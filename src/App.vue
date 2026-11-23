@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import AppMark from "./components/AppMark.vue";
+import AppMenuBar from "./components/AppMenuBar.vue";
+import AppToolbar from "./components/AppToolbar.vue";
 import ConnectionDialog from "./components/ConnectionDialog.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import CreateTableDialog from "./components/CreateTableDialog.vue";
@@ -14,6 +16,7 @@ import ObjectBrowser from "./components/ObjectBrowser.vue";
 import PromptDialog from "./components/PromptDialog.vue";
 import QueryWorkspace from "./components/QueryWorkspace.vue";
 import RedisWorkspace from "./components/RedisWorkspace.vue";
+import ResizeHandle from "./components/ResizeHandle.vue";
 import SchemaSyncDialog from "./components/SchemaSyncDialog.vue";
 import StatusBar from "./components/StatusBar.vue";
 import TableDataView from "./components/TableDataView.vue";
@@ -22,11 +25,26 @@ import * as api from "./lib/api";
 import type { ConnectionInfoFormat } from "./lib/api";
 import { readClipboard, writeClipboard } from "./lib/clipboard";
 import type {
+  AppAction,
+  MenuBarItem,
+  MenuBarMenu,
+} from "./lib/app-actions";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import packageInfo from "../package.json";
+import {
+  DEFAULT_LAYOUT,
+  effectiveLayoutWidths,
+  loadWorkspaceLayout,
+  saveWorkspaceLayout,
+  type WorkspaceLayout,
+} from "./lib/layout";
+import type {
   ConnectionConfig,
   ConnectionGroupInfo,
   Driver,
   HistoryEntry,
   QueryResult,
+  ScopeTableColumns,
   TableInfo,
 } from "./lib/types";
 
@@ -67,6 +85,89 @@ const TEXT_INPUT_TYPES = new Set([
   "week",
   "time",
 ]);
+
+const layout = reactive<WorkspaceLayout>(loadWorkspaceLayout());
+const viewportWidth = ref(window.innerWidth);
+const layoutMenuOpen = ref(false);
+const layoutMenuRef = ref<HTMLElement | null>(null);
+const layoutButtonRef = ref<HTMLElement | null>(null);
+const layoutMenuTop = ref(0);
+const layoutMenuRight = ref(0);
+let layoutSaveTimer = 0;
+
+const effectiveWidths = computed(() =>
+  effectiveLayoutWidths(layout, viewportWidth.value),
+);
+const layoutStyle = computed<Record<string, string>>(() => ({
+  "--sidebar-width": `${
+    layout.sidebarCollapsed ? 32 : effectiveWidths.value.sidebar
+  }px`,
+  "--objects-width": `${
+    layout.objectsCollapsed ? 32 : effectiveWidths.value.objects
+  }px`,
+  "--right-width": `${
+    effectiveWidths.value.right || layout.rightWidth
+  }px`,
+  "--editor-ratio": String(layout.editorRatio),
+}));
+const layoutShortcuts = computed(() => {
+  if (isMacPlatform) {
+    return {
+      sidebar: "⌘B",
+      objects: "⌘⇧B",
+      result: "⌘J",
+      right: "⌘⇧H",
+    };
+  }
+  return {
+    sidebar: "Ctrl+B",
+    objects: "Ctrl+Shift+B",
+    result: "Ctrl+J",
+    right: "Ctrl+Shift+H",
+  };
+});
+
+function toggleSidebar() {
+  layout.sidebarCollapsed = !layout.sidebarCollapsed;
+}
+
+function toggleObjects() {
+  layout.objectsCollapsed = !layout.objectsCollapsed;
+}
+
+function toggleResultPanel() {
+  layout.resultCollapsed = !layout.resultCollapsed;
+}
+
+function toggleRightPanel() {
+  layout.rightOpen = !layout.rightOpen;
+}
+
+function resetLayout() {
+  Object.assign(layout, DEFAULT_LAYOUT);
+  layoutMenuOpen.value = false;
+}
+
+function closeLayoutMenu() {
+  layoutMenuOpen.value = false;
+}
+
+function toggleLayoutMenu() {
+  if (layoutMenuOpen.value) {
+    closeLayoutMenu();
+    return;
+  }
+  const rect = layoutButtonRef.value?.getBoundingClientRect();
+  if (!rect) return;
+  layoutMenuTop.value = rect.bottom + 6;
+  layoutMenuRight.value = Math.max(8, window.innerWidth - rect.right);
+  layoutMenuOpen.value = true;
+}
+
+function updateViewportWidth() {
+  viewportWidth.value = window.innerWidth;
+  if (layoutMenuOpen.value) closeLayoutMenu();
+}
 
 const unlisteners: UnlistenFn[] = [];
 const appContextMenu = ref<AppContextMenu | null>(null);
@@ -200,6 +301,70 @@ const activeTab = computed(
   () =>
     tabs.value.find((tab) => tab.id === activeTabId.value) ?? tabs.value[0],
 );
+const queryWorkspaceRef = ref<InstanceType<typeof QueryWorkspace> | null>(
+  null,
+);
+
+const completionTables = ref<ScopeTableColumns[]>([]);
+const completionRevision = ref(0);
+const completionCache = new Map<string, ScopeTableColumns[]>();
+let completionRequest = 0;
+
+const completionSource = computed(() => {
+  const tab = activeTab.value;
+  if (!tab?.connectionId) return null;
+  const connection = connectionFor(tab.connectionId);
+  if (!connection || connection.driver === "redis") return null;
+  const database = normalizeScopeValue(tab.database);
+  const schema = normalizeScopeValue(tab.schema);
+  return {
+    connectionId: tab.connectionId,
+    database,
+    schema,
+    key: `${tab.connectionId}|${database ?? ""}|${schema ?? ""}`,
+  };
+});
+const completionKey = computed(() => completionSource.value?.key ?? "");
+
+async function loadCompletion() {
+  const source = completionSource.value;
+  if (!source) {
+    completionTables.value = [];
+    return;
+  }
+  const key = source.key;
+  const cached = completionCache.get(key);
+  if (cached) {
+    completionTables.value = cached;
+    return;
+  }
+
+  const request = ++completionRequest;
+  try {
+    const result = await api.listScopeColumns(source.connectionId);
+    if (request !== completionRequest) return;
+    if (completionCache.size > 12) {
+      completionCache.clear();
+    }
+    completionCache.set(key, result);
+    completionTables.value = result;
+  } catch {
+    if (request !== completionRequest) return;
+    // Autocompletion is best-effort: keep keyword completion available.
+    completionTables.value = [];
+  }
+}
+
+watch(
+  [completionKey, completionRevision],
+  ([, revision], previous) => {
+    if (revision !== previous?.[1]) {
+      completionCache.clear();
+    }
+    void loadCompletion();
+  },
+  { immediate: true },
+);
 
 const tabOrder = ref<string[]>([firstTab.id]);
 const activeWorkspaceTabId = ref<string>(firstTab.id);
@@ -264,6 +429,7 @@ const running = computed<boolean>({
 
 const status = ref("就绪");
 const dialogOpen = ref(false);
+const aboutOpen = ref(false);
 const editing = ref<ConnectionConfig | null>(null);
 const connectionSaveError = ref("");
 const connectionsLoaded = ref(false);
@@ -271,7 +437,12 @@ const collapsedGroups = ref<Record<string, boolean>>({});
 const createOpen = ref(false);
 const importOpen = ref(false);
 const importTable = ref("");
-const historyOpen = ref(false);
+const historyOpen = computed<boolean>({
+  get: () => layout.rightOpen,
+  set: (value) => {
+    layout.rightOpen = value;
+  },
+});
 const historyLoading = ref(false);
 const historyEntries = ref<HistoryEntry[]>([]);
 const connectionStatus = ref<ConnectionStatus>("idle");
@@ -330,6 +501,37 @@ function handleRedisDatabaseChange(database: string) {
   if (!connectionId) return;
   redisDatabaseByConnection[connectionId] = database;
   status.value = `Redis 数据库：db${database.padStart(2, "0")}`;
+}
+
+const connectionChipScope = computed(() => {
+  const connection = selected.value;
+  if (!connection) return "";
+  if (connection.driver === "sqlite") return "main";
+  if (connection.driver === "redis") {
+    const database = redisDatabase.value ?? "0";
+    return /^\d+$/.test(database)
+      ? `db${database.padStart(2, "0")}`
+      : `db${database}`;
+  }
+  const database = activeDatabase.value ?? connection.database;
+  if (connection.driver === "postgres" && activeSchema.value) {
+    return `${database} · ${activeSchema.value}`;
+  }
+  return database ?? "";
+});
+
+const connectionChipTitle = computed(() => {
+  const connection = selected.value;
+  if (!connection) return "未连接";
+  const parts = [connection.name, connection.driver];
+  if (connectionChipScope.value) parts.push(connectionChipScope.value);
+  if (connection.readOnly) parts.push("只读");
+  return parts.join(" · ");
+});
+
+function openConnectionChipMenu(event: MouseEvent) {
+  if (!selected.value) return;
+  openConnectionMenu(event, selected.value);
 }
 
 interface TabSource {
@@ -770,6 +972,17 @@ watch(queryTabsSnapshot, (value) => {
   }, 250);
 });
 
+watch(
+  layout,
+  () => {
+    window.clearTimeout(layoutSaveTimer);
+    layoutSaveTimer = window.setTimeout(() => {
+      saveWorkspaceLayout(layout);
+    }, 200);
+  },
+  { deep: true },
+);
+
 function closeStaleTableTab() {
   const connectionId = selectedId.value;
   const database = normalizeScopeValue(activeDatabase.value);
@@ -801,6 +1014,7 @@ function closeStaleTableTab() {
 }
 
 async function refreshTables() {
+  completionRevision.value += 1;
   const connectionId = selectedId.value;
   if (!connectionId) {
     tables.value = [];
@@ -1709,10 +1923,7 @@ function menuConnectionNewQuery() {
   }
 }
 
-async function menuCloseConnection() {
-  const connection = connectionMenu.value?.connection;
-  closeConnectionMenu();
-  if (!connection) return;
+async function closeConnectionById(connection: ConnectionConfig) {
   try {
     await api.closeConnection(connection.id);
     resetConnectionTransactions(connection.id);
@@ -1729,6 +1940,21 @@ async function menuCloseConnection() {
   } catch (reason) {
     status.value = String(reason);
   }
+}
+
+async function menuCloseConnection() {
+  const connection = connectionMenu.value?.connection;
+  closeConnectionMenu();
+  if (!connection) return;
+  await closeConnectionById(connection);
+}
+
+async function closeSelectedConnection() {
+  if (!selected.value) {
+    status.value = "请先选择连接";
+    return;
+  }
+  await closeConnectionById(selected.value);
 }
 
 function menuEditConnection() {
@@ -2287,6 +2513,85 @@ function editableTarget(target: EventTarget | null): HTMLElement | null {
   return content instanceof HTMLElement ? content : null;
 }
 
+const lastEditable = ref<HTMLElement | null>(null);
+
+function trackEditableFocus(event: FocusEvent) {
+  const target = event.target as HTMLElement | null;
+  if (target && editableTarget(target)) {
+    lastEditable.value = target;
+  }
+}
+
+function currentEditableTarget(): HTMLElement | null {
+  const remembered =
+    lastEditable.value?.isConnected ? lastEditable.value : null;
+  if (remembered) return remembered;
+  const active = document.activeElement;
+  return active instanceof HTMLElement ? editableTarget(active) : null;
+}
+
+const hasEditableTarget = computed(() =>
+  Boolean(currentEditableTarget()),
+);
+
+async function pasteIntoEditable(target: HTMLElement) {
+  try {
+    const text = await readClipboard();
+    if (!text) return;
+    target.focus({ preventScroll: true });
+    if (
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement
+    ) {
+      const start = target.selectionStart ?? target.value.length;
+      const end = target.selectionEnd ?? start;
+      target.setRangeText(text, start, end, "end");
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+    } else {
+      document.execCommand("insertText", false, text);
+    }
+  } catch {
+    document.execCommand("paste");
+  }
+}
+
+function runMenuEdit(
+  command: "undo" | "redo" | "cut" | "copy" | "paste" | "selectAll",
+) {
+  const target = currentEditableTarget();
+  if (!target) return;
+  target.focus({ preventScroll: true });
+
+  if (command === "undo" || command === "redo") {
+    const editor = target.closest(".cm-editor");
+    const content = editor?.querySelector(".cm-content");
+    if (content instanceof HTMLElement) {
+      content.focus();
+      content.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: command === "redo" ? "Z" : "z",
+          code: "KeyZ",
+          metaKey: isMacPlatform,
+          ctrlKey: !isMacPlatform,
+          shiftKey: command === "redo",
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      return;
+    }
+    document.execCommand(command);
+    return;
+  }
+
+  if (command === "paste") {
+    void pasteIntoEditable(target);
+    return;
+  }
+
+  document.execCommand(command === "selectAll" ? "selectAll" : command);
+}
+
 function openAppContextMenu(event: MouseEvent) {
   if (appMenuRef.value?.contains(event.target as Node | null)) return;
 
@@ -2337,6 +2642,9 @@ function closeAppContextMenu() {
 
 function onWindowMouseDown(event: MouseEvent) {
   const target = event.target as Node | null;
+  if (layoutMenuOpen.value && !layoutMenuRef.value?.contains(target)) {
+    closeLayoutMenu();
+  }
   if (connectionMenu.value && !connectionMenuRef.value?.contains(target)) {
     closeConnectionMenu();
   }
@@ -2364,7 +2672,41 @@ function onWindowKeydown(event: KeyboardEvent) {
     cycleQueryTab(event.shiftKey ? -1 : 1);
     return;
   }
+  const modifier = isMacPlatform ? event.metaKey : event.ctrlKey;
+  // On macOS these are native menu accelerators; other platforms fall back
+  // to the window-level shortcuts.
+  if (!isMacPlatform && modifier && !event.altKey && !event.repeat) {
+    const key = event.key.toLowerCase();
+    if (key === "b" && event.shiftKey) {
+      event.preventDefault();
+      toggleObjects();
+      return;
+    }
+    if (key === "b") {
+      event.preventDefault();
+      toggleSidebar();
+      return;
+    }
+    if (key === "j" && !event.shiftKey) {
+      event.preventDefault();
+      toggleResultPanel();
+      return;
+    }
+    if (key === "h" && event.shiftKey) {
+      event.preventDefault();
+      toggleRightPanel();
+      return;
+    }
+  }
   if (event.key === "Escape") {
+    if (aboutOpen.value) {
+      aboutOpen.value = false;
+      return;
+    }
+    if (layoutMenuOpen.value) {
+      closeLayoutMenu();
+      return;
+    }
     if (connectionMenu.value || groupMenu.value) {
       closeConnectionMenu();
       closeGroupMenu();
@@ -2494,11 +2836,391 @@ function menuHistory() {
   void toggleHistory();
 }
 
+function closeActiveWorkspaceTab() {
+  if (activeWorkspaceTabId.value) {
+    closeWorkspaceTab(activeWorkspaceTabId.value);
+  }
+}
+
+function closeWindow() {
+  void getCurrentWindow().close();
+}
+
+async function toggleFullscreen() {
+  const window = getCurrentWindow();
+  try {
+    const fullscreen = await window.isFullscreen();
+    await window.setFullscreen(!fullscreen);
+  } catch (reason) {
+    status.value = String(reason);
+  }
+}
+
+function openAuthorGithub() {
+  void openUrl("https://github.com/mengqi19990203-creator");
+}
+
+function openProjectRepo() {
+  void openUrl("https://github.com/mengqi19990203-creator/mydb");
+}
+
+async function copyContactEmail() {
+  try {
+    await writeClipboard("jianglichun996@163.com");
+    status.value = "已复制联系邮箱";
+  } catch {
+    status.value = "复制联系邮箱失败";
+  }
+}
+
+const canCloseActiveTab = computed(() => {
+  const activeIsQuery = tabs.value.some(
+    (tab) => tab.id === activeWorkspaceTabId.value,
+  );
+  return (
+    Boolean(activeWorkspaceTabId.value) &&
+    (!activeIsQuery || tabs.value.length > 1)
+  );
+});
+
+const appActions = computed<AppAction[]>(() => {
+  const modifier = isMacPlatform ? "⌘" : "Ctrl+";
+  const readOnly = Boolean(selected.value?.readOnly);
+  const noConnection = !selectedId.value;
+  const redis = isRedisConnection.value;
+  const connectionReason = noConnection
+    ? "请先选择连接"
+    : redis
+      ? "Redis 连接请使用命令控制台"
+      : "";
+  const canExport =
+    viewMode.value === "sql" &&
+    !redis &&
+    !running.value &&
+    !queryError.value &&
+    Boolean(result.value?.isQuery) &&
+    Boolean(result.value?.rows.length);
+  const exportReason = redis
+    ? "Redis 连接不支持 SQL 结果"
+    : viewMode.value !== "sql"
+      ? "请切换到查询标签"
+      : running.value
+        ? "查询执行中"
+        : queryError.value
+          ? "查询失败"
+          : !result.value?.isQuery
+            ? "当前没有结果集"
+            : !result.value?.rows.length
+              ? "结果为空"
+              : "";
+  const importReason = connectionReason
+    ? connectionReason
+    : readOnly
+      ? "当前连接为只读"
+      : activeTable.value?.kind === "table"
+        ? ""
+        : "请先打开一个表标签";
+
+  return [
+    {
+      id: "new-connection",
+      group: "connection",
+      label: "新建连接",
+      icon: "plus",
+      shortcut: `${modifier}N`,
+      priority: 1,
+      enabled: true,
+      run: openNewConnection,
+    },
+    {
+      id: "new-query",
+      group: "query",
+      label: "新建查询",
+      icon: "code",
+      shortcut: `${modifier}T`,
+      priority: 2,
+      enabled: !redis,
+      disabledReason: redis ? "Redis 连接请使用命令控制台" : undefined,
+      run: newQuery,
+    },
+    {
+      id: "new-table",
+      group: "object",
+      label: "新建表",
+      icon: "structure",
+      priority: 3,
+      enabled: !connectionReason && !readOnly,
+      disabledReason:
+        connectionReason || (readOnly ? "当前连接为只读" : undefined),
+      run: openCreateTable,
+    },
+    {
+      id: "er-diagram",
+      group: "tools",
+      label: "ER 图",
+      icon: "diagram",
+      priority: 4,
+      enabled: !connectionReason,
+      disabledReason: connectionReason || undefined,
+      active: viewMode.value === "er",
+      run: () => void openErDiagram(),
+    },
+    {
+      id: "refresh",
+      group: "object",
+      label: "刷新",
+      icon: "refresh",
+      shortcut: `${modifier}R`,
+      priority: 5,
+      enabled: Boolean(selectedId.value) && !tablesLoading.value,
+      disabledReason: noConnection
+        ? "请先选择连接"
+        : tablesLoading.value
+          ? "对象列表加载中"
+          : undefined,
+      run: () => void refreshTables(),
+    },
+    {
+      id: "history",
+      group: "view",
+      label: "历史",
+      icon: "history",
+      shortcut: `${modifier}Y`,
+      priority: 6,
+      enabled: !redis,
+      disabledReason: redis ? "Redis 连接暂不支持 SQL 历史" : undefined,
+      active: historyOpen.value,
+      run: () => void toggleHistory(),
+    },
+    {
+      id: "structure-sync",
+      group: "tools",
+      label: "结构同步",
+      icon: "structure",
+      priority: 7,
+      enabled: !connectionReason,
+      disabledReason: connectionReason || undefined,
+      run: () => {
+        syncOpen.value = true;
+      },
+    },
+    {
+      id: "data-sync",
+      group: "tools",
+      label: "数据同步",
+      icon: "sync",
+      priority: 8,
+      enabled: !connectionReason,
+      disabledReason: connectionReason || undefined,
+      run: () => {
+        dataSyncOpen.value = true;
+      },
+    },
+    {
+      id: "import-data",
+      group: "object",
+      label: "导入数据",
+      icon: "upload",
+      priority: 20,
+      placement: "more",
+      enabled: !importReason,
+      disabledReason: importReason || undefined,
+      run: () => {
+        const table = activeTable.value;
+        if (table) void openImportData(table);
+      },
+    },
+    {
+      id: "export-result",
+      group: "query",
+      label: "导出结果",
+      icon: "download",
+      priority: 21,
+      placement: "more",
+      enabled: canExport,
+      disabledReason: exportReason || undefined,
+      run: () => queryWorkspaceRef.value?.requestExport(),
+    },
+    {
+      id: "close-tab",
+      group: "query",
+      label: "关闭标签",
+      icon: "close",
+      shortcut: `${modifier}W`,
+      priority: 22,
+      placement: "more",
+      enabled: canCloseActiveTab.value,
+      disabledReason: canCloseActiveTab.value
+        ? undefined
+        : "至少保留一个查询标签",
+      run: closeActiveWorkspaceTab,
+    },
+  ];
+});
+
+const appMenus = computed<MenuBarMenu[]>(() => {
+  const modifier = isMacPlatform ? "⌘" : "Ctrl+";
+  const shift = isMacPlatform ? "⇧" : "Shift+";
+  const fromAction = (id: string): MenuBarItem => {
+    const action = appActions.value.find((item) => item.id === id);
+    if (!action) return { label: id, disabled: true };
+    return {
+      label: action.label,
+      shortcut: action.shortcut,
+      disabled: !action.enabled,
+      disabledReason: action.disabledReason,
+      action: action.run,
+    };
+  };
+  const editItem = (
+    label: string,
+    shortcut: string,
+    command: "undo" | "redo" | "cut" | "copy" | "paste" | "selectAll",
+  ): MenuBarItem => ({
+    label,
+    shortcut,
+    disabled: !hasEditableTarget.value,
+    disabledReason: "请先聚焦输入框或代码编辑器",
+    action: () => runMenuEdit(command),
+  });
+
+  return [
+    {
+      label: "文件",
+      items: [
+        fromAction("new-connection"),
+        fromAction("new-query"),
+        { separator: true },
+        fromAction("import-data"),
+        fromAction("export-result"),
+        { separator: true },
+        fromAction("close-tab"),
+        { separator: true },
+        {
+          label: "关闭窗口",
+          shortcut: `${modifier}${shift}W`,
+          action: closeWindow,
+        },
+        {
+          label: "退出 mydb",
+          shortcut: `${modifier}Q`,
+          action: closeWindow,
+        },
+      ],
+    },
+    {
+      label: "编辑",
+      items: [
+        editItem("撤销", `${modifier}Z`, "undo"),
+        editItem("重做", `${modifier}${shift}Z`, "redo"),
+        { separator: true },
+        editItem("剪切", `${modifier}X`, "cut"),
+        editItem("复制", `${modifier}C`, "copy"),
+        editItem("粘贴", `${modifier}V`, "paste"),
+        editItem("全选", `${modifier}A`, "selectAll"),
+      ],
+    },
+    {
+      label: "视图",
+      items: [
+        fromAction("refresh"),
+        fromAction("history"),
+        { separator: true },
+        {
+          label: "连接侧栏",
+          shortcut: layoutShortcuts.value.sidebar,
+          action: toggleSidebar,
+        },
+        {
+          label: "对象树",
+          shortcut: layoutShortcuts.value.objects,
+          action: toggleObjects,
+        },
+        {
+          label: "结果面板",
+          shortcut: layoutShortcuts.value.result,
+          action: toggleResultPanel,
+        },
+        {
+          label: "右侧面板",
+          shortcut: layoutShortcuts.value.right,
+          action: toggleRightPanel,
+        },
+        { separator: true },
+        { label: "重置布局", action: resetLayout },
+        { separator: true },
+        { label: "切换全屏", action: () => void toggleFullscreen() },
+      ],
+    },
+    {
+      label: "工具",
+      items: [
+        fromAction("er-diagram"),
+        fromAction("structure-sync"),
+        fromAction("data-sync"),
+        { separator: true },
+        fromAction("import-data"),
+        { separator: true },
+        {
+          label: "编辑当前连接…",
+          disabled: !selected.value,
+          disabledReason: "请先选择连接",
+          action: editSelectedConnection,
+        },
+        {
+          label: "关闭当前连接",
+          disabled: !selected.value,
+          disabledReason: "请先选择连接",
+          action: () => void closeSelectedConnection(),
+        },
+      ],
+    },
+    {
+      label: "窗口",
+      items: [
+        {
+          label: "最小化",
+          shortcut: `${modifier}M`,
+          action: () => {
+            void getCurrentWindow().minimize();
+          },
+        },
+        {
+          label: "关闭窗口",
+          shortcut: `${modifier}${shift}W`,
+          action: closeWindow,
+        },
+      ],
+    },
+    {
+      label: "帮助",
+      items: [
+        {
+          label: "关于 mydb",
+          action: () => {
+            aboutOpen.value = true;
+          },
+        },
+        { separator: true },
+        {
+          label: "GitHub 项目主页",
+          action: () => {
+            void openUrl(
+              "https://github.com/mengqi19990203-creator/mydb",
+            );
+          },
+        },
+      ],
+    },
+  ];
+});
+
 async function bindMenuEvents() {
   const handlers: Array<[string, () => void]> = [
     ["menu:new-connection", openNewConnection],
     ["menu:new-query", newQuery],
-    ["menu:new-table", openCreateTable],
+    ["menu:close-tab", closeActiveWorkspaceTab],
+    ["menu:close-window", closeWindow],
     [
       "menu:refresh",
       () => {
@@ -2506,6 +3228,35 @@ async function bindMenuEvents() {
       },
     ],
     ["menu:history", () => void toggleHistory()],
+    ["menu:toggle-sidebar", toggleSidebar],
+    ["menu:toggle-objects", toggleObjects],
+    ["menu:toggle-result", toggleResultPanel],
+    ["menu:toggle-right", toggleRightPanel],
+    ["menu:reset-layout", resetLayout],
+    [
+      "menu:er-diagram",
+      () => {
+        if (selectedId.value && !isRedisConnection.value) {
+          void openErDiagram();
+        }
+      },
+    ],
+    [
+      "menu:structure-sync",
+      () => {
+        if (selectedId.value && !isRedisConnection.value) {
+          syncOpen.value = true;
+        }
+      },
+    ],
+    [
+      "menu:data-sync",
+      () => {
+        if (selectedId.value && !isRedisConnection.value) {
+          dataSyncOpen.value = true;
+        }
+      },
+    ],
   ];
 
   try {
@@ -2523,7 +3274,9 @@ onMounted(async () => {
   window.addEventListener("keydown", onWindowKeydown);
   window.addEventListener("resize", closeAppContextMenu);
   window.addEventListener("resize", updateTabScroll);
+  window.addEventListener("resize", updateViewportWidth);
   window.addEventListener("blur", closeAppContextMenu);
+  document.addEventListener("focusin", trackEditableFocus);
 
   await bindMenuEvents();
   await nextTick();
@@ -2551,140 +3304,147 @@ onBeforeUnmount(() => {
     }
   }
   window.clearTimeout(tabsSaveTimer);
+  window.clearTimeout(layoutSaveTimer);
+  saveWorkspaceLayout(layout);
   for (const unlisten of unlisteners) unlisten();
   window.removeEventListener("contextmenu", openAppContextMenu);
   window.removeEventListener("mousedown", onWindowMouseDown);
   window.removeEventListener("keydown", onWindowKeydown);
   window.removeEventListener("resize", closeAppContextMenu);
   window.removeEventListener("resize", updateTabScroll);
+  window.removeEventListener("resize", updateViewportWidth);
   window.removeEventListener("blur", closeAppContextMenu);
+  document.removeEventListener("focusin", trackEditableFocus);
 });
 </script>
 
 <template>
-  <div class="app-shell">
+  <div class="app-shell" :style="layoutStyle">
     <header class="titlebar">
-      <div class="titlebar-brand" data-tauri-drag-region>
-        <span class="brand-mark"><AppMark :size="22" /></span>
-        <span class="brand-name">mydb</span>
-      </div>
+      <AppMenuBar :menus="appMenus" />
+      <span class="titlebar-spacer" data-tauri-drag-region></span>
 
-      <div class="titlebar-tools">
-        <button
-          class="toolbar-action"
-          title="新建连接"
-          aria-label="新建连接"
-          @click="openNewConnection"
-        >
-          <Icon name="plus" :size="14" />
-          <span>新建连接</span>
-        </button>
-        <button
-          class="toolbar-action"
-          :disabled="isRedisConnection"
-          title="新建查询"
-          aria-label="新建查询"
-          @click="newQuery"
-        >
-          <Icon name="code" :size="14" />
-          <span>新建查询</span>
-        </button>
-        <button
-          class="toolbar-action"
-          :disabled="!selectedId || isRedisConnection || Boolean(selected?.readOnly)"
-          title="新建表"
-          aria-label="新建表"
-          @click="openCreateTable"
-        >
-          <Icon name="structure" :size="14" />
-          <span>新建表</span>
-        </button>
-        <button
-          class="toolbar-action"
-          :class="{ active: viewMode === 'er' }"
-          :disabled="!selectedId || isRedisConnection"
-          title="ER 图"
-          aria-label="ER 图"
-          @click="openErDiagram"
-        >
-          <Icon name="diagram" :size="14" />
-          <span>ER 图</span>
-        </button>
-        <button
-          class="toolbar-action"
-          :disabled="!selectedId || isRedisConnection"
-          title="结构同步"
-          aria-label="结构同步"
-          @click="syncOpen = true"
-        >
-          <Icon name="structure" :size="14" />
-          <span>结构同步</span>
-        </button>
-        <button
-          class="toolbar-action"
-          :disabled="!selectedId || isRedisConnection"
-          title="数据同步"
-          aria-label="数据同步"
-          @click="dataSyncOpen = true"
-        >
-          <Icon name="sync" :size="14" />
-          <span>数据同步</span>
-        </button>
-        <button
-          class="toolbar-action"
-          :disabled="!selectedId || tablesLoading"
-          title="刷新对象列表"
-          aria-label="刷新对象列表"
-          @click="refreshTables"
-        >
-          <Icon name="refresh" :size="14" />
-          <span>刷新</span>
-        </button>
-        <button
-          class="toolbar-action"
-          :class="{ active: historyOpen }"
-          :disabled="isRedisConnection"
-          title="执行历史"
-          aria-label="执行历史"
-          @click="toggleHistory"
-        >
-          <Icon name="history" :size="14" />
-          <span>历史</span>
-        </button>
-      </div>
-
-      <div class="titlebar-context" data-tauri-drag-region>
-        <template v-if="selected">
-          <span class="titlebar-connection" :title="selected.name">{{ selected.name }}</span>
+      <button
+        v-if="selected"
+        class="connection-chip"
+        :class="connectionStatus"
+        :title="connectionChipTitle"
+        @click="openConnectionChipMenu"
+      >
+        <span class="connection-chip-head">
+          <span class="titlebar-connection">{{ selected.name }}</span>
           <span class="driver-badge">{{ selected.driver }}</span>
+        </span>
+        <span class="connection-chip-meta">
+          <span v-if="connectionChipScope" class="connection-chip-scope">
+            {{ connectionChipScope }}
+          </span>
+          <span class="status-dot" :class="connectionStatus"></span>
           <span class="connection-state" :class="connectionStatus">
-            <span class="status-dot" :class="connectionStatus"></span>
             {{ connectionStatusLabel }}
           </span>
-        </template>
-        <span v-else class="titlebar-muted">未连接</span>
-      </div>
+          <span v-if="selected.readOnly" class="readonly-badge">只读</span>
+        </span>
+      </button>
+      <span v-else class="titlebar-muted">未连接</span>
 
-      <div class="titlebar-actions">
+      <div ref="layoutMenuRef" class="layout-menu-host">
         <button
-          v-if="viewMode === 'sql' && !isRedisConnection"
-          class="button primary"
-          :disabled="
-            !selectedId || running || connectionStatus !== 'connected'
-          "
-          :title="runDisabledReason || `运行 SQL（${runShortcutLabel}）`"
-          aria-label="运行 SQL"
-          @click="runQuery()"
+          ref="layoutButtonRef"
+          class="toolbar-action layout-button"
+          :class="{ active: layoutMenuOpen }"
+          title="布局"
+          aria-label="布局"
+          :aria-expanded="layoutMenuOpen"
+          @click.stop="toggleLayoutMenu"
         >
-          <span v-if="running" class="spinner"></span>
-          <Icon v-else name="play" :size="14" />
-          {{ running ? "执行中…" : "运行" }}
+          <Icon name="structure" :size="14" />
         </button>
+        <div
+          v-if="layoutMenuOpen"
+          class="context-menu layout-menu"
+          role="menu"
+          :style="{
+            position: 'fixed',
+            top: `${layoutMenuTop}px`,
+            right: `${layoutMenuRight}px`,
+            left: 'auto',
+          }"
+          @click.stop
+        >
+          <button class="context-menu-item" @click="toggleSidebar">
+            <span class="layout-check-slot">
+              <Icon v-if="!layout.sidebarCollapsed" name="check" :size="14" />
+            </span>
+            <span>连接侧栏</span>
+            <span class="context-menu-shortcut">
+              {{ layoutShortcuts.sidebar }}
+            </span>
+          </button>
+          <button class="context-menu-item" @click="toggleObjects">
+            <span class="layout-check-slot">
+              <Icon v-if="!layout.objectsCollapsed" name="check" :size="14" />
+            </span>
+            <span>对象树</span>
+            <span class="context-menu-shortcut">
+              {{ layoutShortcuts.objects }}
+            </span>
+          </button>
+          <button class="context-menu-item" @click="toggleResultPanel">
+            <span class="layout-check-slot">
+              <Icon v-if="!layout.resultCollapsed" name="check" :size="14" />
+            </span>
+            <span>结果面板</span>
+            <span class="context-menu-shortcut">
+              {{ layoutShortcuts.result }}
+            </span>
+          </button>
+          <button class="context-menu-item" @click="toggleRightPanel">
+            <span class="layout-check-slot">
+              <Icon v-if="layout.rightOpen" name="check" :size="14" />
+            </span>
+            <span>右侧面板</span>
+            <span class="context-menu-shortcut">
+              {{ layoutShortcuts.right }}
+            </span>
+          </button>
+          <div class="context-separator"></div>
+          <button class="context-menu-item" @click="resetLayout">
+            <Icon name="refresh" :size="14" />
+            <span>重置布局</span>
+          </button>
+        </div>
       </div>
     </header>
 
+    <div class="app-toolbar-row">
+      <AppToolbar :actions="appActions" />
+    </div>
+
     <div class="app-body">
-      <aside class="sidebar">
+      <aside
+        class="sidebar"
+        :class="{ collapsed: layout.sidebarCollapsed }"
+      >
+        <div v-if="layout.sidebarCollapsed" class="sidebar-rail">
+          <button
+            class="icon-button"
+            title="展开连接侧栏"
+            aria-label="展开连接侧栏"
+            @click="toggleSidebar"
+          >
+            <Icon name="chevron-right" :size="14" />
+          </button>
+          <button
+            class="icon-button"
+            title="新建连接"
+            aria-label="新建连接"
+            @click="openNewConnection"
+          >
+            <Icon name="plus" :size="14" />
+          </button>
+          <span class="sidebar-rail-label">连接</span>
+        </div>
         <div class="sidebar-toolbar">
           <span class="sidebar-toolbar-title">连接</span>
           <button
@@ -2828,6 +3588,17 @@ onBeforeUnmount(() => {
         </div>
       </aside>
 
+      <ResizeHandle
+        v-if="!layout.sidebarCollapsed"
+        orientation="vertical"
+        :value="effectiveWidths.sidebar"
+        :min="180"
+        :max="360"
+        label="调整连接侧栏宽度"
+        @update:value="layout.sidebarWidth = $event"
+        @reset="layout.sidebarWidth = 240"
+      />
+
       <section class="main">
         <div v-if="isRedisConnection" class="workspace-tabs">
           <div class="workspace-tab active redis-tab">
@@ -2969,6 +3740,8 @@ onBeforeUnmount(() => {
             :database-counts="databaseCounts"
             :loading="tablesLoading"
             :active-table="treeActiveTableName"
+            :collapsed="layout.objectsCollapsed"
+            @toggle="toggleObjects"
             @select="openTable"
             @select-structure="openTableStructure"
             @select-index="openIndex"
@@ -2980,21 +3753,41 @@ onBeforeUnmount(() => {
             @create="openCreateTable"
             @generate-sql="openGeneratedSql"
           />
+          <ResizeHandle
+            v-if="!layout.objectsCollapsed"
+            orientation="vertical"
+            :value="effectiveWidths.objects"
+            :min="160"
+            :max="420"
+            label="调整对象树宽度"
+            @update:value="layout.objectsWidth = $event"
+            @reset="layout.objectsWidth = 216"
+          />
           <QueryWorkspace
+            ref="queryWorkspaceRef"
             v-show="viewMode === 'sql'"
             :sql="sql"
             :tab-id="activeTabId"
+            :driver="driverForConnection(activeTab?.connectionId ?? null)"
+            :completion-tables="completionTables"
             :result="result"
             :running="running"
             :error="queryError"
             :in-transaction="activeTab?.inTransaction ?? false"
             :transaction-busy="activeTab?.transactionBusy ?? false"
+            :editor-ratio="layout.editorRatio"
+            :result-collapsed="layout.resultCollapsed"
+            :can-run="!runDisabledReason"
+            :run-disabled-reason="runDisabledReason"
+            :run-shortcut-label="runShortcutLabel"
             @update:sql="sql = $event"
             @selection="handleSqlSelection"
             @run="runQuery"
             @begin-transaction="beginTransaction"
             @commit-transaction="commitTransaction"
             @rollback-transaction="rollbackTransaction"
+            @update:editor-ratio="layout.editorRatio = $event"
+            @toggle-result="toggleResultPanel"
           />
           <div
             v-show="viewMode === 'table'"
@@ -3037,6 +3830,8 @@ onBeforeUnmount(() => {
                 :table="tab.table.name"
                 :driver="driverForConnection(tab.connectionId)"
                 :database-label="scopeLabelFor(tab)"
+                :database="tab.database ?? undefined"
+                :schema="tab.schema"
               />
               <TableStructureView
                 v-else
@@ -3060,6 +3855,18 @@ onBeforeUnmount(() => {
           />
           </template>
 
+          <ResizeHandle
+            v-if="historyOpen && !isRedisConnection"
+            class="resize-handle-right"
+            orientation="vertical"
+            invert
+            :value="effectiveWidths.right"
+            :min="260"
+            :max="520"
+            label="调整右侧面板宽度"
+            @update:value="layout.rightWidth = $event"
+            @reset="layout.rightWidth = 320"
+          />
           <HistoryPanel
             v-if="!isRedisConnection"
             :open="historyOpen"
@@ -3083,6 +3890,53 @@ onBeforeUnmount(() => {
           :schema="activeSchema"
         />
       </section>
+    </div>
+
+    <div
+      v-if="aboutOpen"
+      class="modal-backdrop"
+      @click.self="aboutOpen = false"
+    >
+      <div
+        class="modal confirm-modal about-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="关于 mydb"
+      >
+        <h2>关于 mydb</h2>
+        <p class="about-version">版本 {{ packageInfo.version }}</p>
+        <p class="about-author">作者：蒙其同学</p>
+        <p class="about-github">
+          GitHub：
+          <button
+            class="link-button"
+            @click="openAuthorGithub"
+          >
+            github.com/mengqi19990203-creator
+          </button>
+        </p>
+        <p class="about-email">
+          联系邮箱：
+          <button
+            class="link-button"
+            @click="copyContactEmail"
+          >
+            jianglichun996@163.com
+          </button>
+        </p>
+        <p class="about-desc">轻量、跨平台的数据库客户端</p>
+        <p class="about-tech">
+          Tauri 2 · Rust · Vue 3 · SQLite / MySQL / PostgreSQL / Redis
+        </p>
+        <div class="confirm-actions">
+          <button class="button ghost" @click="openProjectRepo">
+            项目仓库
+          </button>
+          <button class="button primary" @click="aboutOpen = false">
+            关闭
+          </button>
+        </div>
+      </div>
     </div>
 
     <ConnectionDialog

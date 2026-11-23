@@ -2,7 +2,7 @@ use crate::db::{DatabaseDriver, DatabaseSession};
 use crate::db::query::is_read_query;
 use crate::models::{
     ColumnInfo, ColumnValue, ConnectionConfig, DatabaseObjects, ForeignKeyInfo, IndexInfo,
-    QueryResult, TableInfo, TableRows, TableStructure,
+    QueryResult, ScopeTableColumns, TableInfo, TableRows, TableStructure,
 };
 use crate::ssh::SshTunnel;
 use async_trait::async_trait;
@@ -484,6 +484,60 @@ impl DatabaseDriver for MySqlDriver {
                     auto_increment: extra.to_ascii_lowercase().contains("auto_increment"),
                     default_value,
                 }
+            })
+            .collect())
+    }
+
+    async fn scope_columns(&self) -> Result<Vec<ScopeTableColumns>, String> {
+        let database = self.current_database().await;
+        let rows = sqlx::query(
+            "SELECT c.table_name, t.table_type, c.column_name, c.column_type, \
+                    c.is_nullable, c.column_key, c.extra, c.column_default \
+             FROM information_schema.columns c \
+             JOIN information_schema.tables t \
+               ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
+             WHERE c.table_schema = ? AND t.table_type IN ('BASE TABLE', 'VIEW') \
+             ORDER BY c.table_name, c.ordinal_position",
+        )
+        .bind(&database)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("读取补全元数据失败: {error}"))?;
+
+        let mut grouped: BTreeMap<String, (String, Vec<ColumnInfo>)> = BTreeMap::new();
+        for row in rows {
+            let table_name: String = row.try_get(0).unwrap_or_default();
+            let table_type: String = row.try_get(1).unwrap_or_default();
+            let kind = if table_type.eq_ignore_ascii_case("VIEW") {
+                "view"
+            } else {
+                "table"
+            };
+            let nullable: String = row.try_get(4).unwrap_or_default();
+            let column_key: String = row.try_get(5).unwrap_or_default();
+            let extra: String = row.try_get(6).unwrap_or_default();
+            let default_value: Option<String> = row.try_get(7).ok().flatten();
+            let column = ColumnInfo {
+                name: row.try_get(2).unwrap_or_default(),
+                data_type: row.try_get(3).unwrap_or_default(),
+                nullable: nullable.eq_ignore_ascii_case("YES"),
+                primary_key: column_key.eq_ignore_ascii_case("PRI"),
+                auto_increment: extra.to_ascii_lowercase().contains("auto_increment"),
+                default_value,
+            };
+            grouped
+                .entry(table_name)
+                .or_insert_with(|| (kind.to_string(), Vec::new()))
+                .1
+                .push(column);
+        }
+
+        Ok(grouped
+            .into_iter()
+            .map(|(name, (kind, columns))| ScopeTableColumns {
+                name,
+                kind,
+                columns,
             })
             .collect())
     }

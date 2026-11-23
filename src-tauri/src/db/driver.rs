@@ -1,6 +1,6 @@
 use crate::models::{
     ColumnInfo, ColumnValue, DatabaseObjects, ErColumn, ErDiagram, ErRelation, ErTable,
-    ForeignKeyInfo, QueryResult, TableInfo, TableRows, TableStructure,
+    ForeignKeyInfo, QueryResult, ScopeTableColumns, TableInfo, TableRows, TableStructure,
 };
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -80,6 +80,27 @@ pub trait DatabaseDriver: Send + Sync {
     }
 
     async fn list_columns(&self, table: &str) -> Result<Vec<ColumnInfo>, String>;
+
+    /// Tables / views in the current scope with their columns, used by the SQL
+    /// editor's autocompletion. Drivers with a cheaper metadata query override
+    /// this default per-table loop.
+    async fn scope_columns(&self) -> Result<Vec<ScopeTableColumns>, String> {
+        let tables = self.list_tables().await?;
+        let mut result = Vec::new();
+        for table in tables {
+            if !matches!(table.kind.as_str(), "table" | "view" | "matview") {
+                continue;
+            }
+            let columns = self.list_columns(&table.name).await?;
+            result.push(ScopeTableColumns {
+                name: table.name,
+                kind: table.kind,
+                columns,
+            });
+        }
+        Ok(result)
+    }
+
     async fn table_structure(&self, table: &str) -> Result<TableStructure, String>;
     async fn read_rows(
         &self,

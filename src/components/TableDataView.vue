@@ -12,6 +12,13 @@ import ConfirmDialog from "./ConfirmDialog.vue";
 import Icon from "./Icon.vue";
 import * as api from "../lib/api";
 import { writeClipboard } from "../lib/clipboard";
+import { qualifiedSqlName } from "../lib/generate-sql";
+import {
+  buildRowInsert,
+  buildRowJson,
+  buildRowUpdate,
+} from "../lib/row-copy";
+import { quoteIdentifier, sqlLiteral } from "../lib/sql-literal";
 import type { ColumnInfo, ColumnValue, Driver } from "../lib/types";
 
 const props = defineProps<{
@@ -19,6 +26,8 @@ const props = defineProps<{
   table: string;
   databaseLabel?: string;
   driver?: Driver;
+  database?: string;
+  schema?: string | null;
 }>();
 
 const vFocus = {
@@ -65,6 +74,7 @@ const filterDraft = ref("");
 const appliedFilter = ref("");
 const columnWidths = reactive<Record<string, number>>({});
 const cellMenu = ref<CellMenu | null>(null);
+const copyAsOpen = ref(false);
 const deleteRequest = ref<{ keys: ColumnValue[]; detail: string } | null>(null);
 const importRequest = ref<{ path: string } | null>(null);
 const importHasHeader = ref(true);
@@ -73,7 +83,24 @@ let resizeState: ResizeState | null = null;
 const primaryKeys = computed(() =>
   columns.value.filter((column) => column.primaryKey),
 );
+const driverKind = computed<Driver>(() => props.driver ?? "sqlite");
 const canEdit = computed(() => primaryKeys.value.length > 0);
+const updateCopyReason = computed(() => {
+  if (loading.value) return "数据加载中";
+  if (saving.value) return "正在保存，暂不能复制 UPDATE";
+  if (!primaryKeys.value.length) return "无主键，无法生成 UPDATE";
+  if (
+    !columns.value.some(
+      (column) => !column.primaryKey && !column.autoIncrement,
+    )
+  ) {
+    return "没有可更新的列";
+  }
+  return "";
+});
+const copyAsLeft = computed(
+  () => (cellMenu.value?.x ?? 0) + 210 + 168 > window.innerWidth,
+);
 const page = computed(() => Math.floor(offset.value / limit.value) + 1);
 const pageCount = computed(() =>
   Math.max(1, Math.ceil(total.value / limit.value)),
@@ -172,22 +199,10 @@ function stopResize() {
   window.removeEventListener("mouseup", stopResize);
 }
 
-function quoteIdentifier(name: string): string {
-  if (props.driver === "mysql") {
-    return `\`${name.replaceAll("`", "``")}\``;
-  }
-  return `"${name.replaceAll('"', '""')}"`;
-}
-
 function conditionFor(column: ColumnInfo, value: unknown): string {
-  const identifier = quoteIdentifier(column.name);
+  const identifier = quoteIdentifier(column.name, driverKind.value);
   if (isNull(value)) return `${identifier} IS NULL`;
-  if (typeof value === "number") return `${identifier} = ${value}`;
-  if (typeof value === "boolean") {
-    return `${identifier} = ${value ? 1 : 0}`;
-  }
-  const text = typeof value === "object" ? JSON.stringify(value) : String(value);
-  return `${identifier} = '${text.replaceAll("'", "''")}'`;
+  return `${identifier} = ${sqlLiteral(value, driverKind.value)}`;
 }
 
 function openCellMenu(event: MouseEvent, rowIndex: number, colIndex: number) {
@@ -202,6 +217,7 @@ function openCellMenu(event: MouseEvent, rowIndex: number, colIndex: number) {
 
 function closeCellMenu() {
   cellMenu.value = null;
+  copyAsOpen.value = false;
 }
 
 function onGlobalKey(event: KeyboardEvent) {
@@ -239,6 +255,64 @@ async function copyRowValues() {
     error.value = `复制失败: ${reason}`;
   }
   closeCellMenu();
+}
+
+function menuRow(): unknown[] | null {
+  const menu = cellMenu.value;
+  if (!menu) return null;
+  return rows.value[menu.rowIndex] ?? null;
+}
+
+function tableIdentifier(): string {
+  return qualifiedSqlName(
+    driverKind.value,
+    props.table,
+    props.database,
+    props.schema,
+  );
+}
+
+async function copyAs(kind: "insert" | "update" | "json") {
+  if (loading.value || saving.value) return;
+  const row = menuRow();
+  if (!row) return;
+
+  let text: string;
+  let label: string;
+  if (kind === "insert") {
+    text = buildRowInsert(
+      columns.value,
+      row,
+      driverKind.value,
+      tableIdentifier(),
+    );
+    label = "INSERT";
+  } else if (kind === "update") {
+    if (updateCopyReason.value) return;
+    const sql = buildRowUpdate(
+      columns.value,
+      row,
+      driverKind.value,
+      tableIdentifier(),
+    );
+    if (!sql) return;
+    text = sql;
+    label = "UPDATE";
+  } else {
+    text = buildRowJson(
+      columns.value.map((column) => column.name),
+      row,
+    );
+    label = "JSON";
+  }
+
+  closeCellMenu();
+  try {
+    await writeClipboard(text);
+    showMessage(`已复制 ${label}`);
+  } catch (reason) {
+    error.value = `复制失败: ${reason}`;
+  }
 }
 
 function filterByValue() {
@@ -974,6 +1048,50 @@ function changeSize(event: Event) {
         <Icon name="copy" :size="14" />
         复制整行
       </button>
+      <div
+        class="context-submenu-host"
+        @mouseenter="copyAsOpen = true"
+        @mouseleave="copyAsOpen = false"
+      >
+        <button
+          class="context-menu-item"
+          :disabled="loading || saving"
+          @click.stop="copyAsOpen = !copyAsOpen"
+        >
+          <Icon name="copy" :size="14" />
+          <span>复制为</span>
+          <span class="context-menu-shortcut">▸</span>
+        </button>
+        <div
+          v-if="copyAsOpen"
+          class="context-menu context-submenu"
+          :class="{ 'context-submenu-left': copyAsLeft }"
+          role="menu"
+        >
+          <button
+            class="context-menu-item"
+            :disabled="loading || saving"
+            @click="copyAs('insert')"
+          >
+            INSERT
+          </button>
+          <button
+            class="context-menu-item"
+            :disabled="Boolean(updateCopyReason)"
+            :title="updateCopyReason || '复制为 UPDATE'"
+            @click="copyAs('update')"
+          >
+            UPDATE
+          </button>
+          <button
+            class="context-menu-item"
+            :disabled="loading || saving"
+            @click="copyAs('json')"
+          >
+            JSON
+          </button>
+        </div>
+      </div>
       <div class="context-separator"></div>
       <button class="context-menu-item" @click="filterByValue">
         <Icon name="filter" :size="14" />

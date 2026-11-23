@@ -1,7 +1,7 @@
 use super::{AppState, connection_read_only, driver_for};
 use crate::db::sql_guard;
 use crate::history;
-use crate::models::{QueryResult, TableInfo};
+use crate::models::{QueryResult, ScopeTableColumns, TableInfo};
 use crate::storage;
 use tauri::{AppHandle, State};
 
@@ -13,6 +13,16 @@ pub async fn list_tables(
 ) -> Result<Vec<TableInfo>, String> {
     let driver = driver_for(&app, &state, &connection_id).await?;
     driver.list_tables().await
+}
+
+#[tauri::command]
+pub async fn list_scope_columns(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<Vec<ScopeTableColumns>, String> {
+    let driver = driver_for(&app, &state, &connection_id).await?;
+    driver.scope_columns().await
 }
 
 #[tauri::command]

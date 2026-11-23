@@ -14,6 +14,7 @@ import type {
   RedisKeyDetail,
   RedisScanResult,
   SchemaDiff,
+  ScopeTableColumns,
   TableDataDiff,
   TableInfo,
   TableRows,
@@ -119,6 +120,12 @@ export function testConnection(
 
 export function listTables(connectionId: string): Promise<TableInfo[]> {
   return invoke("list_tables", { connectionId });
+}
+
+export function listScopeColumns(
+  connectionId: string,
+): Promise<ScopeTableColumns[]> {
+  return invoke("list_scope_columns", { connectionId });
 }
 
 export function listDatabases(connectionId: string): Promise<string[]> {

@@ -478,7 +478,50 @@ pub fn write_text_file(path: String, contents: String) -> Result<(), String> {
     if path.trim().is_empty() {
         return Err("文件路径不能为空".to_string());
     }
-    std::fs::write(&path, contents).map_err(|error| format!("写入文件失败: {error}"))
+    write_text_file_atomic(std::path::Path::new(&path), &contents)
+}
+
+/// Writes through a temporary file in the same directory and renames it, so a
+/// failed export never leaves a half-written destination file behind.
+fn write_text_file_atomic(path: &std::path::Path, contents: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "文件路径无效".to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        stamp
+    ));
+
+    std::fs::write(&temp, contents).map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        format!("写入文件失败: {error}")
+    })?;
+
+    if let Err(error) = std::fs::rename(&temp, path) {
+        #[cfg(windows)]
+        {
+            // Windows refuses to rename over an existing file.
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+                if std::fs::rename(&temp, path).is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("写入文件失败: {error}"));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -691,6 +734,24 @@ mod tests {
     fn quotes_export_identifiers() {
         assert_eq!(export_identifier("a`b", true), "`a``b`");
         assert_eq!(export_identifier("a\"b", false), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn writes_text_file_atomically() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("result.csv");
+        write_text_file_atomic(&path, "a,b\n1,2").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "a,b\n1,2"
+        );
+        write_text_file_atomic(&path, "replaced").expect("overwrite");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "replaced");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("read dir").count(),
+            1,
+            "temporary files should be cleaned up"
+        );
     }
 
     #[test]

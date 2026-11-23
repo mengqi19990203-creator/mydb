@@ -1,8 +1,8 @@
 use crate::db::{DatabaseDriver, DatabaseSession};
 use crate::db::query::is_read_query;
 use crate::models::{
-    ColumnInfo, ColumnValue, ConnectionConfig, ForeignKeyInfo, IndexInfo, QueryResult, TableInfo,
-    TableRows, TableStructure,
+    ColumnInfo, ColumnValue, ConnectionConfig, ForeignKeyInfo, IndexInfo, QueryResult,
+    ScopeTableColumns, TableInfo, TableRows, TableStructure,
 };
 use crate::ssh::SshTunnel;
 use async_trait::async_trait;
@@ -411,6 +411,71 @@ impl DatabaseDriver for PostgresDriver {
                     default_value: row.try_get(3).ok().flatten(),
                     auto_increment: row.try_get(4).unwrap_or(false),
                 }
+            })
+            .collect())
+    }
+
+    async fn scope_columns(&self) -> Result<Vec<ScopeTableColumns>, String> {
+        let schema = self.current_schema().await;
+        let rows = sqlx::query(
+            "SELECT c.relname, c.relkind::text AS relkind, a.attname, \
+                    pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type, \
+                    NOT a.attnotnull AS nullable, \
+                    pg_get_expr(d.adbin, d.adrelid) AS default_value, \
+                    (a.attidentity IN ('a', 'd') \
+                     OR COALESCE(pg_get_expr(d.adbin, d.adrelid), '') LIKE 'nextval(%') \
+                      AS auto_increment, \
+                    COALESCE(pk.is_pk, false) AS primary_key \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_attribute a ON a.attrelid = c.oid \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+             LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             LEFT JOIN LATERAL ( \
+                 SELECT true AS is_pk \
+                 FROM pg_index i \
+                 WHERE i.indrelid = c.oid AND i.indisprimary \
+                   AND a.attnum = ANY(i.indkey) \
+                 LIMIT 1 \
+             ) pk ON true \
+             WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'f', 'v', 'm') \
+             ORDER BY c.relname, a.attnum",
+        )
+        .bind(&schema)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("读取补全元数据失败: {error}"))?;
+
+        let mut grouped: BTreeMap<String, (String, Vec<ColumnInfo>)> = BTreeMap::new();
+        for row in rows {
+            let table_name: String = row.try_get(0).unwrap_or_default();
+            let relkind: String = row.try_get(1).unwrap_or_default();
+            let kind = match relkind.as_str() {
+                "v" => "view",
+                "m" => "matview",
+                _ => "table",
+            };
+            let column = ColumnInfo {
+                name: row.try_get(2).unwrap_or_default(),
+                data_type: row.try_get(3).unwrap_or_default(),
+                nullable: row.try_get(4).unwrap_or(true),
+                default_value: row.try_get(5).ok().flatten(),
+                auto_increment: row.try_get(6).unwrap_or(false),
+                primary_key: row.try_get(7).unwrap_or(false),
+            };
+            grouped
+                .entry(table_name)
+                .or_insert_with(|| (kind.to_string(), Vec::new()))
+                .1
+                .push(column);
+        }
+
+        Ok(grouped
+            .into_iter()
+            .map(|(name, (kind, columns))| ScopeTableColumns {
+                name,
+                kind,
+                columns,
             })
             .collect())
     }

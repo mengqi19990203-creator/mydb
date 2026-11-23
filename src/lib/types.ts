@@ -67,6 +67,12 @@ export interface ColumnInfo {
   defaultValue: string | null;
 }
 
+export interface ScopeTableColumns {
+  name: string;
+  kind: string;
+  columns: ColumnInfo[];
+}
+
 export interface IndexInfo {
   name: string;
   columns: string[];

@@ -181,6 +181,22 @@ MySQL 连接是服务器级连接，`database` 只是可选的默认库；留空
 
 标签栏的「+」固定在右侧，标签放在独立的横向滚动容器中；溢出时显示左右滚动按钮，新增 / 切换标签会自动滚动到可见区域。查询标签的标题、SQL 和来源写入 WebView `localStorage` 的 `mydb.queryTabs.v1`，启动后恢复；查询结果、事务状态、选区和表 / ER 标签不持久化，删除连接会移除其标签。
 
+## SQL 编辑器补全
+
+`SqlEditor.vue` 使用 `@codemirror/lang-sql`，根据当前查询标签的驱动在 MySQL / PostgreSQL / SQLite 方言间切换（`Compartment` 热切换，不重建编辑器），并把当前范围的表 / 视图与字段作为 `schema` 传给补全。`App.vue` 在活动查询标签来源变化或 `refreshTables` 后调用 `list_scope_columns`（按连接 + 库 / 模式缓存，刷新对象时失效），`QueryWorkspace` 把结果传给编辑器；元数据读取失败时静默降级为关键字补全。后端 `DatabaseDriver::scope_columns` 默认逐表调用 `list_columns`（SQLite 使用），MySQL 和 PostgreSQL 各自用一条 information_schema / pg_catalog 查询一次返回范围内所有表与字段。
+
+## 查询结果导出
+
+`ResultGrid` 在内部维护可见列、隐藏列和前端排序，并通过 `buildExportSnapshot()` 生成快照（可见列名、按当前排序且只含可见列的行、排序信息、隐藏列数、返回行数与截断标记），由 `requestExport()` 发出 `export-request`；`QueryWorkspace` 打开 `ResultExportDialog`。
+
+格式转换全部在 `src/lib/result-export.ts` 完成：CSV 为 UTF-8 + `\n`，表头可选，NULL 为空字段，逗号 / 引号 / 换行 / 首尾空格加引号；JSON 是保留数字、布尔和 null 的对象数组，重复或空列名时禁用；Markdown 先转义 `\` 与 `|`，换行变 `<br>`；SQL INSERT 要求填写 `table` 或 `schema.table`，每行一条语句、不包事务。标识符引用和 SQL 字面量统一走 `src/lib/sql-literal.ts`（MySQL 双反斜杠与 `''`，PostgreSQL / SQLite 只做 `''`）。对话框明确提示隐藏列、排序和截断范围；导出不重新查询、不写执行历史。
+
+`write_text_file` 现在先写同目录临时文件再 rename，失败时删除临时文件，避免留下半截导出文件；表数据导出和同步 SQL 保存也复用该命令。
+
+## 行级复制
+
+`TableDataView` 的单元格右键「复制为」提供 INSERT / UPDATE / JSON，`ResultGrid` 提供 JSON。所有生成逻辑在 `src/lib/row-copy.ts`：值统一走 `sqlLiteral()`，标识符走 `quoteIdentifier()`，表名由 `qualifiedSqlName()` 生成（MySQL `库.表`、PostgreSQL `模式.表`、SQLite 仅 `表`）。INSERT 跳过自增列，没有可写列时退化为 `DEFAULT VALUES`；UPDATE 的 SET 排除主键与自增列，WHERE 使用全部主键（复合主键用 `AND`，NULL 主键用 `IS NULL`），无主键或无更新列时禁用子菜单项。表数据页复制全部列；结果网格只复制当前排序行的可见列，隐藏列会在 Toast 中说明，重复或空列名时禁用 JSON。复制只写剪贴板，不执行 SQL、不写执行历史。
+
 ## 对象导出、复制与快照
 
 - `export_object(connection_id, kind, name, format, path, limit, with_header, operation_id)`：`limit` 为空表示全部行；驱动通过 `export_rows` 用 `fetch` 游标逐行回调，Rust 侧把每行直接写入 `BufWriter`，不会把整表载入内存。CSV 可关闭表头，JSON 按 `{table, columns, rows}` 流式拼接，`sql` 格式先写表 DDL 再逐行写 `INSERT`（MySQL 使用反引号并转义反斜杠），`ddl` 格式只写对象 DDL。`operation_id` 对应 `AppState.export_cancels` 中的原子标志，`cancel_export` 置位后驱动在下一行返回错误，命令会删除未完成的文件。
@@ -206,6 +222,20 @@ SQL 标签可以开启交互式事务。后端 `commands/transaction.rs` 在 `Ap
 ## 执行历史
 
 `commands/query.rs` 在每次 `execute_query` 后把 SQL、连接、时间、耗时和错误写入 `app_config_dir()/history.json`，最多保留 100 条。前端历史面板可以回填 SQL、切换对应连接或清空历史。
+
+## 工作区布局
+
+`src/lib/layout.ts` 定义 `WorkspaceLayout`（侧栏 / 对象树 / 右侧面板宽度、编辑器比例、三个折叠开关、右侧面板开关），默认 240 / 216 / 320 / 0.42。布局以版本 1 写入 WebView `localStorage` 的 `mydb.workspaceLayout.v1`，读取时逐项校验并 clamp，JSON 损坏或版本不符回退默认。
+
+`App.vue` 把宽度与比例绑定为 `.app-shell` 上的 CSS 变量（`--sidebar-width`、`--objects-width`、`--right-width`、`--editor-ratio`），并在 `effectiveLayoutWidths()` 里按视口宽度收缩可调整项，保证主编辑区至少 360px，但不会改写保存值。`ResizeHandle.vue` 统一处理四条分隔条：pointer capture、双击恢复默认、方向键 / Shift 加速 / Home / End、`role="separator"` 与 aria 数值；右侧面板在 <1200px 时保持覆盖抽屉并隐藏拖拽手柄。
+
+折叠使用 class 与 rail，不用 `v-if` 卸载 QueryWorkspace / TableDataView，因此查询结果、表分页筛选和列宽不会丢；结果面板折叠时只保留 34px 标题条。标题栏「布局」菜单和 `⌘/Ctrl+B`、`⌘/Ctrl+Shift+B`、`⌘/Ctrl+J`、`⌘/Ctrl+Shift+H` 统一控制开关，布局变化防抖保存。
+
+## 应用工具栏
+
+`src/lib/app-actions.ts` 定义 `AppAction`（id、分组、图标、快捷键、优先级、主栏/更多、启用状态与禁用原因、执行函数）；`App.vue` 用响应式数据生成动作列表，后续 B-25 命令面板可以复用同一注册表。
+
+`AppToolbar.vue` 按「连接 / 对象 / 查询 / 工具 / 视图」渲染主栏，并用 `ResizeObserver` 测量可用宽度：优先保留高优先级动作和「新建连接 / 新建查询 / 新建表」的文字，空间不足时其余动作只显示图标，再不足则连同低频动作（导入数据、导出结果、关闭标签等）进入「更多」菜单；More 菜单按分组展示、保留快捷键与禁用原因，使用固定定位并与 layout/菜单的点击外部关闭逻辑一致。连接 chip 显示连接名、驱动、库 / 模式、状态和只读标记，点击复用现有连接右键菜单。Run 位于 SQL 编辑器标题栏右侧，表 / ER 视图不显示；工具栏动作与原生菜单、右键菜单共用同一套 App 函数。
 
 ## 前端结构
 
@@ -235,7 +265,17 @@ WKWebView 里 `navigator.clipboard.writeText` 在 `await` 之后常因用户手�
 
 ## 菜单与右键菜单
 
-macOS 原生菜单栏在 `src-tauri/src/lib.rs` 的 `build_menu` 中构建，包含「文件 / 编辑 / 视图 / 窗口 / 帮助」；需要前端处理的自定义项通过 `AppHandle::emit` 发送 `menu:*` 事件，`App.vue` 的 `bindMenuEvents` 监听后复用现有动作。编辑菜单使用 Tauri 预定义的撤销 / 重做 / 剪切 / 复制 / 粘贴 / 全选，交给系统处理当前焦点控件。
+macOS 原生菜单栏在 `src-tauri/src/lib.rs` 的 `build_menu` 中构建，按 Navicat / macOS 习惯分为「文件 / 编辑 / 视图 / 工具 / 窗口 / 帮助」：
+
+- 文件：新建连接（`⌘N`）、新建查询（`⌘T`）、关闭标签（`⌘W`）、关闭窗口（`⌘⇧W`）。
+- 编辑：使用 Tauri 预定义的撤销 / 重做 / 剪切 / 复制 / 粘贴 / 全选，交给系统处理当前焦点控件。
+- 视图：刷新对象（`⌘R`）、执行历史（`⌘Y`）、连接侧栏（`⌘B`）、对象树（`⌘⇧B`）、结果面板（`⌘J`）、右侧面板（`⌘⇧H`）、重置布局。
+- 工具：ER 图、结构同步、数据同步。
+- 窗口 / 帮助：最小化、全屏、前置全部窗口、关于。
+
+需要前端处理的自定义项通过 `AppHandle::emit` 发送 `menu:*` 事件，`App.vue` 的 `bindMenuEvents` 监听后复用现有动作；关闭窗口通过前端 `getCurrentWindow().close()` 执行。布局快捷键在 macOS 由原生菜单加速键处理，其他平台在 `onWindowKeydown` 中兜底；表格单元格与文本输入的右键菜单仍由各自组件/全局监听处理。
+
+窗口内另有一行 `AppMenuBar.vue` 文本菜单（文件 / 编辑 / 视图 / 工具 / 窗口 / 帮助），菜单项由 `App.vue` 的 `appMenus` 生成并复用工具栏动作注册表、布局开关和连接操作；编辑菜单通过 `lastEditable` 跟踪最近聚焦的输入框 / CodeMirror，把撤销、重做、剪切、复制、粘贴、全选作用到该控件。窗口关闭、最小化、全屏使用 Tauri window API；关于 mydb 使用内嵌弹窗，「GitHub 项目主页」通过 opener 打开。
 
 WebView 默认右键菜单由 `App.vue` 的全局 `contextmenu` 监听接管：输入框、文本域和 `contenteditable`（含 CodeMirror）显示中文编辑菜单，其他区域显示中文应用动作菜单。表格单元格的右键菜单由 `TableDataView` 自行处理并调用 `preventDefault`，全局监听通过 `event.defaultPrevented` 避让，避免叠加两层菜单。
 

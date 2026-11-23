@@ -763,6 +763,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lists_scope_columns_for_completion() {
+        let (_dir, driver) = test_driver().await;
+        driver
+            .execute(
+                "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)",
+                1000,
+            )
+            .await
+            .expect("create table");
+        driver
+            .execute(
+                "CREATE VIEW author_names AS SELECT name FROM authors",
+                1000,
+            )
+            .await
+            .expect("create view");
+
+        let scope = driver.scope_columns().await.expect("scope columns");
+        let authors = scope
+            .iter()
+            .find(|table| table.name == "authors")
+            .expect("authors table");
+        assert_eq!(authors.kind, "table");
+        assert_eq!(
+            authors
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
+        assert!(authors.columns[0].primary_key);
+
+        let view = scope
+            .iter()
+            .find(|table| table.name == "author_names")
+            .expect("view");
+        assert_eq!(view.kind, "view");
+        assert_eq!(view.columns.len(), 1);
+    }
+
+    #[tokio::test]
     async fn executes_transactions_atomically() {
         let (_dir, driver) = test_driver().await;
         driver

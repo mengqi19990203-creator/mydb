@@ -3635,6 +3635,11 @@ input[type="checkbox"] {
   min-width: 168px;
 }
 
+.context-submenu-left {
+  right: calc(100% - 2px);
+  left: auto;
+}
+
 .context-menu-hint {
   padding: 4px 10px 2px;
   color: var(--faint);
@@ -4115,6 +4120,35 @@ input[type="checkbox"] {
 
 .export-modal {
   width: min(460px, calc(100vw - 48px));
+}
+
+.result-export-modal {
+  width: min(520px, calc(100vw - 48px));
+}
+
+.result-export-summary {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.result-export-warning {
+  margin: 8px 0 0;
+  color: var(--warning);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.result-export-hint {
+  margin: 8px 0 0;
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.result-export-modal .export-field input[type="text"] {
+  width: 100%;
 }
 
 .export-modal h2 {
@@ -4840,4 +4874,354 @@ input:focus-visible {
 .tab-scroll:hover {
   background: var(--bg-hover);
   color: var(--text);
+}
+
+/* ===== 主界面布局：可调整宽度 / 折叠 / 拖拽分隔条 ===== */
+
+.resize-handle {
+  position: relative;
+  z-index: 7;
+  flex: 0 0 5px;
+  min-width: 5px;
+  min-height: 5px;
+  align-self: stretch;
+  background: transparent;
+  touch-action: none;
+}
+
+.resize-handle.vertical {
+  cursor: col-resize;
+}
+
+.resize-handle.horizontal {
+  flex: 0 0 5px;
+  cursor: row-resize;
+}
+
+.resize-handle::after {
+  content: "";
+  position: absolute;
+  background: var(--border);
+  transition: background-color 0.12s ease;
+}
+
+.resize-handle.vertical::after {
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 1px;
+}
+
+.resize-handle.horizontal::after {
+  top: 2px;
+  right: 0;
+  left: 0;
+  height: 1px;
+}
+
+.resize-handle:hover::after,
+.resize-handle.dragging::after,
+.resize-handle:focus-visible::after {
+  background: var(--accent);
+}
+
+.resize-handle:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.editor-panel {
+  flex-basis: calc(var(--editor-ratio, 0.42) * 100%);
+}
+
+.history-panel {
+  width: var(--right-width, 320px);
+  flex: 0 0 var(--right-width, 320px);
+}
+
+.sidebar.collapsed,
+.object-browser.collapsed {
+  align-items: center;
+  gap: 8px;
+  width: 32px;
+  flex: 0 0 32px;
+  padding: 8px 0;
+  overflow: hidden;
+}
+
+.sidebar.collapsed > :not(.sidebar-rail),
+.object-browser.collapsed > :not(.object-rail) {
+  display: none;
+}
+
+.sidebar-rail,
+.object-rail {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-rail-label,
+.object-rail-label {
+  margin-top: 6px;
+  color: var(--faint);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  writing-mode: vertical-rl;
+}
+
+.layout-menu-host {
+  position: relative;
+}
+
+.layout-menu {
+  position: fixed;
+  z-index: 130;
+  min-width: 214px;
+  max-height: min(360px, 60vh);
+  overflow-y: auto;
+}
+
+.layout-check-slot {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  align-items: center;
+  justify-content: center;
+}
+
+.query-workspace.result-collapsed .editor-panel {
+  flex: 1 1 auto;
+}
+
+.query-workspace.result-collapsed .result-panel {
+  flex: 0 0 34px;
+  min-height: 34px;
+  overflow: hidden;
+}
+
+.query-workspace.result-collapsed .result-panel > :not(.panel-header) {
+  display: none;
+}
+
+@media (max-width: 1200px) {
+  .history-panel {
+    width: min(300px, 62vw);
+    flex: none;
+  }
+
+  .resize-handle-right {
+    display: none;
+  }
+}
+
+/* ===== 应用工具栏（Navicat / DBX 风格） ===== */
+
+.app-toolbar {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: center;
+  gap: 2px;
+  overflow: hidden;
+}
+
+.app-toolbar-separator {
+  width: 1px;
+  height: 18px;
+  flex: 0 0 1px;
+  margin: 0 4px;
+  background: var(--border);
+  opacity: 0.75;
+}
+
+.app-toolbar-spacer {
+  flex: 1 1 auto;
+  min-width: 4px;
+}
+
+.app-toolbar-action {
+  flex: 0 0 auto;
+}
+
+.app-toolbar-action.icon-only {
+  width: 28px;
+  min-width: 28px;
+  padding: 0;
+  justify-content: center;
+}
+
+.app-toolbar-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-toolbar-more.active {
+  background: var(--bg-active);
+  color: var(--text);
+}
+
+.app-toolbar-more-menu {
+  z-index: 140;
+  min-width: 220px;
+}
+
+.connection-chip {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 320px;
+  align-items: center;
+  gap: 10px;
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--text);
+  text-align: left;
+}
+
+.connection-chip:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+
+.connection-chip-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.connection-chip .titlebar-connection {
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-chip-meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.connection-chip-scope {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.readonly-badge {
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--warning);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.layout-button {
+  width: 28px;
+  padding: 0;
+  justify-content: center;
+}
+
+.titlebar-spacer {
+  flex: 1 1 auto;
+  min-width: 8px;
+  align-self: stretch;
+}
+
+.app-menubar {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  align-items: center;
+  gap: 1px;
+}
+
+.app-menubar-button {
+  height: 26px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.app-menubar-button:hover,
+.app-menubar-button.active {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.app-menubar-menu {
+  z-index: 150;
+  min-width: 220px;
+  max-height: min(520px, 70vh);
+  overflow-y: auto;
+}
+
+.app-toolbar-row {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.app-toolbar-row .app-toolbar {
+  flex: 1;
+}
+
+.about-modal p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.about-modal .about-version {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.about-modal .about-tech {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.about-modal .about-author {
+  color: var(--text);
+}
+
+.about-modal .about-github {
+  color: var(--muted);
+}
+
+.about-modal .about-github .link-button {
+  padding: 0;
+  font-size: 12px;
+}
+
+.about-modal .about-email {
+  color: var(--muted);
+}
+
+.about-modal .about-email .link-button {
+  padding: 0;
+  font-size: 12px;
 }

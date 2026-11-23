@@ -137,6 +137,14 @@ pub struct ColumnInfo {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ScopeTableColumns {
+    pub name: String,
+    pub kind: String,
+    pub columns: Vec<ColumnInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IndexInfo {
     pub name: String,
     pub columns: Vec<String>,

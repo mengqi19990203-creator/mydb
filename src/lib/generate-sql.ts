@@ -1,13 +1,7 @@
 import type { ColumnInfo, Driver } from "./types";
+import { quoteIdentifier } from "./sql-literal";
 
 export type GeneratedSqlKind = "select" | "insert" | "update" | "delete" | "ddl";
-
-function quote(name: string, driver: Driver): string {
-  if (driver === "mysql") {
-    return `\`${name.replaceAll("`", "``")}\``;
-  }
-  return `"${name.replaceAll('"', '""')}"`;
-}
 
 /** SQL-qualified name: MySQL uses database.table, PostgreSQL schema.table. */
 export function qualifiedSqlName(
@@ -18,15 +12,15 @@ export function qualifiedSqlName(
 ): string {
   if (driver === "postgres") {
     return schema
-      ? `${quote(schema, driver)}.${quote(table, driver)}`
-      : quote(table, driver);
+      ? `${quoteIdentifier(schema, driver)}.${quoteIdentifier(table, driver)}`
+      : quoteIdentifier(table, driver);
   }
   if (driver === "mysql") {
     return database
-      ? `${quote(database, driver)}.${quote(table, driver)}`
-      : quote(table, driver);
+      ? `${quoteIdentifier(database, driver)}.${quoteIdentifier(table, driver)}`
+      : quoteIdentifier(table, driver);
   }
-  return quote(table, driver);
+  return quoteIdentifier(table, driver);
 }
 
 /** Quoted qualified name for copying to the clipboard. */
@@ -38,12 +32,12 @@ export function qualifiedDisplayName(
 ): string {
   if (driver === "postgres") {
     return schema
-      ? `${quote(schema, driver)}.${quote(table, driver)}`
-      : quote(table, driver);
+      ? `${quoteIdentifier(schema, driver)}.${quoteIdentifier(table, driver)}`
+      : quoteIdentifier(table, driver);
   }
   return database
-    ? `${quote(database, driver)}.${quote(table, driver)}`
-    : quote(table, driver);
+    ? `${quoteIdentifier(database, driver)}.${quoteIdentifier(table, driver)}`
+    : quoteIdentifier(table, driver);
 }
 
 function placeholder(driver: Driver, position: number): string {
@@ -74,7 +68,7 @@ export function buildGeneratedSql(
         : `INSERT INTO ${tableName}\nDEFAULT VALUES;`;
     }
     const names = targets
-      .map((column) => quote(column.name, driver))
+      .map((column) => quoteIdentifier(column.name, driver))
       .join(", ");
     const values = targets
       .map((_, index) => placeholder(driver, index + 1))
@@ -102,7 +96,7 @@ export function buildGeneratedSql(
     const sets = updates
       .map(
         (column, index) =>
-          `${quote(column.name, driver)} = ${placeholder(
+          `${quoteIdentifier(column.name, driver)} = ${placeholder(
             driver,
             index + 1,
           )}`,
@@ -111,7 +105,7 @@ export function buildGeneratedSql(
     const condition = primaryKeys
       .map(
         (column, index) =>
-          `${quote(column.name, driver)} = ${placeholder(
+          `${quoteIdentifier(column.name, driver)} = ${placeholder(
             driver,
             updates.length + index + 1,
           )}`,
@@ -125,7 +119,7 @@ export function buildGeneratedSql(
   const condition = primaryKeys
     .map(
       (column, index) =>
-        `${quote(column.name, driver)} = ${placeholder(driver, index + 1)}`,
+        `${quoteIdentifier(column.name, driver)} = ${placeholder(driver, index + 1)}`,
     )
     .join(" AND ");
   return `DELETE FROM ${tableName}\nWHERE ${condition};`;

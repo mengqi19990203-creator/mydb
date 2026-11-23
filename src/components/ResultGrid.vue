@@ -9,6 +9,8 @@ import {
 } from "vue";
 import Icon from "./Icon.vue";
 import { writeClipboard as copyToClipboard } from "../lib/clipboard";
+import { columnNameIssue, type ResultExportSnapshot } from "../lib/result-export";
+import { buildRowJson } from "../lib/row-copy";
 import type { QueryResult } from "../lib/types";
 
 interface CellMenu {
@@ -37,6 +39,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   "hidden-change": [count: number];
+  "export-request": [snapshot: ResultExportSnapshot];
 }>();
 
 const columnWidths = reactive<Record<number, number>>({});
@@ -55,6 +58,12 @@ const visibleColumns = computed(() =>
     .map((name, index) => ({ name, index }))
     .filter((column) => !hiddenColumns.has(column.index)),
 );
+
+const jsonDisabledReason = computed(() => {
+  if (props.running) return "查询执行中";
+  if (!props.result) return "没有结果";
+  return columnNameIssue(visibleColumns.value.map((column) => column.name));
+});
 
 const sortedRows = computed<unknown[][]>(() => {
   const rows = props.result?.rows ?? [];
@@ -197,7 +206,7 @@ function openCellMenu(
   headerMenu.value = null;
   cellMenu.value = {
     x: Math.max(8, Math.min(event.clientX, window.innerWidth - 210)),
-    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 190)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 260)),
     rowIndex,
     colIndex,
   };
@@ -208,7 +217,7 @@ function openHeaderMenu(event: MouseEvent, colIndex: number) {
   cellMenu.value = null;
   headerMenu.value = {
     x: Math.max(8, Math.min(event.clientX, window.innerWidth - 210)),
-    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 240)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 280)),
     colIndex,
   };
 }
@@ -312,12 +321,64 @@ function copyColumnName() {
   void writeClipboard(name, "已复制列名");
 }
 
-function copyAll() {
-  if (!props.result) return;
+function copyAsJson() {
+  if (jsonDisabledReason.value) return;
+  const menu = cellMenu.value;
+  const row = menu ? sortedRows.value[menu.rowIndex] : undefined;
+  if (!row) {
+    closeMenus();
+    return;
+  }
   const columns = visibleColumns.value;
-  const header = columns.map((column) => tsvValue(column.name)).join("\t");
-  const body = sortedRows.value.map((row) =>
-    columns.map((column) => tsvValue(row[column.index])).join("\t"),
+  const text = buildRowJson(
+    columns.map((column) => column.name),
+    columns.map((column) => row[column.index] ?? null),
+  );
+  const message = hiddenColumns.size
+    ? `已复制 JSON（仅可见列，已隐藏 ${hiddenColumns.size} 列）`
+    : "已复制 JSON";
+  void writeClipboard(text, message);
+}
+
+function buildExportSnapshot(): ResultExportSnapshot | null {
+  const result = props.result;
+  if (!result || !result.rows.length) return null;
+  const columns = visibleColumns.value;
+  if (!columns.length) return null;
+  const activeSort = sortIndex.value;
+  return {
+    columns: columns.map((column) => column.name),
+    rows: sortedRows.value.map((row) =>
+      columns.map((column) => row[column.index] ?? null),
+    ),
+    sort:
+      activeSort === null
+        ? null
+        : {
+            column: result.columns[activeSort] ?? "",
+            direction: sortDirection.value,
+            columnHidden: hiddenColumns.has(activeSort),
+          },
+    hiddenCount: hiddenColumns.size,
+    sourceRowCount: result.rows.length,
+    truncated: result.truncated,
+  };
+}
+
+function requestExport() {
+  if (props.running) return;
+  const snapshot = buildExportSnapshot();
+  if (!snapshot) return;
+  closeMenus();
+  emit("export-request", snapshot);
+}
+
+function copyAll() {
+  const snapshot = buildExportSnapshot();
+  if (!snapshot) return;
+  const header = snapshot.columns.map(tsvValue).join("\t");
+  const body = snapshot.rows.map((row) =>
+    row.map((value) => tsvValue(value)).join("\t"),
   );
   void writeClipboard([header, ...body].join("\n"), "已复制全部结果");
 }
@@ -347,7 +408,7 @@ watch(
   { immediate: true },
 );
 
-defineExpose({ showAllColumns });
+defineExpose({ showAllColumns, requestExport });
 
 onMounted(() => {
   window.addEventListener("click", onGlobalClick);
@@ -473,10 +534,28 @@ onBeforeUnmount(() => {
         <Icon name="copy" :size="14" />
         复制列名
       </button>
+      <button
+        class="context-menu-item"
+        :disabled="Boolean(jsonDisabledReason)"
+        :title="jsonDisabledReason || '复制为 JSON'"
+        @click="copyAsJson"
+      >
+        <Icon name="copy" :size="14" />
+        复制为 JSON
+      </button>
       <div class="context-separator"></div>
       <button class="context-menu-item" @click="copyAll">
         <Icon name="copy" :size="14" />
         复制全部结果
+      </button>
+      <div class="context-separator"></div>
+      <button
+        class="context-menu-item"
+        :disabled="running || !result?.rows.length"
+        @click="requestExport"
+      >
+        <Icon name="download" :size="14" />
+        导出结果…
       </button>
     </div>
 
@@ -515,6 +594,15 @@ onBeforeUnmount(() => {
       <button class="context-menu-item" @click="resetHeaderWidth">
         <Icon name="structure" :size="14" />
         恢复自动列宽
+      </button>
+      <div class="context-separator"></div>
+      <button
+        class="context-menu-item"
+        :disabled="running || !result?.rows.length"
+        @click="requestExport"
+      >
+        <Icon name="download" :size="14" />
+        导出结果…
       </button>
     </div>
   </div>

@@ -37,21 +37,46 @@ fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<taur
     let new_query = MenuItemBuilder::with_id("menu-new-query", "新建查询")
         .accelerator("CmdOrCtrl+T")
         .build(handle)?;
-    let new_table = MenuItemBuilder::with_id("menu-new-table", "新建表")
-        .accelerator("CmdOrCtrl+Shift+N")
+    let close_tab = MenuItemBuilder::with_id("menu-close-tab", "关闭标签")
+        .accelerator("CmdOrCtrl+W")
         .build(handle)?;
+    let close_window = MenuItemBuilder::with_id("menu-close-window", "关闭窗口")
+        .accelerator("CmdOrCtrl+Shift+W")
+        .build(handle)?;
+
+    let refresh = MenuItemBuilder::with_id("menu-refresh", "刷新对象")
+        .accelerator("CmdOrCtrl+R")
+        .build(handle)?;
+    let history = MenuItemBuilder::with_id("menu-history", "执行历史")
+        .accelerator("CmdOrCtrl+Y")
+        .build(handle)?;
+    let toggle_sidebar = MenuItemBuilder::with_id("menu-toggle-sidebar", "连接侧栏")
+        .accelerator("CmdOrCtrl+B")
+        .build(handle)?;
+    let toggle_objects = MenuItemBuilder::with_id("menu-toggle-objects", "对象树")
+        .accelerator("CmdOrCtrl+Shift+B")
+        .build(handle)?;
+    let toggle_result = MenuItemBuilder::with_id("menu-toggle-result", "结果面板")
+        .accelerator("CmdOrCtrl+J")
+        .build(handle)?;
+    let toggle_right = MenuItemBuilder::with_id("menu-toggle-right", "右侧面板")
+        .accelerator("CmdOrCtrl+Shift+H")
+        .build(handle)?;
+    let reset_layout = MenuItemBuilder::with_id("menu-reset-layout", "重置布局")
+        .build(handle)?;
+
+    let er_diagram = MenuItemBuilder::with_id("menu-er-diagram", "ER 图").build(handle)?;
+    let structure_sync =
+        MenuItemBuilder::with_id("menu-structure-sync", "结构同步…").build(handle)?;
+    let data_sync = MenuItemBuilder::with_id("menu-data-sync", "数据同步…").build(handle)?;
 
     let file_menu = SubmenuBuilder::new(handle, "文件")
         .item(&new_connection)
         .item(&new_query)
-        .item(&new_table)
         .separator()
-        .text("menu-refresh", "刷新对象")
+        .item(&close_tab)
         .separator()
-        .item(&PredefinedMenuItem::close_window(
-            handle,
-            Some("关闭窗口"),
-        )?)
+        .item(&close_window)
         .build()?;
 
     let edit_menu = SubmenuBuilder::new(handle, "编辑")
@@ -65,7 +90,22 @@ fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<taur
         .build()?;
 
     let view_menu = SubmenuBuilder::new(handle, "视图")
-        .text("menu-history", "执行历史")
+        .item(&refresh)
+        .item(&history)
+        .separator()
+        .item(&toggle_sidebar)
+        .item(&toggle_objects)
+        .item(&toggle_result)
+        .item(&toggle_right)
+        .separator()
+        .item(&reset_layout)
+        .build()?;
+
+    let tools_menu = SubmenuBuilder::new(handle, "工具")
+        .item(&er_diagram)
+        .separator()
+        .item(&structure_sync)
+        .item(&data_sync)
         .build()?;
 
     let window_menu = SubmenuBuilder::new(handle, "窗口")
@@ -91,6 +131,7 @@ fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<taur
             &file_menu,
             &edit_menu,
             &view_menu,
+            &tools_menu,
             &window_menu,
             &help_menu,
         ])
@@ -108,9 +149,18 @@ pub fn run() {
             let event_name = match event.id().as_ref() {
                 "menu-new-connection" => "menu:new-connection",
                 "menu-new-query" => "menu:new-query",
-                "menu-new-table" => "menu:new-table",
+                "menu-close-tab" => "menu:close-tab",
+                "menu-close-window" => "menu:close-window",
                 "menu-refresh" => "menu:refresh",
                 "menu-history" => "menu:history",
+                "menu-toggle-sidebar" => "menu:toggle-sidebar",
+                "menu-toggle-objects" => "menu:toggle-objects",
+                "menu-toggle-result" => "menu:toggle-result",
+                "menu-toggle-right" => "menu:toggle-right",
+                "menu-reset-layout" => "menu:reset-layout",
+                "menu-er-diagram" => "menu:er-diagram",
+                "menu-structure-sync" => "menu:structure-sync",
+                "menu-data-sync" => "menu:data-sync",
                 _ => return,
             };
             let _ = app.emit(event_name, ());
@@ -136,6 +186,7 @@ pub fn run() {
             commands::move_connection_to_group,
             commands::test_connection,
             commands::list_tables,
+            commands::list_scope_columns,
             commands::list_databases,
             commands::list_database_objects,
             commands::list_schemas,

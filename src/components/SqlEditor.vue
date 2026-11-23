@@ -1,13 +1,19 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { basicSetup } from "codemirror";
-import { EditorState, Prec } from "@codemirror/state";
+import { Compartment, EditorState, Prec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
-import { SQLite, sql } from "@codemirror/lang-sql";
+import { MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { tags } from "@lezer/highlight";
+import type { Driver, ScopeTableColumns } from "../lib/types";
 
-const props = defineProps<{ modelValue: string; tabId: string }>();
+const props = defineProps<{
+  modelValue: string;
+  tabId: string;
+  driver: Driver;
+  completionTables: ScopeTableColumns[];
+}>();
 const emit = defineEmits<{
   "update:modelValue": [value: string];
   selection: [value: string];
@@ -16,6 +22,30 @@ const emit = defineEmits<{
 
 const host = ref<HTMLElement>();
 let view: EditorView | undefined;
+const language = new Compartment();
+
+function dialectFor(driver: Driver) {
+  switch (driver) {
+    case "mysql":
+      return MySQL;
+    case "postgres":
+      return PostgreSQL;
+    default:
+      return SQLite;
+  }
+}
+
+function languageFor(driver: Driver, tables: ScopeTableColumns[]) {
+  const schema: Record<string, string[]> = {};
+  for (const table of tables) {
+    schema[table.name] = table.columns.map((column) => column.name);
+  }
+  return sql({
+    dialect: dialectFor(driver),
+    schema,
+    upperCaseKeywords: true,
+  });
+}
 
 function selectedText(state: EditorState): string {
   const { from, to } = state.selection.main;
@@ -74,7 +104,7 @@ onMounted(() => {
       doc: props.modelValue,
       extensions: [
         basicSetup,
-        sql({ dialect: SQLite }),
+        language.of(languageFor(props.driver, props.completionTables)),
         editorTheme,
         Prec.high(syntaxHighlighting(dbxHighlight)),
         EditorView.lineWrapping,
@@ -126,6 +156,16 @@ watch(
       });
       emit("selection", "");
     }
+  },
+);
+
+watch(
+  [() => props.driver, () => props.completionTables],
+  ([driver, tables]) => {
+    if (!view) return;
+    view.dispatch({
+      effects: language.reconfigure(languageFor(driver, tables)),
+    });
   },
 );
 

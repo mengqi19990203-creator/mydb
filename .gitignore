@@ -15,6 +15,11 @@ src-tauri/gen
 *.local
 examples/demo.db
 
+# Local mydb app state (may contain connection details / history)
+connections.json
+history.json
+groups.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

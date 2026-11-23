@@ -16,9 +16,11 @@ const props = defineProps<{
   databaseCounts?: Record<string, number>;
   loading: boolean;
   activeTable: string | null;
+  collapsed?: boolean;
 }>();
 
 const emit = defineEmits<{
+  toggle: [];
   select: [table: TableInfo];
   "select-structure": [table: TableInfo];
   "select-index": [table: TableInfo];
@@ -253,7 +255,18 @@ watch(
 </script>
 
 <template>
-  <aside class="object-browser">
+  <aside class="object-browser" :class="{ collapsed }">
+    <div v-if="collapsed" class="object-rail">
+      <button
+        class="icon-button"
+        title="展开对象树"
+        aria-label="展开对象树"
+        @click="emit('toggle')"
+      >
+        <Icon name="chevron-right" :size="14" />
+      </button>
+      <span class="object-rail-label">对象</span>
+    </div>
     <header class="panel-header">
       <span>对象</span>
       <div class="panel-actions">
