@@ -6,7 +6,7 @@
 
 ### 新增
 
-- Redis Cluster 检测：连接集群时只显示 `db00`，不展示其他逻辑库，也不出现切库下拉框。
+- Redis Cluster 检测：连接集群时下拉框保留但只包含 `db00`，不展示其他逻辑库，也不执行 `SELECT`。
   - 后端使用 `INFO cluster`（失败时回退 `CLUSTER INFO`）判断集群模式；集群模式忽略非 0 库编号且不执行 `SELECT`。
   - 独立实例只有在确实存在多个逻辑库时才显示下拉框；库数量来自 `CONFIG GET databases`（不可用时回退 16），各库键数量来自 `INFO keyspace`。
 

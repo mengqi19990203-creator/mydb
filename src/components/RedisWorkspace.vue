@@ -33,14 +33,14 @@ const currentDatabase = ref(normalizeDatabase(props.database));
 const databaseLabel = computed(() => databaseLabelFor(currentDatabase.value));
 const dbOptions = ref<RedisDatabaseInfo[]>([]);
 const clusterMode = ref(false);
-const hasMultipleDatabases = computed(
-  () => !clusterMode.value && dbOptions.value.length > 1,
+const showDatabasePicker = computed(
+  () => clusterMode.value || dbOptions.value.length > 1,
 );
 const databaseBadgeTitle = computed(() => {
   if (clusterMode.value) {
-    return "Redis Cluster 仅支持 db0";
+    return "Redis Cluster 仅支持 db0，点击查看";
   }
-  return hasMultipleDatabases.value
+  return showDatabasePicker.value
     ? `当前 Redis 数据库：${databaseLabel.value}，点击切换`
     : `当前 Redis 数据库：${databaseLabel.value}`;
 });
@@ -254,7 +254,7 @@ async function loadDatabases() {
       currentDatabase.value = 0;
       emit("database-change", "0");
     }
-    if (!hasMultipleDatabases.value) {
+    if (!showDatabasePicker.value) {
       dbMenuOpen.value = false;
     }
   } catch (reason) {
@@ -364,7 +364,7 @@ onBeforeUnmount(() => {
       <div class="redis-panel-header">
         <span class="redis-db-control">
           键
-          <template v-if="hasMultipleDatabases">
+          <template v-if="showDatabasePicker">
             <span ref="dbPicker" class="redis-db-picker">
               <button
                 class="redis-db-badge redis-db-button"
@@ -381,6 +381,12 @@ onBeforeUnmount(() => {
               <div v-if="dbMenuOpen" class="redis-db-menu" role="menu">
                 <div v-if="dbLoading" class="redis-db-menu-hint">
                   加载数据库…
+                </div>
+                <div
+                  v-else-if="clusterMode"
+                  class="redis-db-menu-hint"
+                >
+                  Redis Cluster 仅支持 db0
                 </div>
                 <button
                   v-for="option in dbOptions"
