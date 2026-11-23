@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import ConfirmDialog from "./ConfirmDialog.vue";
 import Icon from "./Icon.vue";
 import * as api from "../lib/api";
 import { writeClipboard } from "../lib/clipboard";
-import type { RedisKeyDetail, RedisKeyEntry } from "../lib/types";
+import type {
+  RedisDatabaseInfo,
+  RedisKeyDetail,
+  RedisKeyEntry,
+} from "../lib/types";
 
 const props = defineProps<{
   connectionId: string;
@@ -12,12 +16,27 @@ const props = defineProps<{
   database?: string;
 }>();
 
-const databaseLabel = computed(() => {
-  const database = (props.database ?? "0").trim() || "0";
-  return /^\d+$/.test(database)
-    ? `db${database.padStart(2, "0")}`
-    : `db${database}`;
-});
+const emit = defineEmits<{
+  "database-change": [database: string];
+}>();
+
+function normalizeDatabase(value: string | null | undefined): number {
+  const parsed = Number((value ?? "0").trim() || "0");
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function databaseLabelFor(index: number): string {
+  return `db${String(index).padStart(2, "0")}`;
+}
+
+const currentDatabase = ref(normalizeDatabase(props.database));
+const databaseLabel = computed(() => databaseLabelFor(currentDatabase.value));
+const dbOptions = ref<RedisDatabaseInfo[]>([]);
+const dbMenuOpen = ref(false);
+const dbLoading = ref(false);
+const dbSwitching = ref(false);
+const dbError = ref("");
+const dbPicker = ref<HTMLElement | null>(null);
 
 const pattern = ref("*");
 const limit = ref(500);
@@ -212,6 +231,64 @@ async function copyText(text: string, message: string) {
   }
 }
 
+async function loadDatabases() {
+  dbLoading.value = true;
+  dbError.value = "";
+  try {
+    const result = await api.redisDatabases(props.connectionId);
+    dbOptions.value = result.databases;
+  } catch (reason) {
+    dbError.value = String(reason);
+  } finally {
+    dbLoading.value = false;
+  }
+}
+
+function toggleDatabaseMenu() {
+  if (dbSwitching.value) return;
+  dbMenuOpen.value = !dbMenuOpen.value;
+  if (dbMenuOpen.value) {
+    void loadDatabases();
+  }
+}
+
+async function applyDatabase(index: number, notify = true) {
+  if (dbSwitching.value) return;
+  dbSwitching.value = true;
+  dbError.value = "";
+  try {
+    await api.redisSelectDatabase(props.connectionId, index);
+    currentDatabase.value = index;
+    dbMenuOpen.value = false;
+    if (notify) {
+      emit("database-change", String(index));
+      flashToast(`已切换到 ${databaseLabelFor(index)}`);
+    }
+    reset();
+    await Promise.all([scan(), loadDatabases()]);
+  } catch (reason) {
+    dbError.value = String(reason);
+    scanError.value = String(reason);
+  } finally {
+    dbSwitching.value = false;
+  }
+}
+
+function chooseDatabase(index: number) {
+  if (index === currentDatabase.value) {
+    dbMenuOpen.value = false;
+    return;
+  }
+  void applyDatabase(index);
+}
+
+function onDocumentMouseDown(event: MouseEvent) {
+  if (!dbMenuOpen.value) return;
+  const target = event.target as Node | null;
+  if (target && dbPicker.value?.contains(target)) return;
+  dbMenuOpen.value = false;
+}
+
 function reset() {
   keys.value = [];
   scanned.value = 0;
@@ -229,13 +306,30 @@ function reset() {
 watch(
   () => props.connectionId,
   () => {
+    currentDatabase.value = normalizeDatabase(props.database);
     reset();
-    void scan();
+    void applyDatabase(currentDatabase.value, false);
+  },
+);
+
+watch(
+  () => props.database,
+  (value) => {
+    const next = normalizeDatabase(value);
+    if (next === currentDatabase.value) return;
+    currentDatabase.value = next;
+    reset();
+    void applyDatabase(next, false);
   },
 );
 
 onMounted(() => {
-  void scan();
+  window.addEventListener("mousedown", onDocumentMouseDown);
+  void applyDatabase(currentDatabase.value, false);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("mousedown", onDocumentMouseDown);
 });
 </script>
 
@@ -243,10 +337,43 @@ onMounted(() => {
   <section class="redis-workspace">
     <aside class="redis-key-panel">
       <div class="redis-panel-header">
-        <span>
+        <span class="redis-db-control">
           键
-          <span class="redis-db-badge" :title="`当前 Redis 数据库：${databaseLabel}`">
-            {{ databaseLabel }}
+          <span ref="dbPicker" class="redis-db-picker">
+            <button
+              class="redis-db-badge redis-db-button"
+              :title="`当前 Redis 数据库：${databaseLabel}，点击切换`"
+              :disabled="dbSwitching"
+              aria-haspopup="menu"
+              :aria-expanded="dbMenuOpen"
+              @click.stop="toggleDatabaseMenu"
+              @keydown.esc.stop="dbMenuOpen = false"
+            >
+              {{ databaseLabel }}
+              <Icon name="chevron-down" :size="10" />
+            </button>
+            <div v-if="dbMenuOpen" class="redis-db-menu" role="menu">
+              <div v-if="dbLoading" class="redis-db-menu-hint">
+                加载数据库…
+              </div>
+              <button
+                v-for="option in dbOptions"
+                :key="option.index"
+                class="redis-db-option"
+                :class="{ active: option.index === currentDatabase }"
+                role="menuitem"
+                @click="chooseDatabase(option.index)"
+              >
+                <span>{{ databaseLabelFor(option.index) }}</span>
+                <span
+                  v-if="option.keys !== null"
+                  class="redis-db-keys"
+                >
+                  {{ option.keys }} 个键
+                </span>
+              </button>
+              <p v-if="dbError" class="redis-db-menu-error">{{ dbError }}</p>
+            </div>
           </span>
         </span>
         <span class="hint">

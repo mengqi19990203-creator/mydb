@@ -175,6 +175,8 @@ pub fn run() {
             commands::list_history,
             commands::clear_history,
             commands::redis_ping,
+            commands::redis_databases,
+            commands::redis_select_database,
             commands::redis_scan_keys,
             commands::redis_key_detail,
             commands::redis_delete_key,

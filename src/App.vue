@@ -114,6 +114,7 @@ const tablesConnectionId = ref<string | null>(null);
 const databases = ref<string[]>([]);
 const activeDatabase = ref<string | null>(null);
 const databaseByConnection = reactive<Record<string, string>>({});
+const redisDatabaseByConnection = reactive<Record<string, string>>({});
 const schemas = ref<string[]>([]);
 const activeSchema = ref<string | null>(null);
 const scopeRevision = ref(0);
@@ -313,6 +314,23 @@ const selected = computed(
 const isRedisConnection = computed(
   () => selected.value?.driver === "redis",
 );
+
+const redisDatabase = computed(() => {
+  const connectionId = selectedId.value;
+  if (!connectionId || !isRedisConnection.value) return null;
+  return (
+    redisDatabaseByConnection[connectionId] ??
+    normalizeScopeValue(connectionFor(connectionId)?.database) ??
+    "0"
+  );
+});
+
+function handleRedisDatabaseChange(database: string) {
+  const connectionId = selectedId.value;
+  if (!connectionId) return;
+  redisDatabaseByConnection[connectionId] = database;
+  status.value = `Redis 数据库：db${database.padStart(2, "0")}`;
+}
 
 interface TabSource {
   connectionId: string | null;
@@ -1016,6 +1034,11 @@ async function refreshConnections(selectId?: string) {
       delete schemaByConnection[id];
     }
   }
+  for (const id of Object.keys(redisDatabaseByConnection)) {
+    if (!ids.has(id)) {
+      delete redisDatabaseByConnection[id];
+    }
+  }
 
   const removedWorkspaceTabs = new Set<string>();
   for (const tab of tableTabs.value) {
@@ -1559,6 +1582,7 @@ async function handleSave(payload: SavePayload) {
     resetConnectionTransactions(saved.id);
     dialogOpen.value = false;
     delete databaseByConnection[saved.id];
+    delete redisDatabaseByConnection[saved.id];
     closeTabsForConnection(saved.id);
     await refreshConnections(saved.id);
     status.value = `已保存连接：${saved.name}`;
@@ -1580,6 +1604,7 @@ function handleDelete(connection: ConnectionConfig) {
         resetConnectionTransactions(connection.id);
         delete databaseByConnection[connection.id];
         delete schemaByConnection[connection.id];
+        delete redisDatabaseByConnection[connection.id];
         for (const tab of tabs.value) {
           if (tab.connectionId === connection.id) {
             tab.connectionId = null;
@@ -2904,7 +2929,8 @@ onBeforeUnmount(() => {
             :key="selectedId"
             :connection-id="selectedId"
             :connection-name="selected?.name"
-            :database="selected?.database"
+            :database="redisDatabase ?? selected?.database"
+            @database-change="handleRedisDatabaseChange"
           />
           <div
             v-else-if="connectionsLoaded && !connections.length"
@@ -3049,7 +3075,11 @@ onBeforeUnmount(() => {
           :status="status"
           :connection="selected"
           :result="isRedisConnection ? null : result"
-          :database="activeDatabase ?? selected?.database ?? null"
+          :database="
+            isRedisConnection
+              ? redisDatabase
+              : activeDatabase ?? selected?.database ?? null
+          "
           :schema="activeSchema"
         />
       </section>

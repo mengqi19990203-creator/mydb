@@ -36,6 +36,9 @@ pub struct TransactionEntry {
 pub struct AppState {
     pub drivers: Mutex<HashMap<String, Arc<dyn DatabaseDriver>>>,
     pub redis_clients: Mutex<HashMap<String, MultiplexedConnection>>,
+    /// Last Redis logical database selected for a connection, reapplied when
+    /// the multiplexed connection is recreated.
+    pub redis_databases: Mutex<HashMap<String, i64>>,
     pub passwords: Mutex<HashMap<String, String>>,
     pub ssh_passwords: Mutex<HashMap<String, String>>,
     pub export_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,

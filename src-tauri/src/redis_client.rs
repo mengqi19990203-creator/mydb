@@ -2,6 +2,7 @@ use crate::models::ConnectionConfig;
 use redis::aio::MultiplexedConnection;
 use redis::{ConnectionAddr, ConnectionInfo, RedisConnectionInfo};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::time::Instant;
 
 const MAX_VALUE_BYTES: usize = 100_000;
@@ -41,6 +42,20 @@ pub struct RedisCommandResult {
     pub truncated: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisDatabaseInfo {
+    pub index: i64,
+    pub keys: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisDatabases {
+    pub databases: Vec<RedisDatabaseInfo>,
+    pub count: i64,
+}
+
 fn redis_error(context: &str, error: redis::RedisError) -> String {
     format!("{context}: {error}")
 }
@@ -65,12 +80,18 @@ fn database_index(config: &ConnectionConfig) -> Result<i64, String> {
 pub async fn connect(
     config: &ConnectionConfig,
     password: Option<&str>,
+    database: Option<i64>,
 ) -> Result<MultiplexedConnection, String> {
     let username = config.username.trim();
+    let db = match database {
+        Some(db) if db < 0 => return Err("Redis 数据库编号不能为负数".to_string()),
+        Some(db) => db,
+        None => database_index(config)?,
+    };
     let info = ConnectionInfo {
         addr: ConnectionAddr::Tcp(config.host.clone(), config.port),
         redis: RedisConnectionInfo {
-            db: database_index(config)?,
+            db,
             username: if username.is_empty() {
                 None
             } else {
@@ -104,7 +125,7 @@ pub async fn test_connection(
     config: &ConnectionConfig,
     password: Option<&str>,
 ) -> Result<(), String> {
-    connect(config, password).await.map(|_| ())
+    connect(config, password, None).await.map(|_| ())
 }
 
 pub async fn ping(connection: &mut MultiplexedConnection) -> Result<String, String> {
@@ -112,6 +133,85 @@ pub async fn ping(connection: &mut MultiplexedConnection) -> Result<String, Stri
         .query_async(connection)
         .await
         .map_err(|error| redis_error("Redis PING 失败", error))
+}
+
+fn parse_keyspace(info: &str) -> HashMap<i64, u64> {
+    let mut counts = HashMap::new();
+    for line in info.lines() {
+        let Some(rest) = line.strip_prefix("db") else {
+            continue;
+        };
+        let Some((index, fields)) = rest.split_once(':') else {
+            continue;
+        };
+        let Ok(index) = index.parse::<i64>() else {
+            continue;
+        };
+        for field in fields.split(',') {
+            if let Some(value) = field.strip_prefix("keys=") {
+                if let Ok(count) = value.parse::<u64>() {
+                    counts.insert(index, count);
+                }
+            }
+        }
+    }
+    counts
+}
+
+pub async fn list_databases(
+    connection: &mut MultiplexedConnection,
+) -> Result<RedisDatabases, String> {
+    // CONFIG may be disabled on managed Redis; default to the Redis default.
+    let count = match redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("databases")
+        .query_async::<Vec<String>>(connection)
+        .await
+    {
+        Ok(values) => values
+            .get(1)
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(16),
+        Err(_) => 16,
+    }
+    .clamp(1, 1024);
+
+    let keyspace = match redis::cmd("INFO")
+        .arg("keyspace")
+        .query_async::<String>(connection)
+        .await
+    {
+        Ok(info) => parse_keyspace(&info),
+        Err(_) => HashMap::new(),
+    };
+
+    let databases = (0..count)
+        .map(|index| RedisDatabaseInfo {
+            index,
+            keys: keyspace.get(&index).copied(),
+        })
+        .collect();
+
+    Ok(RedisDatabases { databases, count })
+}
+
+pub async fn select_database(
+    connection: &mut MultiplexedConnection,
+    database: i64,
+) -> Result<i64, String> {
+    if database < 0 {
+        return Err("Redis 数据库编号不能为负数".to_string());
+    }
+    let response: String = redis::cmd("SELECT")
+        .arg(database)
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_error("切换 Redis 数据库失败", error))?;
+    if !response.eq_ignore_ascii_case("OK") {
+        return Err(format!("Redis SELECT 响应异常: {response}"));
+    }
+    Ok(database)
 }
 
 pub async fn scan_keys(
@@ -521,7 +621,7 @@ pub async fn run_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_value, parse_command};
+    use super::{format_value, parse_command, parse_keyspace};
 
     #[test]
     fn parses_quoted_command_arguments() {
@@ -533,6 +633,16 @@ mod tests {
     fn rejects_unclosed_quotes() {
         assert!(parse_command(r#"SET key "value"#).is_err());
         assert!(parse_command("   ").is_err());
+    }
+
+    #[test]
+    fn parses_keyspace_counts() {
+        let counts = parse_keyspace(
+            "db0:keys=12,expires=2,avg_ttl=0\r\ndb3:keys=1,expires=0,avg_ttl=0\r\n",
+        );
+        assert_eq!(counts.get(&0), Some(&12));
+        assert_eq!(counts.get(&3), Some(&1));
+        assert_eq!(counts.get(&9), None);
     }
 
     #[test]

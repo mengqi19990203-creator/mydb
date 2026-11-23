@@ -10,6 +10,7 @@ import type {
   HistoryEntry,
   QueryResult,
   RedisCommandResult,
+  RedisDatabases,
   RedisKeyDetail,
   RedisScanResult,
   SchemaDiff,
@@ -474,6 +475,19 @@ export function clearHistory(): Promise<void> {
 
 export function redisPing(connectionId: string): Promise<string> {
   return invoke("redis_ping", { connectionId });
+}
+
+export function redisDatabases(
+  connectionId: string,
+): Promise<RedisDatabases> {
+  return invoke("redis_databases", { connectionId });
+}
+
+export function redisSelectDatabase(
+  connectionId: string,
+  database: number,
+): Promise<number> {
+  return invoke("redis_select_database", { connectionId, database });
 }
 
 export function redisScanKeys(

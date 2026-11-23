@@ -88,6 +88,7 @@ pub async fn save_connection(
     // Drop the cached pool/tunnel/Redis connection so the next request reconnects.
     state.drivers.lock().await.remove(&config.id);
     state.redis_clients.lock().await.remove(&config.id);
+    state.redis_databases.lock().await.remove(&config.id);
     close_connection_transactions(&state, &config.id).await;
 
     Ok(config)
@@ -105,6 +106,7 @@ pub async fn delete_connection(
 
     state.drivers.lock().await.remove(&id);
     state.redis_clients.lock().await.remove(&id);
+    state.redis_databases.lock().await.remove(&id);
     state.passwords.lock().await.remove(&id);
     state.ssh_passwords.lock().await.remove(&id);
     close_connection_transactions(&state, &id).await;

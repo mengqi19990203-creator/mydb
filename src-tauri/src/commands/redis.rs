@@ -1,6 +1,6 @@
 use super::{AppState, connection_read_only};
 use crate::redis_client::{
-    self, RedisCommandResult, RedisKeyDetail, RedisScanResult,
+    self, RedisCommandResult, RedisDatabases, RedisKeyDetail, RedisScanResult,
 };
 use crate::storage;
 use ::redis::aio::MultiplexedConnection;
@@ -53,12 +53,24 @@ async fn redis_connection(
     }
 
     let password = super::password_for(state, config, "db").await?;
-    let connection = redis_client::connect(config, password.as_deref()).await?;
+    let database = state
+        .redis_databases
+        .lock()
+        .await
+        .get(connection_id)
+        .copied();
+    let connection = redis_client::connect(config, password.as_deref(), database).await?;
     state
         .redis_clients
         .lock()
         .await
         .insert(connection_id.to_string(), connection.clone());
+    state
+        .redis_databases
+        .lock()
+        .await
+        .entry(connection_id.to_string())
+        .or_insert_with(|| config.database.trim().parse::<i64>().unwrap_or(0));
     Ok(connection)
 }
 
@@ -70,6 +82,33 @@ pub async fn redis_ping(
 ) -> Result<String, String> {
     let mut connection = redis_connection(&app, &state, &connection_id).await?;
     redis_client::ping(&mut connection).await
+}
+
+#[tauri::command]
+pub async fn redis_databases(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<RedisDatabases, String> {
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::list_databases(&mut connection).await
+}
+
+#[tauri::command]
+pub async fn redis_select_database(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    database: i64,
+) -> Result<i64, String> {
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    let selected = redis_client::select_database(&mut connection, database).await?;
+    state
+        .redis_databases
+        .lock()
+        .await
+        .insert(connection_id, selected);
+    Ok(selected)
 }
 
 #[tauri::command]

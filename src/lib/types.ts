@@ -230,3 +230,13 @@ export interface RedisCommandResult {
   elapsedMs: number;
   truncated: boolean;
 }
+
+export interface RedisDatabaseInfo {
+  index: number;
+  keys: number | null;
+}
+
+export interface RedisDatabases {
+  databases: RedisDatabaseInfo[];
+  count: number;
+}
