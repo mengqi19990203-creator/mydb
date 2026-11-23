@@ -53,13 +53,18 @@ async fn redis_connection(
     }
 
     let password = super::password_for(state, config, "db").await?;
-    let database = state
+    let desired = match state
         .redis_databases
         .lock()
         .await
         .get(connection_id)
-        .copied();
-    let connection = redis_client::connect(config, password.as_deref(), database).await?;
+        .copied()
+    {
+        Some(database) => database,
+        None => redis_client::database_index(config)?,
+    };
+    let mut connection = redis_client::connect(config, password.as_deref()).await?;
+    let database = redis_client::ensure_database(&mut connection, desired).await?;
     state
         .redis_clients
         .lock()
@@ -69,8 +74,7 @@ async fn redis_connection(
         .redis_databases
         .lock()
         .await
-        .entry(connection_id.to_string())
-        .or_insert_with(|| config.database.trim().parse::<i64>().unwrap_or(0));
+        .insert(connection_id.to_string(), database);
     Ok(connection)
 }
 
@@ -102,7 +106,7 @@ pub async fn redis_select_database(
     database: i64,
 ) -> Result<i64, String> {
     let mut connection = redis_connection(&app, &state, &connection_id).await?;
-    let selected = redis_client::select_database(&mut connection, database).await?;
+    let selected = redis_client::switch_database(&mut connection, database).await?;
     state
         .redis_databases
         .lock()

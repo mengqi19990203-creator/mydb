@@ -101,7 +101,7 @@ MySQL 连接是服务器级连接，`database` 只是可选的默认库；留空
 `src-tauri/src/redis_client.rs` 使用 `redis` crate 的 multiplexed async connection：
 
 - 连接参数来自 `ConnectionConfig` 的 host / port / 可选用户名 / 密码 / 数据库编号；`AppState.redis_clients` 按连接缓存 `MultiplexedConnection`，保存或删除连接时清除缓存。
-- `redis_databases` 用 `CONFIG GET databases` 读取逻辑库数量（不可用时回退到 16），并用 `INFO keyspace` 解析各库的键数量；`redis_select_database` 在缓存的 multiplexed 连接上执行 `SELECT`，并把选择记录到 `AppState.redis_databases`，连接被关闭/重建后自动恢复同一个库。前端 Redis 工作区的 `dbNN` 徽标是下拉按钮，切换后清空当前键并重新扫描。
+- `redis_databases` 先通过 `INFO cluster`（失败时回退 `CLUSTER INFO`）检测 Redis Cluster；集群模式固定只有 db0，不执行 `SELECT`。独立实例才用 `CONFIG GET databases` 读取逻辑库数量（不可用时回退到 16），并用 `INFO keyspace` 解析各库的键数量。`redis_select_database` 在缓存的 multiplexed 连接上执行 `SELECT`，并把选择记录到 `AppState.redis_databases`，连接被关闭/重建后自动恢复同一个库。前端 Redis 工作区的 `dbNN` 徽标在存在多个逻辑库时是下拉按钮，否则是普通徽标；集群模式只显示 db00。
 - `redis_scan_keys` 使用 `SCAN MATCH COUNT` 循环扫描（默认最多 500 个键），再用 pipeline 批量读取 `TYPE` 和 `TTL`。
 - `redis_key_detail` 按类型读取 string（GET/GETRANGE）、hash、list、set、zset、stream，单值和集合都有截断上限。
 - `redis_command` 支持带引号的命令行解析，结果按 RESP 值格式化；命令只通过 Redis 协议执行，不经过 shell。

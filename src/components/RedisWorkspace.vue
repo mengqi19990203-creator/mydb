@@ -32,6 +32,18 @@ function databaseLabelFor(index: number): string {
 const currentDatabase = ref(normalizeDatabase(props.database));
 const databaseLabel = computed(() => databaseLabelFor(currentDatabase.value));
 const dbOptions = ref<RedisDatabaseInfo[]>([]);
+const clusterMode = ref(false);
+const hasMultipleDatabases = computed(
+  () => !clusterMode.value && dbOptions.value.length > 1,
+);
+const databaseBadgeTitle = computed(() => {
+  if (clusterMode.value) {
+    return "Redis Cluster 仅支持 db0";
+  }
+  return hasMultipleDatabases.value
+    ? `当前 Redis 数据库：${databaseLabel.value}，点击切换`
+    : `当前 Redis 数据库：${databaseLabel.value}`;
+});
 const dbMenuOpen = ref(false);
 const dbLoading = ref(false);
 const dbSwitching = ref(false);
@@ -237,6 +249,14 @@ async function loadDatabases() {
   try {
     const result = await api.redisDatabases(props.connectionId);
     dbOptions.value = result.databases;
+    clusterMode.value = result.cluster;
+    if (result.cluster && currentDatabase.value !== 0) {
+      currentDatabase.value = 0;
+      emit("database-change", "0");
+    }
+    if (!hasMultipleDatabases.value) {
+      dbMenuOpen.value = false;
+    }
   } catch (reason) {
     dbError.value = String(reason);
   } finally {
@@ -257,12 +277,17 @@ async function applyDatabase(index: number, notify = true) {
   dbSwitching.value = true;
   dbError.value = "";
   try {
-    await api.redisSelectDatabase(props.connectionId, index);
-    currentDatabase.value = index;
+    const selected = await api.redisSelectDatabase(
+      props.connectionId,
+      index,
+    );
+    currentDatabase.value = selected;
     dbMenuOpen.value = false;
+    if (notify || selected !== index) {
+      emit("database-change", String(selected));
+    }
     if (notify) {
-      emit("database-change", String(index));
-      flashToast(`已切换到 ${databaseLabelFor(index)}`);
+      flashToast(`已切换到 ${databaseLabelFor(selected)}`);
     }
     reset();
     await Promise.all([scan(), loadDatabases()]);
@@ -339,41 +364,50 @@ onBeforeUnmount(() => {
       <div class="redis-panel-header">
         <span class="redis-db-control">
           键
-          <span ref="dbPicker" class="redis-db-picker">
-            <button
-              class="redis-db-badge redis-db-button"
-              :title="`当前 Redis 数据库：${databaseLabel}，点击切换`"
-              :disabled="dbSwitching"
-              aria-haspopup="menu"
-              :aria-expanded="dbMenuOpen"
-              @click.stop="toggleDatabaseMenu"
-              @keydown.esc.stop="dbMenuOpen = false"
-            >
-              {{ databaseLabel }}
-              <Icon name="chevron-down" :size="10" />
-            </button>
-            <div v-if="dbMenuOpen" class="redis-db-menu" role="menu">
-              <div v-if="dbLoading" class="redis-db-menu-hint">
-                加载数据库…
-              </div>
+          <template v-if="hasMultipleDatabases">
+            <span ref="dbPicker" class="redis-db-picker">
               <button
-                v-for="option in dbOptions"
-                :key="option.index"
-                class="redis-db-option"
-                :class="{ active: option.index === currentDatabase }"
-                role="menuitem"
-                @click="chooseDatabase(option.index)"
+                class="redis-db-badge redis-db-button"
+                :title="databaseBadgeTitle"
+                :disabled="dbSwitching"
+                aria-haspopup="menu"
+                :aria-expanded="dbMenuOpen"
+                @click.stop="toggleDatabaseMenu"
+                @keydown.esc.stop="dbMenuOpen = false"
               >
-                <span>{{ databaseLabelFor(option.index) }}</span>
-                <span
-                  v-if="option.keys !== null"
-                  class="redis-db-keys"
-                >
-                  {{ option.keys }} 个键
-                </span>
+                {{ databaseLabel }}
+                <Icon name="chevron-down" :size="10" />
               </button>
-              <p v-if="dbError" class="redis-db-menu-error">{{ dbError }}</p>
-            </div>
+              <div v-if="dbMenuOpen" class="redis-db-menu" role="menu">
+                <div v-if="dbLoading" class="redis-db-menu-hint">
+                  加载数据库…
+                </div>
+                <button
+                  v-for="option in dbOptions"
+                  :key="option.index"
+                  class="redis-db-option"
+                  :class="{ active: option.index === currentDatabase }"
+                  role="menuitem"
+                  @click="chooseDatabase(option.index)"
+                >
+                  <span>{{ databaseLabelFor(option.index) }}</span>
+                  <span
+                    v-if="option.keys !== null"
+                    class="redis-db-keys"
+                  >
+                    {{ option.keys }} 个键
+                  </span>
+                </button>
+                <p v-if="dbError" class="redis-db-menu-error">{{ dbError }}</p>
+              </div>
+            </span>
+          </template>
+          <span
+            v-else
+            class="redis-db-badge"
+            :title="databaseBadgeTitle"
+          >
+            {{ databaseLabel }}
           </span>
         </span>
         <span class="hint">

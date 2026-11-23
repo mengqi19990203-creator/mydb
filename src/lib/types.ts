@@ -239,4 +239,5 @@ export interface RedisDatabaseInfo {
 export interface RedisDatabases {
   databases: RedisDatabaseInfo[];
   count: number;
+  cluster: boolean;
 }

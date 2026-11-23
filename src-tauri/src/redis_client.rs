@@ -54,13 +54,14 @@ pub struct RedisDatabaseInfo {
 pub struct RedisDatabases {
     pub databases: Vec<RedisDatabaseInfo>,
     pub count: i64,
+    pub cluster: bool,
 }
 
 fn redis_error(context: &str, error: redis::RedisError) -> String {
     format!("{context}: {error}")
 }
 
-fn database_index(config: &ConnectionConfig) -> Result<i64, String> {
+pub fn database_index(config: &ConnectionConfig) -> Result<i64, String> {
     let value = config.database.trim();
     if value.is_empty() {
         return Ok(0);
@@ -80,18 +81,14 @@ fn database_index(config: &ConnectionConfig) -> Result<i64, String> {
 pub async fn connect(
     config: &ConnectionConfig,
     password: Option<&str>,
-    database: Option<i64>,
 ) -> Result<MultiplexedConnection, String> {
     let username = config.username.trim();
-    let db = match database {
-        Some(db) if db < 0 => return Err("Redis 数据库编号不能为负数".to_string()),
-        Some(db) => db,
-        None => database_index(config)?,
-    };
     let info = ConnectionInfo {
         addr: ConnectionAddr::Tcp(config.host.clone(), config.port),
         redis: RedisConnectionInfo {
-            db,
+            // Always start on db0: Redis Cluster rejects SELECT, so the
+            // requested database is applied later by `ensure_database`.
+            db: 0,
             username: if username.is_empty() {
                 None
             } else {
@@ -125,7 +122,10 @@ pub async fn test_connection(
     config: &ConnectionConfig,
     password: Option<&str>,
 ) -> Result<(), String> {
-    connect(config, password, None).await.map(|_| ())
+    let mut connection = connect(config, password).await?;
+    let database = database_index(config)?;
+    ensure_database(&mut connection, database).await?;
+    Ok(())
 }
 
 pub async fn ping(connection: &mut MultiplexedConnection) -> Result<String, String> {
@@ -158,9 +158,86 @@ fn parse_keyspace(info: &str) -> HashMap<i64, u64> {
     counts
 }
 
+fn parse_cluster_enabled(info: &str) -> bool {
+    info.lines().any(|line| line.trim() == "cluster_enabled:1")
+}
+
+pub async fn cluster_enabled(connection: &mut MultiplexedConnection) -> bool {
+    if let Ok(info) = redis::cmd("INFO")
+        .arg("cluster")
+        .query_async::<String>(connection)
+        .await
+    {
+        return parse_cluster_enabled(&info);
+    }
+    if let Ok(info) = redis::cmd("CLUSTER")
+        .arg("INFO")
+        .query_async::<String>(connection)
+        .await
+    {
+        return parse_cluster_enabled(&info);
+    }
+    false
+}
+
+pub async fn ensure_database(
+    connection: &mut MultiplexedConnection,
+    database: i64,
+) -> Result<i64, String> {
+    if database < 0 {
+        return Err("Redis 数据库编号不能为负数".to_string());
+    }
+    if database == 0 {
+        // New connections start on db0; nothing to apply.
+        return Ok(0);
+    }
+    if cluster_enabled(connection).await {
+        // Redis Cluster only has db0 and rejects SELECT.
+        return Ok(0);
+    }
+    select_database(connection, database).await
+}
+
+/// Explicit user-requested database switch. Unlike `ensure_database`, this
+/// always sends SELECT for standalone Redis, including switching back to db0.
+pub async fn switch_database(
+    connection: &mut MultiplexedConnection,
+    database: i64,
+) -> Result<i64, String> {
+    if database < 0 {
+        return Err("Redis 数据库编号不能为负数".to_string());
+    }
+    if cluster_enabled(connection).await {
+        return Ok(0);
+    }
+    select_database(connection, database).await
+}
+
 pub async fn list_databases(
     connection: &mut MultiplexedConnection,
 ) -> Result<RedisDatabases, String> {
+    let cluster = cluster_enabled(connection).await;
+
+    let keyspace = match redis::cmd("INFO")
+        .arg("keyspace")
+        .query_async::<String>(connection)
+        .await
+    {
+        Ok(info) => parse_keyspace(&info),
+        Err(_) => HashMap::new(),
+    };
+
+    if cluster {
+        return Ok(RedisDatabases {
+            databases: vec![RedisDatabaseInfo {
+                index: 0,
+                keys: keyspace.get(&0).copied(),
+            }],
+            count: 1,
+            cluster: true,
+        });
+    }
+
     // CONFIG may be disabled on managed Redis; default to the Redis default.
     let count = match redis::cmd("CONFIG")
         .arg("GET")
@@ -177,15 +254,6 @@ pub async fn list_databases(
     }
     .clamp(1, 1024);
 
-    let keyspace = match redis::cmd("INFO")
-        .arg("keyspace")
-        .query_async::<String>(connection)
-        .await
-    {
-        Ok(info) => parse_keyspace(&info),
-        Err(_) => HashMap::new(),
-    };
-
     let databases = (0..count)
         .map(|index| RedisDatabaseInfo {
             index,
@@ -193,7 +261,11 @@ pub async fn list_databases(
         })
         .collect();
 
-    Ok(RedisDatabases { databases, count })
+    Ok(RedisDatabases {
+        databases,
+        count,
+        cluster: false,
+    })
 }
 
 pub async fn select_database(
@@ -621,7 +693,7 @@ pub async fn run_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_value, parse_command, parse_keyspace};
+    use super::{format_value, parse_cluster_enabled, parse_command, parse_keyspace};
 
     #[test]
     fn parses_quoted_command_arguments() {
@@ -643,6 +715,15 @@ mod tests {
         assert_eq!(counts.get(&0), Some(&12));
         assert_eq!(counts.get(&3), Some(&1));
         assert_eq!(counts.get(&9), None);
+    }
+
+    #[test]
+    fn detects_cluster_mode() {
+        assert!(parse_cluster_enabled(
+            "# Cluster\r\ncluster_enabled:1\r\ncluster_state:ok\r\n"
+        ));
+        assert!(!parse_cluster_enabled("cluster_enabled:0\r\n"));
+        assert!(!parse_cluster_enabled("# Keyspace\r\ndb0:keys=1\r\n"));
     }
 
     #[test]

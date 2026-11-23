@@ -6,6 +6,8 @@
 
 界面按 DBX 的暗色工作台风格对齐：自定义 Overlay 标题栏、命令工具栏、连接/对象搜索、表标签、数据/结构分段控件、紧凑数据网格和深色模态框；仅参考视觉语言，不复制其品牌资源。
 
+版本变更记录见 [CHANGELOG.md](CHANGELOG.md)；版本号只在明确要求时提升。
+
 ## 当前功能
 
 - **SQLite**、**MySQL / MariaDB**、**PostgreSQL** 与 **Redis** 连接
@@ -17,7 +19,7 @@
 - **只读连接**：连接可标记为只读，命令层拒绝写入（SQL 只允许 SELECT/SHOW/DESCRIBE/EXPLAIN/PRAGMA，禁止多语句与 `RETURNING` 绕过），Redis 写命令同样被拒绝
 - **对象右键菜单**：表 / 视图 / 物化视图可打开数据、查看结构、在新标签打开、生成 SQL（SELECT / INSERT / UPDATE / DELETE / DDL，直接在查询标签打开）、复制 DDL / 名称 / 带引号限定名、导出、重命名、删除、刷新；表支持「复制为新表」（结构 + 全部数据）、清空表 / 截断表；视图支持「复制为新视图」和「快照为新表」（可选是否包含数据）；存储过程 / 函数 / 触发器 / 事件 / 序列 / 索引按当前驱动能力提供复制 DDL、重命名与删除；数据库和模式节点提供切换、新建表、刷新、复制名称；表右键支持「导入数据」（CSV / JSON）
 - SQLite 对象树同样固定显示表 / 视图 / 索引 / 触发器及各自数量
-- Redis 支持 host / port / 可选用户名 / 密码 / 数据库编号；左侧扫描键，右侧查看 string / hash / list / set / zset / stream 内容、删除键，并执行任意 Redis 命令；工作区和状态栏会显示当前数据库编号（如 `db01`）；主页面 `dbNN` 徽标可点击展开逻辑库下拉框，列表显示各库键数量，选中后立即切换并在重连后保持所选库
+- Redis 支持 host / port / 可选用户名 / 密码 / 数据库编号；左侧扫描键，右侧查看 string / hash / list / set / zset / stream 内容、删除键，并执行任意 Redis 命令；工作区和状态栏会显示当前数据库编号（如 `db01`）；主页面 `dbNN` 徽标可点击展开逻辑库下拉框，列表显示各库键数量，选中后立即切换并在重连后保持所选库；检测到 Redis Cluster 时只显示 `db00` 且不提供切库下拉框
 - 数据库密码可选保存到系统钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service）；不勾选时仅当前运行有效
 - MySQL / PostgreSQL 支持 **SSH 隧道**：私钥或密码认证，首次连接自动写入 `~/.ssh/known_hosts`（TOFU），之后检测主机密钥变化
 - 连接分组与颜色标记
