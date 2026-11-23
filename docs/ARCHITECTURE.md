@@ -139,11 +139,11 @@ MySQL 连接是服务器级连接，`database` 只是可选的默认库；留空
 
 ## ER 图
 
-顶部工具栏的「ER 图」会以标签形式打开 `ErDiagram.vue`（同一连接 + 库 / 模式复用同一个 ER 标签），后端命令 `get_er_diagram` 调用驱动的默认 `er_diagram` 实现：先 `list_tables` 过滤出表，再对每张表调用 `list_columns` 与 `list_foreign_keys`（SQLite `PRAGMA foreign_key_list`、MySQL `key_column_usage` + `referential_constraints`、PostgreSQL `pg_constraint`），只保留目标表也在当前范围内的外键。前端用轻量力导向布局初始化节点，支持拖拽、滚轮缩放、空白平移和适应窗口，点击节点通过 `openTable` 打开数据页；切换数据库或模式时组件按 scope key 重新挂载，多个 ER 标签用 `v-show` 保留各自布局。
+工具菜单的「ER 图」会以标签形式打开 `ErDiagram.vue`（同一连接 + 库 / 模式复用同一个 ER 标签），后端命令 `get_er_diagram` 调用驱动的默认 `er_diagram` 实现：先 `list_tables` 过滤出表，再对每张表调用 `list_columns` 与 `list_foreign_keys`（SQLite `PRAGMA foreign_key_list`、MySQL `key_column_usage` + `referential_constraints`、PostgreSQL `pg_constraint`），只保留目标表也在当前范围内的外键。前端用轻量力导向布局初始化节点，支持拖拽、滚轮缩放、空白平移和适应窗口，点击节点通过 `openTable` 打开数据页；切换数据库或模式时组件按 scope key 重新挂载，多个 ER 标签用 `v-show` 保留各自布局。
 
 ## 结构同步
 
-顶部工具栏的「同步」打开 `SchemaSyncDialog.vue`。后端 `compare_schemas(source, target, source_database, source_schema, target_database, target_schema, tables, include_indexes, include_foreign_keys)` 要求源与目标属于同一驱动（Redis 除外）。`commands/context.rs` 负责解析两侧范围：
+工具菜单的「同步」打开 `SchemaSyncDialog.vue`。后端 `compare_schemas(source, target, source_database, source_schema, target_database, target_schema, tables, include_indexes, include_foreign_keys)` 要求源与目标属于同一驱动（Redis 除外）。`commands/context.rs` 负责解析两侧范围：
 
 - 源范围可以通过 `resolve_source` 指向任意 MySQL 数据库或 PostgreSQL 数据库 / 模式；选择与连接当前范围相同时复用缓存驱动，否则用 `isolated_driver_for` 新建一条不进入缓存的独立连接。
 - 目标为另一条同类型连接时，未指定库 / 模式则使用该连接缓存的驱动及其当前数据库 / 模式，指定了则同样通过 `isolated_driver_for` 建立独立连接；目标为源连接本身时（仅 MySQL / PostgreSQL）也走独立连接。源和目标范围相同是允许的，此时依赖不同的源表 / 目标表进行对比；同一张表对自身会被前端拦截。
@@ -162,7 +162,7 @@ MySQL 连接是服务器级连接，`database` 只是可选的默认库；留空
 
 ## 数据同步
 
-顶部工具栏的「数据同步」打开 `DataSyncDialog.vue`。后端 `compare_table_data(source, target, source_table, target_table, source_database, source_schema, target_database, target_schema, max_rows)` 要求源与目标属于同一驱动（Redis 除外）；源端和目标端都通过 `resolve_source` / `resolve_target` 解析数据库 / 模式，支持另一条同类型连接、同一 MySQL / PostgreSQL 连接下的不同库 / 模式，以及同一库内的不同表。两侧 `list_columns` 必须都有主键且主键字段一致；默认每侧读取 5000 行（上限 50000，单列主键时按主键排序）。纯函数 `build_data_diff` 生成差异：
+工具菜单的「数据同步」打开 `DataSyncDialog.vue`。后端 `compare_table_data(source, target, source_table, target_table, source_database, source_schema, target_database, target_schema, max_rows)` 要求源与目标属于同一驱动（Redis 除外）；源端和目标端都通过 `resolve_source` / `resolve_target` 解析数据库 / 模式，支持另一条同类型连接、同一 MySQL / PostgreSQL 连接下的不同库 / 模式，以及同一库内的不同表。两侧 `list_columns` 必须都有主键且主键字段一致；默认每侧读取 5000 行（上限 50000，单列主键时按主键排序）。纯函数 `build_data_diff` 生成差异：
 
 - 按主键规范化（JSON 值的 canonical 字符串，整数与等价浮点视为相同）建立行映射。
 - 源独有行 → `INSERT`；双方都存在 → 比较公共非二进制 / 数组字段，不同则 `UPDATE`；目标独有行 → `DELETE`。
@@ -231,15 +231,17 @@ SQL 标签可以开启交互式事务。后端 `commands/transaction.rs` 在 `Ap
 
 折叠使用 class 与 rail，不用 `v-if` 卸载 QueryWorkspace / TableDataView，因此查询结果、表分页筛选和列宽不会丢；结果面板折叠时只保留 34px 标题条。标题栏「布局」菜单和 `⌘/Ctrl+B`、`⌘/Ctrl+Shift+B`、`⌘/Ctrl+J`、`⌘/Ctrl+Shift+H` 统一控制开关，布局变化防抖保存。
 
-## 应用工具栏
+## 动作注册表与连接 chip
 
-`src/lib/app-actions.ts` 定义 `AppAction`（id、分组、图标、快捷键、优先级、主栏/更多、启用状态与禁用原因、执行函数）；`App.vue` 用响应式数据生成动作列表，后续 B-25 命令面板可以复用同一注册表。
+`src/lib/app-actions.ts` 定义 `AppAction`（id、分组、图标、快捷键、优先级、主栏/更多、启用状态与禁用原因、执行函数）；`App.vue` 用响应式数据生成动作列表，窗口内菜单、原生菜单与右键菜单共用同一份执行函数，后续 B-25 命令面板也可以复用同一注册表。
 
-`AppToolbar.vue` 按「连接 / 对象 / 查询 / 工具 / 视图」渲染主栏，并用 `ResizeObserver` 测量可用宽度：优先保留高优先级动作和「新建连接 / 新建查询 / 新建表」的文字，空间不足时其余动作只显示图标，再不足则连同低频动作（导入数据、导出结果、关闭标签等）进入「更多」菜单；More 菜单按分组展示、保留快捷键与禁用原因，使用固定定位并与 layout/菜单的点击外部关闭逻辑一致。连接 chip 显示连接名、驱动、库 / 模式、状态和只读标记，点击复用现有连接右键菜单。Run 位于 SQL 编辑器标题栏右侧，表 / ER 视图不显示；工具栏动作与原生菜单、右键菜单共用同一套 App 函数。
+窗口内菜单栏下方不再有独立的应用工具栏行；新建连接、新建查询、刷新、ER 图、结构同步、数据同步、历史、导入数据、导出结果、关闭标签等动作统一收在「文件 / 工具 / 视图」菜单和对象树中。标题栏右侧保留连接 chip，显示连接名、驱动、库 / 模式、状态和只读标记，点击复用现有连接右键菜单。Run 位于 SQL 编辑器标题栏右侧，表 / ER 视图不显示。
 
 ## 前端结构
 
 - `App.vue`：应用外壳、连接列表、当前选择、查询状态。
+- `WorkspaceStart.vue`：零标签时的全幅「主工作区」和零连接时的「欢迎」起始面。主工作区显示新建查询 / 新建连接命令、最近查询（`api.listHistory`，零标签时预载）、当前连接和当前库对象快捷入口；对象树保持可见，编辑器与右侧历史面板隐藏。零标签状态写入 `mydb.queryTabs.v1`，重启恢复；选择连接 / 数据库 / 模式不会自动创建标签。
+- `DriverIcon.vue`：连接侧栏按驱动渲染品牌 SVG（MySQL / PostgreSQL / Redis / SQLite，资源在 `src/assets/drivers/`，Devicon MIT，详情见同目录 `LICENSE`）；MariaDB 复用 MySQL 驱动图标。
 - `ConnectionDialog.vue`：新建 / 编辑连接，文件选择，测试连接。
 - `ObjectBrowser.vue`：数据库 / 模式层级与对象搜索，复用 `ObjectCategoryGroups.vue` 渲染分类；`ObjectCategoryGroups.vue` 负责分类计数、搜索过滤和按需加载列信息。对象树支持方向键 / Home / End / Enter 键盘导航；点击 SQLite 索引会通过 `get_index_table` 找到所属表并在结构页高亮该索引。
 - `QueryWorkspace.vue`：编辑器与结果面板布局。
@@ -275,7 +277,7 @@ macOS 原生菜单栏在 `src-tauri/src/lib.rs` 的 `build_menu` 中构建，按
 
 需要前端处理的自定义项通过 `AppHandle::emit` 发送 `menu:*` 事件，`App.vue` 的 `bindMenuEvents` 监听后复用现有动作；关闭窗口通过前端 `getCurrentWindow().close()` 执行。布局快捷键在 macOS 由原生菜单加速键处理，其他平台在 `onWindowKeydown` 中兜底；表格单元格与文本输入的右键菜单仍由各自组件/全局监听处理。
 
-窗口内另有一行 `AppMenuBar.vue` 文本菜单（文件 / 编辑 / 视图 / 工具 / 窗口 / 帮助），菜单项由 `App.vue` 的 `appMenus` 生成并复用工具栏动作注册表、布局开关和连接操作；编辑菜单通过 `lastEditable` 跟踪最近聚焦的输入框 / CodeMirror，把撤销、重做、剪切、复制、粘贴、全选作用到该控件。窗口关闭、最小化、全屏使用 Tauri window API；关于 mydb 使用内嵌弹窗，「GitHub 项目主页」通过 opener 打开。
+窗口内另有一行 `AppMenuBar.vue` 文本菜单（文件 / 编辑 / 视图 / 工具 / 窗口 / 帮助），菜单项由 `App.vue` 的 `appMenus` 生成并复用动作注册表、布局开关和连接操作；编辑菜单通过 `lastEditable` 跟踪最近聚焦的输入框 / CodeMirror，把撤销、重做、剪切、复制、粘贴、全选作用到该控件。窗口关闭、最小化、全屏使用 Tauri window API；关于 mydb 使用内嵌弹窗，「GitHub 项目主页」通过 opener 打开。
 
 WebView 默认右键菜单由 `App.vue` 的全局 `contextmenu` 监听接管：输入框、文本域和 `contenteditable`（含 CodeMirror）显示中文编辑菜单，其他区域显示中文应用动作菜单。表格单元格的右键菜单由 `TableDataView` 自行处理并调用 `preventDefault`，全局监听通过 `event.defaultPrevented` 避让，避免叠加两层菜单。
 

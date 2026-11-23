@@ -3,11 +3,11 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import AppMenuBar from "./components/AppMenuBar.vue";
-import AppToolbar from "./components/AppToolbar.vue";
 import ConnectionDialog from "./components/ConnectionDialog.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import CreateTableDialog from "./components/CreateTableDialog.vue";
 import DataSyncDialog from "./components/DataSyncDialog.vue";
+import DriverIcon from "./components/DriverIcon.vue";
 import ErDiagram from "./components/ErDiagram.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
 import Icon from "./components/Icon.vue";
@@ -21,6 +21,7 @@ import SchemaSyncDialog from "./components/SchemaSyncDialog.vue";
 import StatusBar from "./components/StatusBar.vue";
 import TableDataView from "./components/TableDataView.vue";
 import TableStructureView from "./components/TableStructureView.vue";
+import WorkspaceStart from "./components/WorkspaceStart.vue";
 import * as api from "./lib/api";
 import type { ConnectionInfoFormat } from "./lib/api";
 import { readClipboard, writeClipboard } from "./lib/clipboard";
@@ -388,9 +389,14 @@ const tableMode = computed<"data" | "structure">({
     if (activeTableTab.value) activeTableTab.value.mode = value;
   },
 });
-const viewMode = computed<"sql" | "table" | "er">(() =>
-  activeTableTab.value ? "table" : activeErTab.value ? "er" : "sql",
-);
+const viewMode = computed<"sql" | "table" | "er" | "empty">(() => {
+  if (activeTableTab.value) return "table";
+  if (activeErTab.value) return "er";
+  if (tabs.value.some((tab) => tab.id === activeWorkspaceTabId.value)) {
+    return "sql";
+  }
+  return "empty";
+});
 
 const selectedId = computed<string | null>({
   get: () => selectedConnectionId.value,
@@ -444,6 +450,7 @@ const historyOpen = computed<boolean>({
   },
 });
 const historyLoading = ref(false);
+const historyLoaded = ref(false);
 const historyEntries = ref<HistoryEntry[]>([]);
 const connectionStatus = ref<ConnectionStatus>("idle");
 const connectionError = ref("");
@@ -582,6 +589,7 @@ const treeActiveTableName = computed(() => {
 });
 
 const isMacPlatform = navigator.platform.toUpperCase().includes("MAC");
+const commandKeyLabel = isMacPlatform ? "⌘" : "Ctrl+";
 const runShortcutLabel = computed(() => (isMacPlatform ? "⌘↩" : "Ctrl+Enter"));
 const runDisabledReason = computed(() => {
   if (!selectedId.value) return "请先选择一个数据库连接";
@@ -815,7 +823,7 @@ const workspaceTabViews = computed<WorkspaceTabView[]>(() => {
         source: queryTabSource(query),
         icon: "code",
         running: query.running,
-        closable: tabs.value.length > 1,
+        closable: true,
       });
       continue;
     }
@@ -902,7 +910,14 @@ function restoreQueryTabs(list: ConnectionConfig[]) {
       tabs?: StoredQueryTab[];
       activeTabId?: string;
     };
-    if (!Array.isArray(parsed.tabs) || !parsed.tabs.length) return;
+    if (!Array.isArray(parsed.tabs)) return;
+    if (!parsed.tabs.length) {
+      tabs.value = [];
+      tabOrder.value = [];
+      activeTabId.value = "";
+      activeWorkspaceTabId.value = "";
+      return;
+    }
     const byId = new Map(list.map((connection) => [connection.id, connection]));
     const restored: QueryTab[] = [];
     for (const stored of parsed.tabs) {
@@ -1295,7 +1310,7 @@ async function refreshConnections(selectId?: string) {
   if (selectedId.value) {
     await refreshTables();
     const connection = connectionFor(selectedId.value);
-    if (connection && connection.driver !== "redis") {
+    if (connection && connection.driver !== "redis" && tabs.value.length) {
       ensureTabForSource(true);
       if (pendingRestoredActiveTabId) {
         const restoredTab = tabs.value.find(
@@ -1343,7 +1358,7 @@ async function selectConnection(id: string) {
   connectionError.value = "";
   await refreshTables();
   const connection = connectionFor(id);
-  if (connection && connection.driver !== "redis") {
+  if (connection && connection.driver !== "redis" && tabs.value.length) {
     ensureTabForSource(true);
   }
 }
@@ -1377,11 +1392,11 @@ async function selectDatabase(database: string) {
       tablesConnectionId.value = connectionId;
       connectionStatus.value = "connected";
       status.value = `已切换到数据库：${database} · ${tables.value.length} 个对象`;
-      ensureTabForSource(true);
+      if (tabs.value.length) ensureTabForSource(true);
       return;
     }
     await refreshTables();
-    ensureTabForSource(true);
+    if (tabs.value.length) ensureTabForSource(true);
     status.value = `已切换到数据库：${database}`;
   } catch (reason) {
     activeDatabase.value = previous;
@@ -1411,7 +1426,7 @@ async function selectSchema(schema: string) {
     scopeRevision.value += 1;
     schemaByConnection[connectionId] = schema;
     await refreshTables();
-    ensureTabForSource(true);
+    if (tabs.value.length) ensureTabForSource(true);
     status.value = `已切换到模式：${schema}`;
   } catch (reason) {
     activeSchema.value = previous;
@@ -1663,8 +1678,6 @@ watch(
 );
 
 function closeQueryTab(id: string) {
-  if (tabs.value.length <= 1) return;
-
   const index = tabs.value.findIndex((tab) => tab.id === id);
   if (index < 0) return;
 
@@ -1677,6 +1690,9 @@ function closeQueryTab(id: string) {
   const neighbor = neighborTabId(id);
   tabs.value.splice(index, 1);
   removeTabFromOrder(id);
+  if (activeTabId.value === id) {
+    activeTabId.value = tabs.value[0]?.id ?? "";
+  }
   if (!wasActive) return;
 
   if (neighbor) {
@@ -1687,7 +1703,11 @@ function closeQueryTab(id: string) {
   if (replacement) {
     activeTabId.value = replacement.id;
     activeWorkspaceTabId.value = replacement.id;
+    return;
   }
+  activeWorkspaceTabId.value = "";
+  activeTabId.value = "";
+  status.value = "已关闭全部标签";
 }
 
 function closeTableTab(id: string) {
@@ -1738,11 +1758,18 @@ function closeWorkspaceTab(id: string) {
 
 function fallbackToQueryTab() {
   const id = activeTabId.value;
-  if (!id) return;
-  activeWorkspaceTabId.value = id;
-  if (tabs.value.some((tab) => tab.id === id)) {
+  if (id && tabs.value.some((tab) => tab.id === id)) {
+    activeWorkspaceTabId.value = id;
     void showQueryTab(id);
+    return;
   }
+  const next = tabOrder.value[0];
+  if (next) {
+    void activateWorkspaceTabById(next);
+    return;
+  }
+  activeWorkspaceTabId.value = "";
+  activeTabId.value = "";
 }
 
 function closeTabsForConnection(connectionId: string) {
@@ -2309,6 +2336,25 @@ async function handleTableCreated(table: string, warning?: string) {
     : `已创建表：${table}`;
 }
 
+async function loadHistory(force = false) {
+  if (historyLoading.value || (historyLoaded.value && !force)) return;
+  historyLoading.value = true;
+  try {
+    historyEntries.value = await api.listHistory();
+    historyLoaded.value = true;
+  } catch (reason) {
+    status.value = String(reason);
+  } finally {
+    historyLoading.value = false;
+  }
+}
+
+watch(viewMode, (mode) => {
+  if (mode === "empty" && connectionsLoaded.value && !isRedisConnection.value) {
+    void loadHistory(true);
+  }
+});
+
 async function toggleHistory() {
   if (isRedisConnection.value) {
     status.value = "Redis 连接暂不支持 SQL 历史";
@@ -2320,18 +2366,15 @@ async function toggleHistory() {
   }
 
   historyOpen.value = true;
-  historyLoading.value = true;
-  try {
-    historyEntries.value = await api.listHistory();
-  } catch (reason) {
-    status.value = String(reason);
-  } finally {
-    historyLoading.value = false;
-  }
+  await loadHistory(true);
 }
 
 function useHistory(entry: HistoryEntry) {
-  const tab = activeTab.value;
+  let tab = activeTab.value;
+  if (!tab) {
+    newQuery();
+    tab = activeTab.value;
+  }
   if (!tab) return;
 
   activeTabId.value = tab.id;
@@ -2366,6 +2409,7 @@ function handleClearHistory() {
       try {
         await api.clearHistory();
         historyEntries.value = [];
+        historyLoaded.value = true;
         status.value = "已清空执行历史";
       } catch (reason) {
         status.value = String(reason);
@@ -2873,15 +2917,11 @@ async function copyContactEmail() {
   }
 }
 
-const canCloseActiveTab = computed(() => {
-  const activeIsQuery = tabs.value.some(
-    (tab) => tab.id === activeWorkspaceTabId.value,
-  );
-  return (
+const canCloseActiveTab = computed(
+  () =>
     Boolean(activeWorkspaceTabId.value) &&
-    (!activeIsQuery || tabs.value.length > 1)
-  );
-});
+    tabOrder.value.includes(activeWorkspaceTabId.value),
+);
 
 const appActions = computed<AppAction[]>(() => {
   const modifier = isMacPlatform ? "⌘" : "Ctrl+";
@@ -3052,7 +3092,7 @@ const appActions = computed<AppAction[]>(() => {
       enabled: canCloseActiveTab.value,
       disabledReason: canCloseActiveTab.value
         ? undefined
-        : "至少保留一个查询标签",
+        : "当前没有可关闭的标签",
       run: closeActiveWorkspaceTab,
     },
   ];
@@ -3290,6 +3330,14 @@ onMounted(async () => {
   } catch (reason) {
     status.value = String(reason);
   }
+
+  if (
+    connections.value.length &&
+    viewMode.value === "empty" &&
+    !isRedisConnection.value
+  ) {
+    void loadHistory();
+  }
 });
 
 onBeforeUnmount(() => {
@@ -3417,10 +3465,6 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <div class="app-toolbar-row">
-      <AppToolbar :actions="appActions" />
-    </div>
-
     <div class="app-body">
       <aside
         class="sidebar"
@@ -3516,7 +3560,7 @@ onBeforeUnmount(() => {
                   class="connection-color"
                   :style="{ background: connection.color }"
                 ></span>
-                <span class="db-icon"><Icon name="database" :size="15" /></span>
+                <span class="db-icon"><DriverIcon :driver="connection.driver" :size="18" /></span>
                 <span class="connection-meta">
                   <span class="connection-name-row">
                     <span class="connection-name" :title="connection.name">{{ connection.name }}</span>
@@ -3608,6 +3652,12 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div v-else-if="connections.length" class="workspace-tabs">
+          <span
+            v-if="!workspaceTabViews.length"
+            class="workspace-start-label"
+          >
+            主工作区
+          </span>
           <button
             v-if="tabScrollLeft"
             class="tab-scroll"
@@ -3703,58 +3753,49 @@ onBeforeUnmount(() => {
             :database="redisDatabase ?? selected?.database"
             @database-change="handleRedisDatabaseChange"
           />
-          <div
+          <WorkspaceStart
             v-else-if="connectionsLoaded && !connections.length"
-            class="welcome"
-          >
-            <div class="welcome-card">
-              <span class="welcome-mark">M</span>
-              <h1>连接你的第一个数据库</h1>
-              <p>
-                支持 SQLite、MySQL / MariaDB、PostgreSQL 与 Redis。
-                连接配置保存在本机，密码可选择写入系统钥匙串。
-              </p>
-              <div class="welcome-drivers">
-                <span class="welcome-driver">SQLite</span>
-                <span class="welcome-driver">MySQL / MariaDB</span>
-                <span class="welcome-driver">PostgreSQL</span>
-                <span class="welcome-driver">Redis</span>
-              </div>
-              <div class="welcome-actions">
-                <button class="button primary" @click="openNewConnection">
-                  <Icon name="plus" :size="14" />
-                  新建连接
-                </button>
-              </div>
-            </div>
-          </div>
+            :connections-count="0"
+            :selected="null"
+            :target="''"
+            :scope="''"
+            :connection-status="connectionStatus"
+            :connection-status-label="connectionStatusLabel"
+            :tables="[]"
+            :tables-loading="false"
+            :history="[]"
+            :history-loading="false"
+            :command-key="commandKeyLabel"
+            @new-connection="openNewConnection"
+          />
           <template v-else>
             <ObjectBrowser
-            :connection-id="selectedId ?? ''"
-            :driver="selected?.driver ?? 'sqlite'"
-            :tables="tables"
-            :databases="databases"
-            :active-database="activeDatabase"
-            :schemas="schemas"
-            :active-schema="activeSchema"
-            :database-counts="databaseCounts"
-            :loading="tablesLoading"
-            :active-table="treeActiveTableName"
-            :collapsed="layout.objectsCollapsed"
-            @toggle="toggleObjects"
-            @select="openTable"
-            @select-structure="openTableStructure"
-            @select-index="openIndex"
-            @open-new-tab="openTableInNewTab"
-            @import-data="openImportData"
-            @select-database="selectDatabase"
-            @select-schema="selectSchema"
-            @refresh="refreshTables"
-            @create="openCreateTable"
-            @generate-sql="openGeneratedSql"
-          />
-          <ResizeHandle
-            v-if="!layout.objectsCollapsed"
+              v-if="selected"
+              :connection-id="selectedId ?? ''"
+              :driver="selected?.driver ?? 'sqlite'"
+              :tables="tables"
+              :databases="databases"
+              :active-database="activeDatabase"
+              :schemas="schemas"
+              :active-schema="activeSchema"
+              :database-counts="databaseCounts"
+              :loading="tablesLoading"
+              :active-table="treeActiveTableName"
+              :collapsed="layout.objectsCollapsed"
+              @toggle="toggleObjects"
+              @select="openTable"
+              @select-structure="openTableStructure"
+              @select-index="openIndex"
+              @open-new-tab="openTableInNewTab"
+              @import-data="openImportData"
+              @select-database="selectDatabase"
+              @select-schema="selectSchema"
+              @refresh="refreshTables"
+              @create="openCreateTable"
+              @generate-sql="openGeneratedSql"
+            />
+            <ResizeHandle
+            v-if="selected && !layout.objectsCollapsed"
             orientation="vertical"
             :value="effectiveWidths.objects"
             :min="160"
@@ -3762,6 +3803,26 @@ onBeforeUnmount(() => {
             label="调整对象树宽度"
             @update:value="layout.objectsWidth = $event"
             @reset="layout.objectsWidth = 216"
+          />
+          <WorkspaceStart
+            v-if="viewMode === 'empty'"
+            :connections-count="connections.length"
+            :selected="selected"
+            :target="selected ? connectionTarget(selected) : ''"
+            :scope="connectionChipScope"
+            :connection-status="connectionStatus"
+            :connection-status-label="connectionStatusLabel"
+            :tables="tables"
+            :tables-loading="tablesLoading"
+            :history="historyEntries"
+            :history-loading="historyLoading"
+            :command-key="commandKeyLabel"
+            @new-connection="openNewConnection"
+            @new-query="newQuery"
+            @select-history="useHistory"
+            @open-table="openTable"
+            @refresh-tables="refreshTables"
+            @refresh-history="loadHistory(true)"
           />
           <QueryWorkspace
             ref="queryWorkspaceRef"
@@ -3856,7 +3917,7 @@ onBeforeUnmount(() => {
           </template>
 
           <ResizeHandle
-            v-if="historyOpen && !isRedisConnection"
+            v-if="viewMode !== 'empty' && historyOpen && !isRedisConnection"
             class="resize-handle-right"
             orientation="vertical"
             invert
@@ -3868,7 +3929,7 @@ onBeforeUnmount(() => {
             @reset="layout.rightWidth = 320"
           />
           <HistoryPanel
-            v-if="!isRedisConnection"
+            v-if="viewMode !== 'empty' && !isRedisConnection"
             :open="historyOpen"
             :entries="historyEntries"
             :loading="historyLoading"
