@@ -53,11 +53,13 @@ export const ACTION_GROUP_LABELS: Record<AppActionGroup, string> = {
 };
 
 export interface MenuBarItem {
+  id?: string;
   label?: string;
   shortcut?: string;
   disabled?: boolean;
   disabledReason?: string;
   separator?: boolean;
+  checked?: boolean;
   danger?: boolean;
   action?: () => void | Promise<void>;
 }

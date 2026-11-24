@@ -713,9 +713,10 @@ impl DatabaseDriver for MySqlDriver {
         table: &str,
         keys: &[ColumnValue],
         changes: &[ColumnValue],
+        single_row: bool,
     ) -> Result<u64, String> {
         if keys.is_empty() {
-            return Err("该表没有主键，无法安全编辑".to_string());
+            return Err("该表没有可用的行标识，无法安全编辑".to_string());
         }
         if changes.is_empty() {
             return Ok(0);
@@ -727,14 +728,21 @@ impl DatabaseDriver for MySqlDriver {
             .map(|item| format!("{} = ?", quote_identifier(&item.column)))
             .collect::<Vec<_>>()
             .join(", ");
-        let where_clause = keys
+        let key_clause = keys
             .iter()
-            .map(|item| format!("{} = ?", quote_identifier(&item.column)))
+            .map(|item| {
+                if item.value.is_null() {
+                    format!("{} IS NULL", quote_identifier(&item.column))
+                } else {
+                    format!("{} = ?", quote_identifier(&item.column))
+                }
+            })
             .collect::<Vec<_>>()
             .join(" AND ");
         let sql = format!(
-            "UPDATE {} SET {set_clause} WHERE {where_clause}",
-            qualified_identifier(&schema, table)
+            "UPDATE {} SET {set_clause} WHERE {key_clause}{}",
+            qualified_identifier(&schema, table),
+            if single_row { " LIMIT 1" } else { "" }
         );
 
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
@@ -742,7 +750,9 @@ impl DatabaseDriver for MySqlDriver {
             query = bind_json_mysql(query, &change.value);
         }
         for key in keys {
-            query = bind_json_mysql(query, &key.value);
+            if !key.value.is_null() {
+                query = bind_json_mysql(query, &key.value);
+            }
         }
 
         let result = query
@@ -781,25 +791,39 @@ impl DatabaseDriver for MySqlDriver {
         Ok(result.rows_affected())
     }
 
-    async fn delete_row(&self, table: &str, keys: &[ColumnValue]) -> Result<u64, String> {
+    async fn delete_row(
+        &self,
+        table: &str,
+        keys: &[ColumnValue],
+        single_row: bool,
+    ) -> Result<u64, String> {
         if keys.is_empty() {
-            return Err("该表没有主键，无法安全删除".to_string());
+            return Err("该表没有可用的行标识，无法安全删除".to_string());
         }
 
         let schema = self.current_database().await;
         let where_clause = keys
             .iter()
-            .map(|item| format!("{} = ?", quote_identifier(&item.column)))
+            .map(|item| {
+                if item.value.is_null() {
+                    format!("{} IS NULL", quote_identifier(&item.column))
+                } else {
+                    format!("{} = ?", quote_identifier(&item.column))
+                }
+            })
             .collect::<Vec<_>>()
             .join(" AND ");
         let sql = format!(
-            "DELETE FROM {} WHERE {where_clause}",
-            qualified_identifier(&schema, table)
+            "DELETE FROM {} WHERE {where_clause}{}",
+            qualified_identifier(&schema, table),
+            if single_row { " LIMIT 1" } else { "" }
         );
 
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for key in keys {
-            query = bind_json_mysql(query, &key.value);
+            if !key.value.is_null() {
+                query = bind_json_mysql(query, &key.value);
+            }
         }
 
         let result = query

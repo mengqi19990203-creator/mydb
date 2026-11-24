@@ -102,6 +102,19 @@ pub trait DatabaseDriver: Send + Sync {
     }
 
     async fn table_structure(&self, table: &str) -> Result<TableStructure, String>;
+    /// Rebuilds a SQLite table to change a column's type, nullability or
+    /// default. Drivers with native ALTER support do not implement this.
+    async fn rebuild_column(
+        &self,
+        _table: &str,
+        _column: &str,
+        _name: &str,
+        _data_type: &str,
+        _nullable: bool,
+        _default_value: Option<&str>,
+    ) -> Result<(), String> {
+        Err("当前驱动不支持重建表修改字段".to_string())
+    }
     async fn read_rows(
         &self,
         table: &str,
@@ -116,9 +129,15 @@ pub trait DatabaseDriver: Send + Sync {
         table: &str,
         keys: &[ColumnValue],
         changes: &[ColumnValue],
+        single_row: bool,
     ) -> Result<u64, String>;
     async fn insert_row(&self, table: &str, values: &[ColumnValue]) -> Result<u64, String>;
-    async fn delete_row(&self, table: &str, keys: &[ColumnValue]) -> Result<u64, String>;
+    async fn delete_row(
+        &self,
+        table: &str,
+        keys: &[ColumnValue],
+        single_row: bool,
+    ) -> Result<u64, String>;
     /// Foreign keys declared on `table`, used by the ER diagram.
     async fn list_foreign_keys(&self, _table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
         Ok(Vec::new())
@@ -134,10 +153,14 @@ pub trait DatabaseDriver: Send + Sync {
 
         let mut nodes = Vec::new();
         let mut relations = Vec::new();
-        for table in tables.iter().filter(|table| table.kind == "table") {
+        for table in tables
+            .iter()
+            .filter(|table| matches!(table.kind.as_str(), "table" | "view" | "matview"))
+        {
             let columns = self.list_columns(&table.name).await?;
             nodes.push(ErTable {
                 name: table.name.clone(),
+                kind: table.kind.clone(),
                 columns: columns
                     .into_iter()
                     .map(|column| ErColumn {
@@ -148,6 +171,9 @@ pub trait DatabaseDriver: Send + Sync {
                     .collect(),
             });
 
+            if table.kind != "table" {
+                continue;
+            }
             for key in self.list_foreign_keys(&table.name).await? {
                 if !names.contains(key.referenced_table.as_str()) {
                     continue;

@@ -24,6 +24,7 @@ import type { ColumnInfo, ColumnValue, Driver } from "../lib/types";
 const props = defineProps<{
   connectionId: string;
   table: string;
+  tableKind?: string;
   databaseLabel?: string;
   driver?: Driver;
   database?: string;
@@ -84,7 +85,28 @@ const primaryKeys = computed(() =>
   columns.value.filter((column) => column.primaryKey),
 );
 const driverKind = computed<Driver>(() => props.driver ?? "sqlite");
-const canEdit = computed(() => primaryKeys.value.length > 0);
+const isTable = computed(() => (props.tableKind ?? "table") === "table");
+
+function isBinaryColumn(column: ColumnInfo): boolean {
+  return /(^|[^A-Z])(BLOB|BINARY|VARBINARY|BYTEA|BIT|IMAGE|RAW)([^A-Z]|$)/i.test(
+    column.dataType,
+  );
+}
+
+/**
+ * Without a primary key we match the whole row. Binary values are decoded for
+ * display, so they cannot be used to identify a row again; leave them out.
+ */
+const matchColumns = computed(() =>
+  columns.value.filter((column) => !isBinaryColumn(column)),
+);
+const singleRowMatch = computed(() => primaryKeys.value.length === 0);
+const canEdit = computed(
+  () =>
+    columns.value.length > 0 &&
+    (primaryKeys.value.length > 0 ||
+      (isTable.value && matchColumns.value.length > 0)),
+);
 const updateCopyReason = computed(() => {
   if (loading.value) return "数据加载中";
   if (saving.value) return "正在保存，暂不能复制 UPDATE";
@@ -457,7 +479,8 @@ function parseInput(value: string, column: ColumnInfo): unknown {
 }
 
 function rowKeys(row: unknown[]): ColumnValue[] {
-  return primaryKeys.value.map((column) => ({
+  const keys = primaryKeys.value.length ? primaryKeys.value : matchColumns.value;
+  return keys.map((column) => ({
     column: column.name,
     value: row[columnIndex(column.name)],
   }));
@@ -488,6 +511,7 @@ async function commitEdit() {
       props.table,
       rowKeys(row),
       [{ column: column.name, value: parseInput(current.value, column) }],
+      singleRowMatch.value,
     );
     editing.value = null;
     await load(offset.value);
@@ -509,9 +533,11 @@ async function deleteRow(rowIndex: number) {
   const keys = rowKeys(row);
   deleteRequest.value = {
     keys,
-    detail: keys
-      .map((key) => `${key.column} = ${formatCell(key.value)}`)
-      .join("\n"),
+    detail: singleRowMatch.value
+      ? `匹配整行 ${keys.length} 个字段（无主键，仅删除 1 行）`
+      : keys
+          .map((key) => `${key.column} = ${formatCell(key.value)}`)
+          .join("\n"),
   };
 }
 
@@ -523,7 +549,12 @@ async function confirmDeleteRow() {
   saving.value = true;
   error.value = "";
   try {
-    await api.deleteTableRow(props.connectionId, props.table, request.keys);
+    await api.deleteTableRow(
+      props.connectionId,
+      props.table,
+      request.keys,
+      singleRowMatch.value,
+    );
     const nextOffset =
       rows.value.length === 1 && offset.value > 0
         ? Math.max(0, offset.value - limit.value)
@@ -674,7 +705,10 @@ function changeSize(event: Event) {
         </span>
         <span class="hint">{{ total }} 行</span>
         <span v-if="columns.length && !canEdit" class="hint warning">
-          该表没有主键，行内编辑和删除已禁用
+          {{ isTable ? "没有可编辑的字段" : "视图不支持行内编辑和删除" }}
+        </span>
+        <span v-else-if="columns.length && singleRowMatch" class="hint warning">
+          无主键，按整行匹配，仅修改 / 删除 1 行
         </span>
         <span v-else-if="columns.length" class="hint">
           双击单元格编辑

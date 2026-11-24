@@ -8,12 +8,14 @@ const props = defineProps<{
   detail?: string | null;
   confirmText?: string;
   cancelText?: string;
+  extraText?: string;
   danger?: boolean;
 }>();
 
 const emit = defineEmits<{
   confirm: [];
   cancel: [];
+  extra: [];
 }>();
 
 const modalRef = ref<HTMLElement | null>(null);
@@ -90,6 +92,13 @@ onBeforeUnmount(() => {
           @click="emit('cancel')"
         >
           {{ cancelText ?? "取消" }}
+        </button>
+        <button
+          v-if="extraText"
+          class="button ghost"
+          @click="emit('extra')"
+        >
+          {{ extraText }}
         </button>
         <button
           class="button"

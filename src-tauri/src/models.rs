@@ -184,6 +184,7 @@ pub struct ErColumn {
 #[serde(rename_all = "camelCase")]
 pub struct ErTable {
     pub name: String,
+    pub kind: String,
     pub columns: Vec<ErColumn>,
 }
 

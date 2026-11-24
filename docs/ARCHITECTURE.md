@@ -191,7 +191,7 @@ MySQL 连接是服务器级连接，`database` 只是可选的默认库；留空
 
 格式转换全部在 `src/lib/result-export.ts` 完成：CSV 为 UTF-8 + `\n`，表头可选，NULL 为空字段，逗号 / 引号 / 换行 / 首尾空格加引号；JSON 是保留数字、布尔和 null 的对象数组，重复或空列名时禁用；Markdown 先转义 `\` 与 `|`，换行变 `<br>`；SQL INSERT 要求填写 `table` 或 `schema.table`，每行一条语句、不包事务。标识符引用和 SQL 字面量统一走 `src/lib/sql-literal.ts`（MySQL 双反斜杠与 `''`，PostgreSQL / SQLite 只做 `''`）。对话框明确提示隐藏列、排序和截断范围；导出不重新查询、不写执行历史。
 
-`write_text_file` 现在先写同目录临时文件再 rename，失败时删除临时文件，避免留下半截导出文件；表数据导出和同步 SQL 保存也复用该命令。
+`write_text_file` 现在先写同目录临时文件再 rename，失败时删除临时文件，避免留下半截导出文件；表数据导出和同步 SQL 保存也复用该命令。SQL 文件的读取使用 `read_text_file`（只允许普通文件、5 MB 上限、UTF-8 校验并去掉 BOM），路径由原生打开 / 保存对话框提供；文件路径只存在当前查询标签内，不写入 localStorage。
 
 ## 行级复制
 
@@ -240,14 +240,15 @@ SQL 标签可以开启交互式事务。后端 `commands/transaction.rs` 在 `Ap
 ## 前端结构
 
 - `App.vue`：应用外壳、连接列表、当前选择、查询状态。
-- `WorkspaceStart.vue`：零标签时的全幅「主工作区」和零连接时的「欢迎」起始面。主工作区显示新建查询 / 新建连接命令、最近查询（`api.listHistory`，零标签时预载）、当前连接和当前库对象快捷入口；对象树保持可见，编辑器与右侧历史面板隐藏。零标签状态写入 `mydb.queryTabs.v1`，重启恢复；选择连接 / 数据库 / 模式不会自动创建标签。
+- `WorkspaceStart.vue`：零标签时的全幅「主工作区」和零连接时的「欢迎」起始面。主工作区显示新建查询 / 新建连接命令、最近查询（`api.listHistory`，零标签时预载）、当前连接和当前库对象快捷入口；对象树保持可见，编辑器与右侧历史面板隐藏。零标签状态写入 `mydb.queryTabs.v1`，重启恢复；选择连接 / 数据库 / 模式不会自动创建标签。传入 `redis` 时显示 Redis 形态：控制台已关闭、当前连接 / 逻辑库和打开控制台入口，不显示 SQL 历史或表对象。
 - `DriverIcon.vue`：连接侧栏按驱动渲染品牌 SVG（MySQL / PostgreSQL / Redis / SQLite，资源在 `src/assets/drivers/`，Devicon MIT，详情见同目录 `LICENSE`）；MariaDB 复用 MySQL 驱动图标。
+- `CommandPalette.vue` / `src/lib/command-palette.ts`：`⌘/Ctrl+K` 命令面板，消费 `connections/tables/databases/schemas/workspaceTabViews/appActions`；分组搜索连接、当前库对象、标签和命令，最近连接/命令写入 `mydb.commandPalette.recent.v1`；支持 IME 组合保护、键盘循环、`⌘/Ctrl+Enter` 新表标签和焦点恢复，不发后端请求。
 - `ConnectionDialog.vue`：新建 / 编辑连接，文件选择，测试连接。
 - `ObjectBrowser.vue`：数据库 / 模式层级与对象搜索，复用 `ObjectCategoryGroups.vue` 渲染分类；`ObjectCategoryGroups.vue` 负责分类计数、搜索过滤和按需加载列信息。对象树支持方向键 / Home / End / Enter 键盘导航；点击 SQLite 索引会通过 `get_index_table` 找到所属表并在结构页高亮该索引。
 - `QueryWorkspace.vue`：编辑器与结果面板布局。
 - `SqlEditor.vue`：CodeMirror 实例，`Mod-Enter` 触发运行；有选区时把选中 SQL 作为 `run` 事件载荷，无选区时执行整个标签。选区文本同步到 `QueryTab.selectedSql`，这样点击工具栏「运行」时即使编辑器失焦也能继续执行选中部分；切换标签或替换文档会清空选区。
 - `ResultGrid.vue`：结果表格、NULL 样式、截断提示；列宽拖拽 / 双击恢复、表头三态排序、表头右键（只看此列 / 隐藏此列 / 显示所有列 / 恢复自动列宽）、单元格右键复制单元格 / 整行 / 列名 / 全部结果。
-- `RedisWorkspace.vue`：Redis 键扫描、键详情、删除与命令控制台。
+- `RedisWorkspace.vue`：Redis 键扫描、键详情、删除与命令控制台。Redis 控制台作为可关闭的标签显示（`redisWorkspaceOpen`）；关闭后由 `WorkspaceStart` 的 Redis 形态接管主工作区，重新选择连接或点标签栏 `+` 恢复。
 - `ExportDialog.vue`：对象导出对话框，选择格式、行范围（全部行 / 指定行数）与 CSV 表头；导出期间工具栏右下角显示进度提示，可取消。
 - `ErDiagram.vue`：ER 图画布，力导向布局、节点拖拽、缩放与平移。
 - `SchemaSyncDialog.vue`：选择源 / 目标连接与库 / 模式、全部表或指定表、是否包含索引 / 外键，展示结构与行数差异并生成迁移 SQL。
@@ -269,13 +270,15 @@ WKWebView 里 `navigator.clipboard.writeText` 在 `await` 之后常因用户手�
 
 macOS 原生菜单栏在 `src-tauri/src/lib.rs` 的 `build_menu` 中构建，按 Navicat / macOS 习惯分为「文件 / 编辑 / 视图 / 工具 / 窗口 / 帮助」：
 
-- 文件：新建连接（`⌘N`）、新建查询（`⌘T`）、关闭标签（`⌘W`）、关闭窗口（`⌘⇧W`）。
+- 文件：新建连接（`⌘N`）、新建查询（`⌘T`）、打开 SQL 文件（`⌘O`）、保存 SQL（`⌘S`）、另存为（`⌘⇧S`）、关闭标签（`⌘W`）、关闭窗口（`⌘⇧W`）。
 - 编辑：使用 Tauri 预定义的撤销 / 重做 / 剪切 / 复制 / 粘贴 / 全选，交给系统处理当前焦点控件。
 - 视图：刷新对象（`⌘R`）、执行历史（`⌘Y`）、连接侧栏（`⌘B`）、对象树（`⌘⇧B`）、结果面板（`⌘J`）、右侧面板（`⌘⇧H`）、重置布局。
 - 工具：ER 图、结构同步、数据同步。
 - 窗口 / 帮助：最小化、全屏、前置全部窗口、关于。
 
-需要前端处理的自定义项通过 `AppHandle::emit` 发送 `menu:*` 事件，`App.vue` 的 `bindMenuEvents` 监听后复用现有动作；关闭窗口通过前端 `getCurrentWindow().close()` 执行。布局快捷键在 macOS 由原生菜单加速键处理，其他平台在 `onWindowKeydown` 中兜底；表格单元格与文本输入的右键菜单仍由各自组件/全局监听处理。
+需要前端处理的自定义项通过 `AppHandle::emit` 发送 `menu:*` 事件，`App.vue` 的 `bindMenuEvents` 监听后复用现有动作；关闭窗口通过前端 `getCurrentWindow().close()` 执行。布局与 SQL 文件快捷键在 macOS 由原生菜单加速键处理，其他平台在 `onWindowKeydown` 中兜底；表格单元格与文本输入的右键菜单仍由各自组件/全局监听处理。
+
+窗口内菜单由 `appMenus` 生成，`AppMenuBar.vue` 实现 roving tabindex、方向键/Home/End、Enter/Esc、首字母 typeahead 和 ARIA；视图面板开关使用 checked 项。原生菜单通过新增的 `sync_menu_state` 命令接收 `enabled` / `checked` 映射（id 为 `menu-<item id>`），以 ≥80ms 节流同步，避免窗口内菜单与原生菜单状态分叉。原生编辑菜单的查找/注释等 CodeMirror 命令不注册全局加速键，避免抢占编辑器快捷键；`MutationObserver` 检测任意 `.modal-backdrop` 后统一置灰两个菜单入口，并把 Tab 焦点限制在最上层对话框内。`src/lib/closed-tabs.ts` 维护会话内 LIFO 关闭栈（最多 10 条），由文件菜单和 `⇧⌘/Ctrl+Shift+T` 恢复，不持久化。`ShortcutHelpDialog.vue` 与 `src/lib/shortcuts.ts` 提供只读快捷键速查、平台格式化和开发期重复检测。
 
 窗口内另有一行 `AppMenuBar.vue` 文本菜单（文件 / 编辑 / 视图 / 工具 / 窗口 / 帮助），菜单项由 `App.vue` 的 `appMenus` 生成并复用动作注册表、布局开关和连接操作；编辑菜单通过 `lastEditable` 跟踪最近聚焦的输入框 / CodeMirror，把撤销、重做、剪切、复制、粘贴、全选作用到该控件。窗口关闭、最小化、全屏使用 Tauri window API；关于 mydb 使用内嵌弹窗，「GitHub 项目主页」通过 opener 打开。
 
@@ -285,7 +288,7 @@ WebView 默认右键菜单由 `App.vue` 的全局 `contextmenu` 监听接管：�
 
 - 连接配置：`app_config_dir()/connections.json`，原子写入（临时文件 + rename）。
 - 数据库文件：用户选择，不复制、不修改。
-- 密码：勾选保存时写入系统钥匙串（`keyring` 4.x，macOS Keychain / Windows Credential Manager / Linux Secret Service），账号为 `connection:<id>:db`；不勾选时只存在于 `AppState` 内存，进程退出即丢失。
+- 密码：勾选保存时写入系统钥匙串（`keyring` 4.x，macOS Keychain / Windows Credential Manager / Linux Secret Service），账号为 `connection:<id>:db`；不勾选时只存在于 `AppState` 内存，进程退出即丢失。macOS debug 构建为避开每次重编译后的钥匙串授权，改用 `~/Library/Application Support/com.mengqi.mydb/dev-credentials.json`（0600，明文，仅开发版；首次读取时通过 `/usr/bin/security` 从钥匙串迁移）；release 构建仍使用系统钥匙串，该文件已加入 `.gitignore`。
 - SSH 密码使用独立账号 `connection:<id>:ssh`，与数据库密码分开。
 
 ## 安全

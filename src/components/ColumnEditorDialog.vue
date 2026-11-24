@@ -77,6 +77,24 @@ const typeOptions = computed(() => {
 const defaultType = computed(() => typeOptions.value[0] ?? "TEXT");
 
 const preview = computed(() => {
+  if (isSqliteEdit.value) {
+    if (!name.value.trim()) {
+      return { statements: [] as string[], error: "字段名不能为空", rebuild: true };
+    }
+    if (!type.value.trim()) {
+      return { statements: [] as string[], error: "字段类型不能为空", rebuild: true };
+    }
+    const definition = `"${name.value.trim()}" ${type.value.trim()}${
+      nullable.value ? "" : " NOT NULL"
+    }${
+      defaultValue.value.trim() ? ` DEFAULT ${defaultValue.value.trim()}` : ""
+    }`;
+    return {
+      statements: [`-- SQLite 将重建表并应用字段定义：${definition}`],
+      error: "",
+      rebuild: true,
+    };
+  }
   try {
     const statements = buildColumnStatements(
       props.driver,
@@ -89,11 +107,12 @@ const preview = computed(() => {
         defaultValue: defaultValue.value,
       },
     );
-    return { statements, error: "" };
+    return { statements, error: "", rebuild: false };
   } catch (reason) {
     return {
       statements: [] as string[],
       error: reason instanceof Error ? reason.message : String(reason),
+      rebuild: false,
     };
   }
 });
@@ -137,6 +156,20 @@ async function submit() {
   error.value = "";
   let completed = 0;
   try {
+    if (preview.value.rebuild && props.column) {
+      await api.alterTableColumn(
+        props.connectionId,
+        props.table,
+        props.column.name,
+        name.value.trim(),
+        type.value.trim(),
+        nullable.value,
+        defaultValue.value.trim() || null,
+      );
+      emit("done", "字段已更新（SQLite 已重建表）");
+      return;
+    }
+
     for (const statement of preview.value.statements) {
       await api.executeQuery(props.connectionId, statement, 1);
       completed += 1;
@@ -144,7 +177,11 @@ async function submit() {
     emit("done", props.column ? "字段已更新" : "字段已添加");
   } catch (reason) {
     const prefix =
-      completed > 0 ? "部分语句已执行，请关闭后刷新确认。\n" : "";
+      preview.value.rebuild
+        ? "重建表失败，已回滚；原表和数据保持不变。\n"
+        : completed > 0
+          ? "部分语句已执行，请关闭后刷新确认。\n"
+          : "";
     error.value = `${prefix}${String(reason)}`;
   } finally {
     executing.value = false;
@@ -183,7 +220,6 @@ async function submit() {
             <input
               v-model="type"
               list="alter-column-types"
-              :disabled="isSqliteEdit"
               placeholder="例如：VARCHAR(255)"
             />
           </label>
@@ -191,7 +227,6 @@ async function submit() {
             <input
               v-model="nullable"
               type="checkbox"
-              :disabled="isSqliteEdit"
             />
             可空
           </label>
@@ -199,7 +234,6 @@ async function submit() {
             默认值
             <input
               v-model="defaultValue"
-              :disabled="isSqliteEdit"
               placeholder="SQL 表达式，如 0、'abc'、CURRENT_TIMESTAMP"
             />
           </label>
@@ -210,7 +244,8 @@ async function submit() {
         </datalist>
 
         <p v-if="isSqliteEdit" class="draft-hint">
-          SQLite 不支持修改字段类型、可空性和默认值，这里只能修改字段名。
+          SQLite 会重建表来修改字段类型、可空性或默认值；数据、显式索引和触发器会保留，
+          已有数据违反新约束时会整体回滚。
         </p>
         <p v-else-if="driver === 'sqlite'" class="draft-hint">
           SQLite 添加字段时默认值必须是常量（不能使用 CURRENT_TIMESTAMP

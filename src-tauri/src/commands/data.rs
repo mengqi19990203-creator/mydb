@@ -78,11 +78,14 @@ pub async fn update_table_row(
     table: String,
     keys: Vec<ColumnValue>,
     changes: Vec<ColumnValue>,
+    single_row: Option<bool>,
 ) -> Result<u64, String> {
     ensure_table(&table)?;
     ensure_writable(&app, &connection_id)?;
     let driver = driver_for(&app, &state, &connection_id).await?;
-    driver.update_row(&table, &keys, &changes).await
+    driver
+        .update_row(&table, &keys, &changes, single_row.unwrap_or(false))
+        .await
 }
 
 #[tauri::command]
@@ -106,11 +109,53 @@ pub async fn delete_table_row(
     connection_id: String,
     table: String,
     keys: Vec<ColumnValue>,
+    single_row: Option<bool>,
 ) -> Result<u64, String> {
     ensure_table(&table)?;
     ensure_writable(&app, &connection_id)?;
     let driver = driver_for(&app, &state, &connection_id).await?;
-    driver.delete_row(&table, &keys).await
+    driver
+        .delete_row(&table, &keys, single_row.unwrap_or(false))
+        .await
+}
+
+#[tauri::command]
+pub async fn alter_table_column(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    table: String,
+    column: String,
+    name: String,
+    data_type: String,
+    nullable: bool,
+    default_value: Option<String>,
+) -> Result<(), String> {
+    ensure_table(&table)?;
+    ensure_table(&column)?;
+    ensure_table(&name)?;
+    if name.trim().is_empty() {
+        return Err("字段名不能为空".to_string());
+    }
+    if data_type.trim().is_empty() {
+        return Err("字段类型不能为空".to_string());
+    }
+    ensure_writable(&app, &connection_id)?;
+    let driver = driver_for(&app, &state, &connection_id).await?;
+    let default = default_value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    driver
+        .rebuild_column(
+            &table,
+            &column,
+            name.trim(),
+            data_type.trim(),
+            nullable,
+            default,
+        )
+        .await
 }
 
 #[tauri::command]
@@ -481,6 +526,38 @@ pub fn write_text_file(path: String, contents: String) -> Result<(), String> {
     write_text_file_atomic(std::path::Path::new(&path), &contents)
 }
 
+const MAX_TEXT_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
+#[tauri::command]
+pub fn read_text_file(path: String) -> Result<String, String> {
+    if path.trim().is_empty() {
+        return Err("文件路径不能为空".to_string());
+    }
+    let file_path = std::path::Path::new(&path);
+    let metadata =
+        std::fs::metadata(file_path).map_err(|error| format!("打开文件失败: {error}"))?;
+    if !metadata.is_file() {
+        return Err("只能打开普通文件".to_string());
+    }
+    if metadata.len() > MAX_TEXT_FILE_BYTES {
+        return Err("文件超过 5 MB，无法在编辑器中打开".to_string());
+    }
+    let bytes = std::fs::read(file_path).map_err(|error| format!("读取文件失败: {error}"))?;
+    if bytes.len() as u64 > MAX_TEXT_FILE_BYTES {
+        return Err("文件超过 5 MB，无法在编辑器中打开".to_string());
+    }
+    let text = String::from_utf8(bytes).map_err(|_| "文件不是 UTF-8 文本".to_string())?;
+    Ok(text
+        .strip_prefix('\u{feff}')
+        .map(str::to_string)
+        .unwrap_or(text))
+}
+
 /// Writes through a temporary file in the same directory and renames it, so a
 /// failed export never leaves a half-written destination file behind.
 fn write_text_file_atomic(path: &std::path::Path, contents: &str) -> Result<(), String> {
@@ -751,6 +828,33 @@ mod tests {
             std::fs::read_dir(dir.path()).expect("read dir").count(),
             1,
             "temporary files should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn reads_utf8_text_files_and_strips_bom() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("query.sql");
+        std::fs::write(&path, "\u{feff}SELECT 1;").expect("write");
+        assert_eq!(
+            read_text_file(path.to_string_lossy().into_owned()).expect("read"),
+            "SELECT 1;"
+        );
+        assert!(
+            read_text_file(dir.path().to_string_lossy().into_owned()).is_err(),
+            "directories should be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_text_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("binary.sql");
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x01]).expect("write");
+        assert!(
+            read_text_file(path.to_string_lossy().into_owned())
+                .expect_err("invalid utf-8")
+                .contains("UTF-8")
         );
     }
 

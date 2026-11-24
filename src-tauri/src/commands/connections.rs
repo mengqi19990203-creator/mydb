@@ -88,6 +88,7 @@ pub async fn save_connection(
     // Drop the cached pool/tunnel/Redis connection so the next request reconnects.
     state.drivers.lock().await.remove(&config.id);
     state.redis_clients.lock().await.remove(&config.id);
+    state.redis_tunnels.lock().await.remove(&config.id);
     state.redis_databases.lock().await.remove(&config.id);
     close_connection_transactions(&state, &config.id).await;
 
@@ -106,6 +107,7 @@ pub async fn delete_connection(
 
     state.drivers.lock().await.remove(&id);
     state.redis_clients.lock().await.remove(&id);
+    state.redis_tunnels.lock().await.remove(&id);
     state.redis_databases.lock().await.remove(&id);
     state.passwords.lock().await.remove(&id);
     state.ssh_passwords.lock().await.remove(&id);
@@ -142,6 +144,7 @@ pub async fn close_connection(
 ) -> Result<(), String> {
     state.drivers.lock().await.remove(&id);
     state.redis_clients.lock().await.remove(&id);
+    state.redis_tunnels.lock().await.remove(&id);
     close_connection_transactions(&state, &id).await;
     Ok(())
 }
@@ -163,6 +166,7 @@ pub async fn set_connection_read_only(
     storage::save_connections(&app, &connections)?;
     state.drivers.lock().await.remove(&id);
     state.redis_clients.lock().await.remove(&id);
+    state.redis_tunnels.lock().await.remove(&id);
     close_connection_transactions(&state, &id).await;
     Ok(saved)
 }
@@ -335,8 +339,16 @@ pub async fn connection_info(
             match config.driver.as_str() {
                 "sqlite" => return Err("SQLite 不支持含密码的连接信息".to_string()),
                 "redis" => format!(
-                    "redis://:{}@{}:{}/{}",
-                    password, host, port, database
+                    "{}://:{}@{}:{}/{}",
+                    if config.ssl_mode == "required" {
+                        "rediss"
+                    } else {
+                        "redis"
+                    },
+                    password,
+                    host,
+                    port,
+                    database
                 ),
                 "postgres" => format!(
                     "postgres://{}:{}@{}:{}/{}",
@@ -372,7 +384,17 @@ pub async fn connection_info(
                 "psql \"host={} port={} user={} dbname={}\"",
                 host, port, config.username, dsn_database
             ),
-            "redis" => format!("redis-cli -h {} -p {} -n {}", host, port, database),
+            "redis" => format!(
+                "redis-cli{} -h {} -p {} -n {}",
+                if config.ssl_mode == "required" {
+                    " --tls"
+                } else {
+                    ""
+                },
+                host,
+                port,
+                database
+            ),
             _ => format!(
                 "mysql -h {} -P {} -u {} -p {}",
                 host, port, config.username, dsn_database
@@ -612,7 +634,11 @@ pub async fn test_connection(
             Some(value) if !value.is_empty() => Some(value),
             _ => password_for(&state, &config, "db").await?,
         };
-        return crate::redis_client::test_connection(&config, password.as_deref()).await;
+        let (host, port, tunnel) = connection_target(&state, &config, ssh_password).await?;
+        let result =
+            crate::redis_client::test_connection(&config, &host, port, password.as_deref()).await;
+        drop(tunnel);
+        return result;
     }
 
     let password = match password {
@@ -752,9 +778,6 @@ fn validate_config(config: &mut ConnectionConfig) -> Result<(), String> {
             if config.port == 0 {
                 config.port = 6379;
             }
-            if config.ssh_enabled {
-                return Err("Redis 暂不支持 SSH 隧道".to_string());
-            }
             config.database = config.database.trim().to_string();
             if config.database.is_empty() {
                 config.database = "0".to_string();
@@ -768,7 +791,10 @@ fn validate_config(config: &mut ConnectionConfig) -> Result<(), String> {
                 }
                 config.database = db.to_string();
             }
-            config.ssl_mode = "disabled".to_string();
+            config.ssl_mode = match config.ssl_mode.trim().to_ascii_lowercase().as_str() {
+                "required" | "preferred" => "required".to_string(),
+                _ => "disabled".to_string(),
+            };
         }
         other => return Err(format!("暂不支持的数据库类型: {other}")),
     }

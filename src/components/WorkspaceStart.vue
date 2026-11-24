@@ -21,6 +21,7 @@ const props = defineProps<{
   history: HistoryEntry[];
   historyLoading: boolean;
   commandKey: string;
+  redis?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -30,6 +31,7 @@ const emit = defineEmits<{
   "open-table": [table: TableInfo];
   "refresh-tables": [];
   "refresh-history": [];
+  "open-redis": [];
 }>();
 
 const KIND_LABELS: Record<string, string> = {
@@ -92,7 +94,9 @@ function formatHistoryTime(value: string): string {
             {{
               connectionsCount === 0
                 ? "0 个连接"
-                : "0 个标签"
+                : redis
+                  ? "Redis"
+                  : "0 个标签"
             }}
           </span>
         </div>
@@ -107,6 +111,31 @@ function formatHistoryTime(value: string): string {
               class="start-command primary"
               @click="emit('new-connection')"
             >
+              <span class="start-command-icon">
+                <Icon name="plus" :size="15" />
+              </span>
+              <span>新建连接</span>
+              <kbd class="start-kbd">{{ commandKey }}N</kbd>
+            </button>
+          </div>
+        </template>
+
+        <template v-else-if="redis">
+          <h2 id="start-title">Redis 控制台已关闭</h2>
+          <p class="start-desc">
+            重新打开控制台，浏览键、切换逻辑库或执行 Redis 命令。
+          </p>
+          <div class="start-actions">
+            <button
+              class="start-command primary"
+              @click="emit('open-redis')"
+            >
+              <span class="start-command-icon">
+                <Icon name="database" :size="15" />
+              </span>
+              <span>打开 Redis 控制台</span>
+            </button>
+            <button class="start-command" @click="emit('new-connection')">
               <span class="start-command-icon">
                 <Icon name="plus" :size="15" />
               </span>
@@ -169,7 +198,46 @@ function formatHistoryTime(value: string): string {
       </div>
 
       <div v-else class="start-grid">
-        <section class="start-recents" aria-labelledby="start-recent-title">
+        <section
+          v-if="redis"
+          class="start-recents"
+          aria-labelledby="start-redis-title"
+        >
+          <header class="start-section-head">
+            <h3 id="start-redis-title" class="start-section-title">
+              Redis 控制台
+            </h3>
+            <span class="start-section-count">{{ scope || "db00" }}</span>
+          </header>
+          <div class="start-empty">
+            会话已关闭。重新打开后可扫描键、查看类型详情，或执行任意 Redis 命令。
+          </div>
+          <div class="start-notes start-redis-notes">
+            <div class="start-note">
+              <span class="start-note-label">键浏览</span>
+              <span class="start-note-value">
+                SCAN、类型详情和删除键。
+              </span>
+            </div>
+            <div class="start-note">
+              <span class="start-note-label">命令控制台</span>
+              <span class="start-note-value">
+                直接执行任意 Redis 命令。
+              </span>
+            </div>
+            <div class="start-note">
+              <span class="start-note-label">逻辑库</span>
+              <span class="start-note-value">
+                切换 db，重连后保持选择。
+              </span>
+            </div>
+          </div>
+        </section>
+        <section
+          v-else
+          class="start-recents"
+          aria-labelledby="start-recent-title"
+        >
           <header class="start-section-head">
             <h3 id="start-recent-title" class="start-section-title">
               最近查询
@@ -286,7 +354,7 @@ function formatHistoryTime(value: string): string {
           </section>
 
           <section
-            v-if="selected"
+            v-if="selected && !redis"
             class="start-objects"
             aria-labelledby="start-objects-title"
           >

@@ -72,6 +72,7 @@ pub(crate) struct SchemaSnapshot {
 pub(crate) struct DiffOptions {
     pub include_indexes: bool,
     pub include_foreign_keys: bool,
+    pub include_drops: bool,
 }
 
 impl DiffOptions {
@@ -79,6 +80,7 @@ impl DiffOptions {
     pub(crate) const ALL: Self = Self {
         include_indexes: true,
         include_foreign_keys: true,
+        include_drops: true,
     };
 }
 
@@ -96,6 +98,7 @@ pub async fn compare_schemas(
     target_table: Option<String>,
     include_indexes: Option<bool>,
     include_foreign_keys: Option<bool>,
+    include_drops: Option<bool>,
 ) -> Result<SchemaDiff, String> {
     let connections = storage::load_connections(&app)?;
     let source_config = connections
@@ -117,6 +120,7 @@ pub async fn compare_schemas(
     let options = DiffOptions {
         include_indexes: include_indexes.unwrap_or(true),
         include_foreign_keys: include_foreign_keys.unwrap_or(true),
+        include_drops: include_drops.unwrap_or(false),
     };
     let source_table = source_table
         .map(|name| name.trim().to_string())
@@ -336,7 +340,9 @@ pub(crate) fn diff_snapshots(
             (Some(src), None) => {
                 tables.push(only_source_table(src, &target.driver, options, None));
             }
-            (None, Some(dst)) => tables.push(only_target_table(dst)),
+            (None, Some(dst)) => {
+                tables.push(only_target_table(dst, &target.driver, options))
+            }
             (None, None) => {}
         }
     }
@@ -487,15 +493,15 @@ fn compare_table(
                     match suggested {
                         Some(statement) => {
                             warnings.push(format!(
-                                "字段 {} 存在差异，建议 SQL 已注释，请人工确认后再执行",
+                                "字段 {} 存在差异，已生成修改语句；执行前请人工确认数据类型转换与约束影响",
                                 column.name
                             ));
-                            for line in statement.lines() {
-                                sql.push(format!("-- {line}"));
+                            for line in statement.lines().filter(|line| !line.trim().is_empty()) {
+                                sql.push(line.to_string());
                             }
                         }
                         None => warnings.push(format!(
-                            "字段 {} 存在差异，当前驱动不支持自动生成修改语句，请手动处理",
+                            "字段 {} 存在差异，当前驱动不能直接修改类型/默认值；请重建表或手动处理",
                             column.name
                         )),
                     }
@@ -507,16 +513,28 @@ fn compare_table(
     for column in &target.columns {
         if !source_columns.contains_key(column.name.as_str()) {
             missing_columns.push(column.name.clone());
-            warnings.push(format!(
-                "目标包含源中不存在的字段 {}（未生成删除语句）",
-                column.name
-            ));
+            if options.include_drops {
+                sql.push(format!(
+                    "ALTER TABLE {} DROP COLUMN {};",
+                    quote(&target.name, driver),
+                    quote(&column.name, driver)
+                ));
+                warnings.push(format!(
+                    "目标包含源中不存在的字段 {}，已生成 DROP COLUMN；执行前请备份数据",
+                    column.name
+                ));
+            } else {
+                warnings.push(format!(
+                    "目标包含源中不存在的字段 {}（未生成删除语句；勾选「包含删除语句」可生成）",
+                    column.name
+                ));
+            }
         }
     }
 
     if options.include_indexes {
         let (added, extra, changed) =
-            compare_indexes(source, target, driver, &mut sql, &mut warnings);
+            compare_indexes(source, target, driver, &mut sql, &mut warnings, options.include_drops);
         added_indexes = added;
         extra_indexes = extra;
         changed_indexes = changed;
@@ -524,7 +542,7 @@ fn compare_table(
 
     if options.include_foreign_keys {
         let (added, extra, changed) =
-            compare_foreign_keys(source, target, driver, &mut sql, &mut warnings);
+            compare_foreign_keys(source, target, driver, &mut sql, &mut warnings, options.include_drops);
         added_foreign_keys = added;
         extra_foreign_keys = extra;
         changed_foreign_keys = changed;
@@ -686,7 +704,22 @@ fn only_source_table(
     }
 }
 
-fn only_target_table(target: &TableSnapshot) -> SchemaTableDiff {
+fn only_target_table(
+    target: &TableSnapshot,
+    driver: &str,
+    options: DiffOptions,
+) -> SchemaTableDiff {
+    let mut sql = Vec::new();
+    let mut warnings = Vec::new();
+    if options.include_drops {
+        sql.push(format!("DROP TABLE {};", quote(&target.name, driver)));
+        warnings.push("目标存在但源中不存在该表，已生成 DROP TABLE；执行前请备份数据".to_string());
+    } else {
+        warnings.push(
+            "目标存在但源中不存在该表（未生成删除语句；勾选「包含删除语句」可生成）"
+                .to_string(),
+        );
+    }
     SchemaTableDiff {
         name: target.name.clone(),
         status: "onlyTarget".to_string(),
@@ -701,8 +734,8 @@ fn only_target_table(target: &TableSnapshot) -> SchemaTableDiff {
         added_foreign_keys: Vec::new(),
         extra_foreign_keys: Vec::new(),
         changed_foreign_keys: Vec::new(),
-        sql: Vec::new(),
-        warnings: vec!["目标存在但源中不存在该表（未生成删除语句）".to_string()],
+        sql,
+        warnings,
     }
 }
 
@@ -734,12 +767,25 @@ fn create_index_sql(driver: &str, table: &str, index: &IndexInfo) -> String {
     statement
 }
 
+fn drop_index_sql(driver: &str, table: &str, index_name: &str) -> String {
+    if driver == "mysql" {
+        format!(
+            "ALTER TABLE {} DROP INDEX {};",
+            quote(table, driver),
+            quote(index_name, driver)
+        )
+    } else {
+        format!("DROP INDEX {};", quote(index_name, driver))
+    }
+}
+
 fn compare_indexes(
     source: &TableSnapshot,
     target: &TableSnapshot,
     driver: &str,
     statements: &mut Vec<String>,
     warnings: &mut Vec<String>,
+    include_drops: bool,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let target_map: HashMap<&str, &IndexInfo> = target
         .indexes
@@ -782,8 +828,10 @@ fn compare_indexes(
             Some(existing) => {
                 if existing.columns != index.columns || existing.unique != index.unique {
                     changed.push(index.name.clone());
+                    statements.push(drop_index_sql(driver, &target.name, &index.name));
+                    statements.push(create_index_sql(driver, &target.name, index));
                     warnings.push(format!(
-                        "索引 {} 定义不同（源 {}；目标 {}），未生成修改语句",
+                        "索引 {} 定义不同（源 {}；目标 {}），已生成删除并重建语句",
                         index.name,
                         index_summary(index),
                         index_summary(existing)
@@ -801,10 +849,18 @@ fn compare_indexes(
             continue;
         }
         extra.push(index.name.clone());
-        warnings.push(format!(
-            "目标包含源中不存在的索引 {}（未生成删除语句）",
-            index.name
-        ));
+        if include_drops {
+            statements.push(drop_index_sql(driver, &target.name, &index.name));
+            warnings.push(format!(
+                "目标包含源中不存在的索引 {}，已生成删除语句",
+                index.name
+            ));
+        } else {
+            warnings.push(format!(
+                "目标包含源中不存在的索引 {}（未生成删除语句；勾选「包含删除语句」可生成）",
+                index.name
+            ));
+        }
     }
 
     (added, extra, changed)
@@ -887,12 +943,33 @@ fn foreign_key_signature(foreign_key: &ForeignKeyInfo) -> ForeignKeySignature {
 
 type ForeignKeySignature = (Vec<String>, String, Vec<String>, String, String);
 
+fn drop_foreign_key_sql(
+    driver: &str,
+    table: &str,
+    foreign_key_name: &str,
+) -> Option<String> {
+    match driver {
+        "sqlite" => None,
+        "mysql" => Some(format!(
+            "ALTER TABLE {} DROP FOREIGN KEY {};",
+            quote(table, driver),
+            quote(foreign_key_name, driver)
+        )),
+        _ => Some(format!(
+            "ALTER TABLE {} DROP CONSTRAINT {};",
+            quote(table, driver),
+            quote(foreign_key_name, driver)
+        )),
+    }
+}
+
 fn compare_foreign_keys(
     source: &TableSnapshot,
     target: &TableSnapshot,
     driver: &str,
     statements: &mut Vec<String>,
     warnings: &mut Vec<String>,
+    include_drops: bool,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let target_map: HashMap<String, &ForeignKeyInfo> = target
         .foreign_keys
@@ -945,10 +1022,29 @@ fn compare_foreign_keys(
                     || !existing.on_update.eq_ignore_ascii_case(&foreign_key.on_update)
                 {
                     changed.push(foreign_key.name.clone());
-                    warnings.push(format!(
-                        "外键 {} 定义不同，未生成修改语句",
-                        foreign_key.name
-                    ));
+                    match drop_foreign_key_sql(driver, &target.name, &foreign_key.name) {
+                        Some(drop_sql) => {
+                            statements.push(drop_sql);
+                            if let Some(add_sql) =
+                                add_foreign_key_sql(driver, &target.name, foreign_key)
+                            {
+                                statements.push(add_sql);
+                                warnings.push(format!(
+                                    "外键 {} 定义不同，已生成删除并重建语句",
+                                    foreign_key.name
+                                ));
+                            } else {
+                                warnings.push(format!(
+                                    "外键 {} 定义不同，已生成删除语句；当前驱动无法自动添加，请手动重建",
+                                    foreign_key.name
+                                ));
+                            }
+                        }
+                        None => warnings.push(format!(
+                            "外键 {} 定义不同，SQLite 无法直接修改，需重建表或手动处理",
+                            foreign_key.name
+                        )),
+                    }
                 }
             }
         }
@@ -962,10 +1058,26 @@ fn compare_foreign_keys(
             continue;
         }
         extra.push(foreign_key.name.clone());
-        warnings.push(format!(
-            "目标包含源中不存在的外键 {}（未生成删除语句）",
-            foreign_key.name
-        ));
+        if include_drops {
+            match drop_foreign_key_sql(driver, &target.name, &foreign_key.name) {
+                Some(drop_sql) => {
+                    statements.push(drop_sql);
+                    warnings.push(format!(
+                        "目标包含源中不存在的外键 {}，已生成删除语句",
+                        foreign_key.name
+                    ));
+                }
+                None => warnings.push(format!(
+                    "目标包含源中不存在的外键 {}，SQLite 无法通过 ALTER 删除，需重建表",
+                    foreign_key.name
+                )),
+            }
+        } else {
+            warnings.push(format!(
+                "目标包含源中不存在的外键 {}（未生成删除语句；勾选「包含删除语句」可生成）",
+                foreign_key.name
+            ));
+        }
     }
 
     (added, extra, changed)
@@ -1196,11 +1308,33 @@ mod tests {
             .find(|item| item.name == "legacy")
             .expect("legacy diff");
         assert_eq!(legacy.status, "onlyTarget");
+        assert_eq!(legacy.sql, vec!["DROP TABLE \"legacy\";".to_string()]);
+        assert!(legacy.warnings.iter().any(|text| text.contains("备份")));
+
+        let without_drops = diff_snapshots(
+            &source,
+            &target,
+            DiffOptions {
+                include_indexes: true,
+                include_foreign_keys: true,
+                include_drops: false,
+            },
+        );
+        let legacy = without_drops
+            .tables
+            .iter()
+            .find(|item| item.name == "legacy")
+            .expect("legacy diff");
+        assert_eq!(legacy.status, "onlyTarget");
         assert!(legacy.sql.is_empty());
+        assert!(legacy
+            .warnings
+            .iter()
+            .any(|text| text.contains("未生成删除语句")));
     }
 
     #[test]
-    fn flags_changed_columns_with_commented_suggestions() {
+    fn generates_executable_sql_for_changed_columns() {
         let source = SchemaSnapshot {
             label: "src".to_string(),
             driver: "postgres".to_string(),
@@ -1229,7 +1363,15 @@ mod tests {
         assert!(orders
             .sql
             .iter()
-            .all(|sql| sql.starts_with("-- ALTER TABLE")));
+            .any(|sql| sql.contains("TYPE numeric(12,2)")));
+        assert!(orders
+            .sql
+            .iter()
+            .any(|sql| sql.contains("SET NOT NULL")));
+        assert!(orders
+            .sql
+            .iter()
+            .any(|sql| sql.contains("SET DEFAULT 0")));
         assert!(orders.warnings.iter().any(|text| text.contains("人工确认")));
         assert!(diff.sql.contains("USING \"total\"::numeric(12,2)"));
     }
@@ -1318,6 +1460,7 @@ mod tests {
             DiffOptions {
                 include_indexes: false,
                 include_foreign_keys: false,
+                include_drops: false,
             },
         );
         assert_eq!(without_options.tables[0].status, "same");

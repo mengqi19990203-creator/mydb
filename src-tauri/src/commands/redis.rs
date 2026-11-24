@@ -53,6 +53,8 @@ async fn redis_connection(
     }
 
     let password = super::password_for(state, config, "db").await?;
+    let ssh_password = super::password_for(state, config, "ssh").await?;
+    let (host, port, tunnel) = super::connection_target(state, config, ssh_password).await?;
     let desired = match state
         .redis_databases
         .lock()
@@ -63,8 +65,15 @@ async fn redis_connection(
         Some(database) => database,
         None => redis_client::database_index(config)?,
     };
-    let mut connection = redis_client::connect(config, password.as_deref()).await?;
+    let mut connection = redis_client::connect(config, &host, port, password.as_deref()).await?;
     let database = redis_client::ensure_database(&mut connection, desired).await?;
+    if let Some(tunnel) = tunnel {
+        state
+            .redis_tunnels
+            .lock()
+            .await
+            .insert(connection_id.to_string(), tunnel);
+    }
     state
         .redis_clients
         .lock()

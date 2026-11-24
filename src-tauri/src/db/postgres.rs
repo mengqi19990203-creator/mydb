@@ -677,9 +677,10 @@ impl DatabaseDriver for PostgresDriver {
         table: &str,
         keys: &[ColumnValue],
         changes: &[ColumnValue],
+        single_row: bool,
     ) -> Result<u64, String> {
         if keys.is_empty() {
-            return Err("该表没有主键，无法安全编辑".to_string());
+            return Err("该表没有可用的行标识，无法安全编辑".to_string());
         }
         if changes.is_empty() {
             return Ok(0);
@@ -701,22 +702,32 @@ impl DatabaseDriver for PostgresDriver {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let where_clause = keys
+        let mut parameter = changes.len();
+        let key_clause = keys
             .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                format!(
-                    "{} = ${}{}",
-                    quote_identifier(&item.column),
-                    changes.len() + index + 1,
-                    cast_for(&columns, &item.column)
-                )
+            .map(|item| {
+                if item.value.is_null() {
+                    format!("{} IS NULL", quote_identifier(&item.column))
+                } else {
+                    parameter += 1;
+                    format!(
+                        "{} = ${}{}",
+                        quote_identifier(&item.column),
+                        parameter,
+                        cast_for(&columns, &item.column)
+                    )
+                }
             })
             .collect::<Vec<_>>()
             .join(" AND ");
+        let table_ref = qualified_identifier(&schema, table);
+        let where_clause = if single_row {
+            format!("ctid = (SELECT ctid FROM {table_ref} WHERE {key_clause} LIMIT 1)")
+        } else {
+            key_clause
+        };
         let sql = format!(
-            "UPDATE {} SET {set_clause} WHERE {where_clause}",
-            qualified_identifier(&schema, table)
+            "UPDATE {table_ref} SET {set_clause} WHERE {where_clause}"
         );
 
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
@@ -724,7 +735,9 @@ impl DatabaseDriver for PostgresDriver {
             query = bind_json_postgres(query, &change.value);
         }
         for key in keys {
-            query = bind_json_postgres(query, &key.value);
+            if !key.value.is_null() {
+                query = bind_json_postgres(query, &key.value);
+            }
         }
 
         let result = query
@@ -772,35 +785,50 @@ impl DatabaseDriver for PostgresDriver {
         Ok(result.rows_affected())
     }
 
-    async fn delete_row(&self, table: &str, keys: &[ColumnValue]) -> Result<u64, String> {
+    async fn delete_row(
+        &self,
+        table: &str,
+        keys: &[ColumnValue],
+        single_row: bool,
+    ) -> Result<u64, String> {
         if keys.is_empty() {
-            return Err("该表没有主键，无法安全删除".to_string());
+            return Err("该表没有可用的行标识，无法安全删除".to_string());
         }
 
         let schema = self.current_schema().await;
         let columns = self.list_columns(table).await?;
 
-        let where_clause = keys
+        let mut parameter = 0;
+        let key_clause = keys
             .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                format!(
-                    "{} = ${}{}",
-                    quote_identifier(&item.column),
-                    index + 1,
-                    cast_for(&columns, &item.column)
-                )
+            .map(|item| {
+                if item.value.is_null() {
+                    format!("{} IS NULL", quote_identifier(&item.column))
+                } else {
+                    parameter += 1;
+                    format!(
+                        "{} = ${}{}",
+                        quote_identifier(&item.column),
+                        parameter,
+                        cast_for(&columns, &item.column)
+                    )
+                }
             })
             .collect::<Vec<_>>()
             .join(" AND ");
-        let sql = format!(
-            "DELETE FROM {} WHERE {where_clause}",
-            qualified_identifier(&schema, table)
-        );
+        let table_ref = qualified_identifier(&schema, table);
+        let where_clause = if single_row {
+            format!("ctid = (SELECT ctid FROM {table_ref} WHERE {key_clause} LIMIT 1)")
+        } else {
+            key_clause
+        };
+        let sql = format!("DELETE FROM {table_ref} WHERE {where_clause}");
 
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for key in keys {
-            query = bind_json_postgres(query, &key.value);
+            if !key.value.is_null() {
+                query = bind_json_postgres(query, &key.value);
+            }
         }
 
         let result = query
@@ -1778,6 +1806,7 @@ mod tests {
                     column: "label".to_string(),
                     value: json!("updated"),
                 }],
+                false,
             )
             .await
             .expect("update");
@@ -1804,6 +1833,7 @@ mod tests {
                     column: "id".to_string(),
                     value: json!(1),
                 }],
+                false,
             )
             .await
             .expect("delete");

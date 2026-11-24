@@ -3,6 +3,13 @@ import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { basicSetup } from "codemirror";
 import { Compartment, EditorState, Prec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
+import {
+  findNext,
+  findPrevious,
+  gotoLine,
+  openSearchPanel,
+} from "@codemirror/search";
+import { toggleComment } from "@codemirror/commands";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { tags } from "@lezer/highlight";
@@ -23,6 +30,37 @@ const emit = defineEmits<{
 const host = ref<HTMLElement>();
 let view: EditorView | undefined;
 const language = new Compartment();
+
+export type EditorCommand =
+  | "search"
+  | "find-next"
+  | "find-previous"
+  | "goto-line"
+  | "toggle-comment";
+
+function runCommand(command: EditorCommand) {
+  if (!view) return;
+  view.focus();
+  switch (command) {
+    case "search":
+      openSearchPanel(view);
+      break;
+    case "find-next":
+      findNext(view);
+      break;
+    case "find-previous":
+      findPrevious(view);
+      break;
+    case "goto-line":
+      gotoLine(view);
+      break;
+    case "toggle-comment":
+      toggleComment(view);
+      break;
+  }
+}
+
+defineExpose({ runCommand });
 
 function dialectFor(driver: Driver) {
   switch (driver) {

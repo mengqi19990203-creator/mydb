@@ -16,7 +16,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  select: [table: { name: string; kind: "table" }];
+  select: [table: { name: string; kind: string }];
 }>();
 
 interface ErNode extends ErTable {
@@ -204,6 +204,11 @@ function relationPath(from: ErNode, to: ErNode): string {
   return `M ${startX} ${from.y} C ${startX + direction * curve} ${from.y}, ${endX - direction * curve} ${to.y}, ${endX} ${to.y}`;
 }
 
+const objectCounts = computed(() => ({
+  tables: nodes.value.filter((node) => node.kind === "table").length,
+  views: nodes.value.filter((node) => node.kind !== "table").length,
+}));
+
 const edges = computed(() => {
   if (!diagram.value) return [];
   const byName = new Map(nodes.value.map((node) => [node.name, node]));
@@ -317,7 +322,7 @@ function endNodeDrag(event: PointerEvent, node: ErNode) {
     target.releasePointerCapture(event.pointerId);
   }
   if (current && !current.moved) {
-    emit("select", { name: node.name, kind: "table" });
+    emit("select", { name: node.name, kind: node.kind });
   }
 }
 </script>
@@ -329,7 +334,9 @@ function endNodeDrag(event: PointerEvent, node: ErNode) {
         <strong>ER 图</strong>
         <span v-if="scopeLabel" class="data-context">{{ scopeLabel }}</span>
         <span class="hint">
-          {{ nodes.length }} 表 · {{ edges.length }} 关系
+          {{ objectCounts.tables }} 表
+          <template v-if="objectCounts.views"> · {{ objectCounts.views }} 视图</template>
+          · {{ edges.length }} 关系
         </span>
       </div>
       <div class="data-actions">
@@ -408,6 +415,7 @@ function endNodeDrag(event: PointerEvent, node: ErNode) {
           v-for="node in nodes"
           :key="node.name"
           class="er-node"
+          :class="`er-node-${node.kind}`"
           :style="{
             left: `${node.x - node.width / 2}px`,
             top: `${node.y - node.height / 2}px`,
@@ -419,8 +427,14 @@ function endNodeDrag(event: PointerEvent, node: ErNode) {
           @pointercancel="endNodeDrag($event, node)"
         >
           <div class="er-node-head">
-            <Icon name="table" :size="13" />
+            <Icon
+              :name="node.kind === 'table' ? 'table' : 'view'"
+              :size="13"
+            />
             <span class="er-node-name" :title="node.name">{{ node.name }}</span>
+            <span v-if="node.kind !== 'table'" class="er-kind-badge">
+              {{ node.kind === "matview" ? "物化视图" : "视图" }}
+            </span>
           </div>
           <div class="er-node-columns">
             <div
@@ -443,11 +457,11 @@ function endNodeDrag(event: PointerEvent, node: ErNode) {
       <div v-if="loading" class="panel-empty">正在读取表结构…</div>
       <div v-else-if="error" class="data-message error">{{ error }}</div>
       <div v-else-if="!nodes.length" class="panel-empty">
-        当前范围没有可展示的表
+        当前范围没有可展示的表或视图
       </div>
 
       <div class="er-hint">
-        拖拽表移动 · 点击表打开数据 · 滚轮缩放 · 拖动空白平移
+        拖拽表移动 · 点击打开数据 · 滚轮缩放 · 拖动空白平移
       </div>
     </div>
   </section>

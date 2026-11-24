@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   computed,
+  nextTick,
   onBeforeUnmount,
   onMounted,
   reactive,
@@ -30,6 +31,9 @@ const props = defineProps<{
   activeTable: string | null;
   database?: string;
   schema?: string | null;
+  locateTarget?: string | null;
+  locateNonce?: number;
+  collapseNonce?: number;
 }>();
 
 const emit = defineEmits<{
@@ -45,6 +49,8 @@ const emit = defineEmits<{
 
 const collapsed = ref<Record<string, boolean>>({});
 const expandedTables = reactive<Record<string, boolean>>({});
+const locatedKey = ref<string | null>(null);
+let locateTimer = 0;
 const columnsByTable = reactive<Record<string, ColumnInfo[]>>({});
 const columnsLoading = reactive<Record<string, boolean>>({});
 const columnsError = reactive<Record<string, string>>({});
@@ -286,6 +292,57 @@ function tableKey(table: TableInfo): string {
 function toggle(kind: string) {
   collapsed.value[kind] = !collapsed.value[kind];
 }
+
+function collapseAllCategories() {
+  for (const category of CATEGORIES[props.driver] ?? CATEGORIES.sqlite) {
+    collapsed.value[category.kind] = true;
+  }
+  for (const key of Object.keys(expandedTables)) {
+    delete expandedTables[key];
+  }
+  locatedKey.value = null;
+}
+
+function locateTable(name: string): boolean {
+  const table = props.tables.find((item) => item.name === name);
+  if (!table) {
+    flashToast("对象不在当前列表中");
+    return false;
+  }
+  collapsed.value[table.kind] = false;
+  const key = tableKey(table);
+  locatedKey.value = key;
+  window.clearTimeout(locateTimer);
+  locateTimer = window.setTimeout(() => {
+    if (locatedKey.value === key) locatedKey.value = null;
+  }, 1600);
+  void nextTick(() => {
+    const element = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-object-key]"),
+    ).find((item) => item.dataset.objectKey === key);
+    if (!element) return;
+    element.scrollIntoView({ block: "nearest" });
+    element.focus({ preventScroll: true });
+  });
+  return true;
+}
+
+watch(
+  () => props.collapseNonce,
+  (value) => {
+    if (value !== undefined) collapseAllCategories();
+  },
+);
+
+watch(
+  () => props.locateNonce,
+  (value) => {
+    if (value !== undefined && props.locateTarget) {
+      locateTable(props.locateTarget);
+    }
+  },
+  { immediate: true },
+);
 
 async function loadColumns(table: TableInfo, key: string) {
   columnsLoading[key] = true;
@@ -833,6 +890,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onWindowKey);
   window.removeEventListener("resize", onWindowResize);
   window.clearTimeout(toastTimer);
+  window.clearTimeout(locateTimer);
 });
 
 watch(
@@ -875,6 +933,7 @@ watch(
       >
         <div
           class="object-item tree-table-row"
+          :data-object-key="tableKey(table)"
           role="button"
           tabindex="0"
           data-tree-nav
@@ -885,6 +944,7 @@ watch(
           "
           :class="{
             active: isExpandable(table) && table.name === activeTable,
+            located: locatedKey === tableKey(table),
           }"
           :title="
             !isExpandable(table)

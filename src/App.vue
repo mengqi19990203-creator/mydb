@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import AppMenuBar from "./components/AppMenuBar.vue";
+import CommandPalette from "./components/CommandPalette.vue";
 import ConnectionDialog from "./components/ConnectionDialog.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import CreateTableDialog from "./components/CreateTableDialog.vue";
@@ -18,18 +20,35 @@ import QueryWorkspace from "./components/QueryWorkspace.vue";
 import RedisWorkspace from "./components/RedisWorkspace.vue";
 import ResizeHandle from "./components/ResizeHandle.vue";
 import SchemaSyncDialog from "./components/SchemaSyncDialog.vue";
+import ShortcutHelpDialog from "./components/ShortcutHelpDialog.vue";
 import StatusBar from "./components/StatusBar.vue";
 import TableDataView from "./components/TableDataView.vue";
 import TableStructureView from "./components/TableStructureView.vue";
 import WorkspaceStart from "./components/WorkspaceStart.vue";
 import * as api from "./lib/api";
 import type { ConnectionInfoFormat } from "./lib/api";
+import {
+  popClosedTab,
+  pushClosedTab,
+  type ClosedTabSnapshot,
+} from "./lib/closed-tabs";
+import {
+  clearPaletteRecent,
+  loadPaletteRecent,
+  recordPaletteRecent,
+  savePaletteRecent,
+  type PaletteItem,
+  type PaletteRecentEntry,
+} from "./lib/command-palette";
 import { readClipboard, writeClipboard } from "./lib/clipboard";
 import type {
   AppAction,
   MenuBarItem,
   MenuBarMenu,
 } from "./lib/app-actions";
+import {
+  findDuplicateShortcuts,
+} from "./lib/shortcuts";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import packageInfo from "../package.json";
 import {
@@ -173,6 +192,8 @@ function updateViewportWidth() {
 const unlisteners: UnlistenFn[] = [];
 const appContextMenu = ref<AppContextMenu | null>(null);
 const appMenuRef = ref<HTMLElement | null>(null);
+const tabMenu = ref<{ x: number; y: number; tabId: string } | null>(null);
+const tabMenuRef = ref<HTMLElement | null>(null);
 
 interface QueryTab {
   id: string;
@@ -181,6 +202,10 @@ interface QueryTab {
   database: string | null;
   schema: string | null;
   sql: string;
+  /// Set when the tab is bound to an on-disk SQL file (session only).
+  filePath: string | null;
+  /// SQL snapshot taken when the file was opened or last saved.
+  savedSql: string | null;
   /// Currently selected editor text; run uses it instead of the whole tab.
   selectedSql: string;
   result: QueryResult | null;
@@ -280,6 +305,8 @@ function createQueryTab(
     database: normalizeScopeValue(database),
     schema: normalizeScopeValue(schema),
     sql: "SELECT 1;",
+    filePath: null,
+    savedSql: null,
     selectedSql: "",
     result: null,
     error: null,
@@ -297,6 +324,8 @@ let tabsSaveTimer = 0;
 const firstTab = createQueryTab(null);
 const tabs = ref<QueryTab[]>([firstTab]);
 const activeTabId = ref(firstTab.id);
+/// Session-only LIFO stack for Shift+Mod+T / 文件 → 重新打开关闭的标签.
+const closedTabs = ref<ClosedTabSnapshot[]>([]);
 const selectedConnectionId = ref<string | null>(firstTab.connectionId);
 const activeTab = computed(
   () =>
@@ -398,6 +427,36 @@ const viewMode = computed<"sql" | "table" | "er" | "empty">(() => {
   return "empty";
 });
 
+const statusActiveKind = computed<"query" | "table" | "er" | null>(() => {
+  if (activeTableTab.value) return "table";
+  if (activeErTab.value) return "er";
+  if (tabs.value.some((tab) => tab.id === activeWorkspaceTabId.value)) {
+    return "query";
+  }
+  return null;
+});
+
+const statusActiveLabel = computed(() => {
+  const table = activeTableTab.value;
+  if (table) {
+    return `${table.mode === "structure" ? "结构" : "表"} · ${
+      table.table.name
+    } · ${tabSourceLabel(table)}`;
+  }
+  const er = activeErTab.value;
+  if (er) return `ER · ${tabSourceLabel(er)}`;
+  const query = tabs.value.find(
+    (tab) => tab.id === activeWorkspaceTabId.value,
+  );
+  if (query) return `查询 · ${query.title} · ${queryTabSource(query)}`;
+  if (selected.value) {
+    return connectionChipScope.value
+      ? `${selected.value.name} · ${connectionChipScope.value}`
+      : selected.value.name;
+  }
+  return "未连接";
+});
+
 const selectedId = computed<string | null>({
   get: () => selectedConnectionId.value,
   set: (value) => {
@@ -436,10 +495,74 @@ const running = computed<boolean>({
 const status = ref("就绪");
 const dialogOpen = ref(false);
 const aboutOpen = ref(false);
+const shortcutHelpOpen = ref(false);
+const domModalOpen = ref(false);
+const paletteOpen = ref(false);
+const paletteRecent = ref<PaletteRecentEntry[]>(loadPaletteRecent());
+let palettePreviousFocus: HTMLElement | null = null;
+let modalObserver: MutationObserver | null = null;
+
+function syncDomModalOpen() {
+  domModalOpen.value = Boolean(document.querySelector(".modal-backdrop"));
+}
 const editing = ref<ConnectionConfig | null>(null);
 const connectionSaveError = ref("");
 const connectionsLoaded = ref(false);
-const collapsedGroups = ref<Record<string, boolean>>({});
+const GROUP_COLLAPSE_STORAGE_KEY = "mydb.connectionGroupsCollapsed.v1";
+
+function loadCollapsedGroups(): Record<string, boolean> {
+  try {
+    const raw = window.localStorage.getItem(GROUP_COLLAPSE_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, boolean] => typeof entry[1] === "boolean",
+      ),
+    );
+  } catch {
+    return {};
+  }
+}
+
+const collapsedGroups = ref<Record<string, boolean>>(loadCollapsedGroups());
+const SIDEBAR_FILTER_STORAGE_KEY = "mydb.sidebarOpenOnly.v1";
+function loadSidebarOpenOnly(): boolean {
+  try {
+    return window.localStorage.getItem(SIDEBAR_FILTER_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+const sidebarOpenOnly = ref(loadSidebarOpenOnly());
+watch(sidebarOpenOnly, (value) => {
+  try {
+    window.localStorage.setItem(
+      SIDEBAR_FILTER_STORAGE_KEY,
+      value ? "1" : "0",
+    );
+  } catch {
+    // Persisting the filter is best-effort.
+  }
+});
+const locatedConnectionId = ref<string | null>(null);
+let locatedConnectionTimer = 0;
+
+watch(
+  collapsedGroups,
+  (value) => {
+    try {
+      window.localStorage.setItem(
+        GROUP_COLLAPSE_STORAGE_KEY,
+        JSON.stringify(value),
+      );
+    } catch {
+      // Persisting collapse state is best-effort.
+    }
+  },
+  { deep: true },
+);
 const createOpen = ref(false);
 const importOpen = ref(false);
 const importTable = ref("");
@@ -460,8 +583,11 @@ interface ConfirmRequest {
   message: string;
   detail?: string | null;
   confirmText?: string;
+  cancelText?: string;
+  extraText?: string;
   danger?: boolean;
   action: () => void | Promise<void>;
+  extraAction?: () => void | Promise<void>;
 }
 
 const confirmRequest = ref<ConfirmRequest | null>(null);
@@ -474,6 +600,12 @@ async function runConfirmed() {
   const request = confirmRequest.value;
   confirmRequest.value = null;
   if (request) await request.action();
+}
+
+async function runConfirmExtra() {
+  const request = confirmRequest.value;
+  confirmRequest.value = null;
+  if (request?.extraAction) await request.extraAction();
 }
 
 async function copyConnectionError() {
@@ -492,6 +624,15 @@ const selected = computed(
 const isRedisConnection = computed(
   () => selected.value?.driver === "redis",
 );
+/// Whether the Redis key browser / console is currently open. Selecting a
+/// Redis connection opens it; closing the Redis tab returns to the start page.
+const redisWorkspaceOpen = ref(true);
+
+watch(selectedId, (id) => {
+  if (id && connectionFor(id)?.driver === "redis") {
+    redisWorkspaceOpen.value = true;
+  }
+});
 
 const redisDatabase = computed(() => {
   const connectionId = selectedId.value;
@@ -588,6 +729,40 @@ const treeActiveTableName = computed(() => {
   return tab.table.name;
 });
 
+const objectLocateScope = computed(() => {
+  const tab = activeErTab.value;
+  if (!tab) return false;
+  return sourceMatches(
+    tab,
+    selectedId.value,
+    activeDatabase.value,
+    activeSchema.value,
+  );
+});
+
+const objectLocateReason = computed(() => {
+  const tab = activeTableTab.value;
+  if (!tab) {
+    if (activeErTab.value) {
+      return objectLocateScope.value
+        ? ""
+        : "当前对象树范围与活动标签不一致";
+    }
+    return "当前标签不是表或视图";
+  }
+  if (
+    !sourceMatches(
+      tab,
+      selectedId.value,
+      activeDatabase.value,
+      activeSchema.value,
+    )
+  ) {
+    return "当前对象树范围与活动标签不一致";
+  }
+  return "";
+});
+
 const isMacPlatform = navigator.platform.toUpperCase().includes("MAC");
 const commandKeyLabel = isMacPlatform ? "⌘" : "Ctrl+";
 const runShortcutLabel = computed(() => (isMacPlatform ? "⌘↩" : "Ctrl+Enter"));
@@ -664,11 +839,62 @@ const groupedConnections = computed<ConnectionGroup[]>(() => {
     }));
 });
 
-const filteredGroups = computed<ConnectionGroup[]>(() => {
-  const query = connectionSearch.value.trim().toLowerCase();
-  if (!query) return groupedConnections.value;
+const openConnectionIds = computed(() => {
+  const ids = new Set<string>();
+  for (const tab of tabs.value) {
+    if (tab.connectionId) ids.add(tab.connectionId);
+  }
+  for (const tab of tableTabs.value) {
+    if (tab.connectionId) ids.add(tab.connectionId);
+  }
+  for (const tab of erTabs.value) {
+    if (tab.connectionId) ids.add(tab.connectionId);
+  }
+  if (
+    redisWorkspaceOpen.value &&
+    isRedisConnection.value &&
+    selectedId.value
+  ) {
+    ids.add(selectedId.value);
+  }
+  return ids;
+});
 
-  return groupedConnections.value
+const activeConnectionId = computed(() => {
+  const table = activeTableTab.value;
+  if (table?.connectionId) return table.connectionId;
+  const er = activeErTab.value;
+  if (er?.connectionId) return er.connectionId;
+  const query = tabs.value.find(
+    (tab) => tab.id === activeWorkspaceTabId.value,
+  );
+  if (query?.connectionId) return query.connectionId;
+  if (
+    redisWorkspaceOpen.value &&
+    isRedisConnection.value &&
+    selectedId.value
+  ) {
+    return selectedId.value;
+  }
+  return null;
+});
+
+const filteredGroups = computed<ConnectionGroup[]>(() => {
+  let groups = groupedConnections.value;
+  if (sidebarOpenOnly.value) {
+    groups = groups
+      .map((group) => ({
+        ...group,
+        connections: group.connections.filter((connection) =>
+          openConnectionIds.value.has(connection.id),
+        ),
+      }))
+      .filter((group) => group.connections.length > 0);
+  }
+  const query = connectionSearch.value.trim().toLowerCase();
+  if (!query) return groups;
+
+  return groups
     .map((group) => ({
       name: group.name,
       connections: group.connections.filter((connection) =>
@@ -711,8 +937,25 @@ function connectionDatabase(connectionId: string | null): string | null {
   );
 }
 
+function fileNameFromPath(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
+function isQueryTabDirty(tab: QueryTab): boolean {
+  return Boolean(tab.filePath) && tab.savedSql !== tab.sql;
+}
+
+function suggestedSqlFileName(tab: QueryTab): string {
+  const base = (tab.filePath ? fileNameFromPath(tab.filePath) : tab.title).trim();
+  const name = base || "query";
+  return /\.sql$/i.test(name) ? name : `${name}.sql`;
+}
+
 function queryTabTitle(tab: QueryTab): string {
-  return `${tab.title} · ${tabSourceLabel(tab)}`;
+  const file = tab.filePath ? ` · ${tab.filePath}` : "";
+  const dirty = isQueryTabDirty(tab) ? " · 未保存" : "";
+  return `${tab.title}${dirty} · ${tabSourceLabel(tab)}${file}`;
 }
 
 function tabSourceLabel(tab: TabSource): string {
@@ -807,6 +1050,7 @@ interface WorkspaceTabView {
   source: string;
   icon: "code" | "table" | "diagram";
   running: boolean;
+  dirty: boolean;
   closable: boolean;
 }
 
@@ -823,6 +1067,7 @@ const workspaceTabViews = computed<WorkspaceTabView[]>(() => {
         source: queryTabSource(query),
         icon: "code",
         running: query.running,
+        dirty: isQueryTabDirty(query),
         closable: true,
       });
       continue;
@@ -837,6 +1082,7 @@ const workspaceTabViews = computed<WorkspaceTabView[]>(() => {
         source: tabSourceLabel(table),
         icon: "table",
         running: false,
+        dirty: false,
         closable: true,
       });
       continue;
@@ -851,6 +1097,7 @@ const workspaceTabViews = computed<WorkspaceTabView[]>(() => {
         source: tabSourceLabel(er),
         icon: "diagram",
         running: false,
+        dirty: false,
         closable: true,
       });
     }
@@ -1358,9 +1605,31 @@ async function selectConnection(id: string) {
   connectionError.value = "";
   await refreshTables();
   const connection = connectionFor(id);
+  if (connection?.driver === "redis") {
+    redisWorkspaceOpen.value = true;
+  }
   if (connection && connection.driver !== "redis" && tabs.value.length) {
     ensureTabForSource(true);
   }
+}
+
+function openRedisWorkspace() {
+  redisWorkspaceOpen.value = true;
+  status.value = "已打开 Redis 控制台";
+}
+
+function closeRedisWorkspace() {
+  if (!isRedisConnection.value) return;
+  const connectionId = selectedId.value;
+  if (connectionId) {
+    closedTabs.value = pushClosedTab(closedTabs.value, {
+      kind: "redis",
+      tabId: `redis:${connectionId}`,
+      connectionId,
+    });
+  }
+  redisWorkspaceOpen.value = false;
+  status.value = "已关闭 Redis 控制台";
 }
 
 async function selectDatabase(database: string) {
@@ -1440,6 +1709,55 @@ function toggleGroup(name: string) {
   collapsedGroups.value[name] = !collapsedGroups.value[name];
 }
 
+function toggleSidebarOpenOnly() {
+  sidebarOpenOnly.value = !sidebarOpenOnly.value;
+  status.value = sidebarOpenOnly.value
+    ? "只显示有打开标签的连接"
+    : "显示全部连接";
+}
+
+function collapseAllGroups() {
+  const next: Record<string, boolean> = { ...collapsedGroups.value };
+  for (const group of groupedConnections.value) {
+    next[group.name] = true;
+  }
+  collapsedGroups.value = next;
+  status.value = "已折叠全部连接分组";
+}
+
+function locateActiveConnection() {
+  const id = activeConnectionId.value;
+  if (!id) {
+    status.value = "当前没有可定位的连接";
+    return;
+  }
+  const connection = connectionFor(id);
+  if (!connection) {
+    status.value = "活动标签的来源连接已删除";
+    return;
+  }
+  if (sidebarOpenOnly.value && !openConnectionIds.value.has(id)) {
+    sidebarOpenOnly.value = false;
+  }
+  if (connectionSearch.value) connectionSearch.value = "";
+  const group = connection.group.trim() || "未分组";
+  collapsedGroups.value = { ...collapsedGroups.value, [group]: false };
+  locatedConnectionId.value = id;
+  window.clearTimeout(locatedConnectionTimer);
+  locatedConnectionTimer = window.setTimeout(() => {
+    if (locatedConnectionId.value === id) {
+      locatedConnectionId.value = null;
+    }
+  }, 1600);
+  void nextTick(() => {
+    const element = document.querySelector<HTMLElement>(
+      `.connection-item[data-connection-id="${id}"]`,
+    );
+    element?.scrollIntoView({ block: "nearest" });
+  });
+  status.value = `已定位连接：${connection.name}`;
+}
+
 function newQuery() {
   if (isRedisConnection.value) {
     status.value = "Redis 连接请使用命令控制台";
@@ -1482,6 +1800,94 @@ function openGeneratedSql(payload: { sql: string; title: string }) {
   activeTabId.value = tab.id;
   activeWorkspaceTabId.value = tab.id;
   status.value = `已生成 SQL：${payload.title}`;
+}
+
+async function openSqlFile() {
+  if (isRedisConnection.value) {
+    status.value = "Redis 连接请使用命令控制台";
+    return;
+  }
+  try {
+    const selectedPath = await openDialog({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "SQL 文件", extensions: ["sql"] }],
+    });
+    if (!selectedPath || Array.isArray(selectedPath)) return;
+    const contents = await api.readTextFile(selectedPath);
+    const source = activeTab.value;
+    const connectionId = source?.connectionId ?? selectedId.value;
+    const database =
+      source?.database ?? connectionDatabase(connectionId);
+    const schema =
+      source?.schema ??
+      (connectionId ? schemaByConnection[connectionId] ?? null : null);
+    const tab = createQueryTab(connectionId, database, schema);
+    tab.title = fileNameFromPath(selectedPath);
+    tab.sql = contents;
+    tab.filePath = selectedPath;
+    tab.savedSql = contents;
+    tabs.value.push(tab);
+    tabOrder.value.push(tab.id);
+    activeTabId.value = tab.id;
+    activeWorkspaceTabId.value = tab.id;
+    await showQueryTab(tab.id);
+    status.value = `已打开：${tab.title}`;
+  } catch (reason) {
+    status.value = String(reason);
+  }
+}
+
+async function saveQueryTab(
+  tab: QueryTab | undefined,
+  saveAs = false,
+): Promise<boolean> {
+  if (!tab) {
+    status.value = "当前没有可保存的查询标签";
+    return false;
+  }
+  let path: string | null = saveAs ? null : tab.filePath;
+  if (!path) {
+    try {
+      const chosen = await saveDialog({
+        defaultPath: tab.filePath ?? suggestedSqlFileName(tab),
+        filters: [{ name: "SQL 文件", extensions: ["sql"] }],
+      });
+      if (!chosen || Array.isArray(chosen)) return false;
+      path = chosen;
+    } catch (reason) {
+      status.value = String(reason);
+      return false;
+    }
+  }
+  const contents = tab.sql;
+  try {
+    await api.writeTextFile(path, contents);
+    tab.filePath = path;
+    tab.savedSql = contents;
+    tab.title = fileNameFromPath(path);
+    status.value = `已保存：${tab.title}`;
+    return true;
+  } catch (reason) {
+    status.value = String(reason);
+    return false;
+  }
+}
+
+function saveActiveSql() {
+  if (viewMode.value !== "sql") {
+    status.value = "请先切换到查询标签";
+    return;
+  }
+  void saveQueryTab(activeTab.value);
+}
+
+function saveActiveSqlAs() {
+  if (viewMode.value !== "sql") {
+    status.value = "请先切换到查询标签";
+    return;
+  }
+  void saveQueryTab(activeTab.value, true);
 }
 
 async function activateTabSource(tab: TabSource): Promise<boolean> {
@@ -1573,15 +1979,16 @@ async function showQueryTab(id: string) {
   status.value = `切换到：${tab.title}`;
 }
 
-async function selectTableTab(tab: TableTab) {
-  if (!tableTabs.value.some((item) => item.id === tab.id)) return;
-  if (!(await activateTabSource(tab))) return;
-  if (!tableTabs.value.some((item) => item.id === tab.id)) return;
+async function selectTableTab(tab: TableTab): Promise<boolean> {
+  if (!tableTabs.value.some((item) => item.id === tab.id)) return false;
+  if (!(await activateTabSource(tab))) return false;
+  if (!tableTabs.value.some((item) => item.id === tab.id)) return false;
   activeWorkspaceTabId.value = tab.id;
   status.value =
     tab.mode === "structure"
       ? `查看表结构：${tab.table.name}`
       : `查看表数据：${tab.table.name}`;
+  return true;
 }
 
 async function showErTab(tab: ErTab) {
@@ -1678,6 +2085,28 @@ watch(
 );
 
 function closeQueryTab(id: string) {
+  const tab = tabs.value.find((item) => item.id === id);
+  if (!tab) return;
+  if (isQueryTabDirty(tab)) {
+    askConfirm({
+      title: "保存修改？",
+      message: `「${tab.title}」有未保存的修改。关闭前要保存吗？`,
+      detail: tab.filePath,
+      cancelText: "取消",
+      extraText: "不保存",
+      extraAction: () => closeQueryTabNow(id),
+      confirmText: "保存",
+      danger: false,
+      action: async () => {
+        if (await saveQueryTab(tab)) closeQueryTabNow(id);
+      },
+    });
+    return;
+  }
+  closeQueryTabNow(id);
+}
+
+function closeQueryTabNow(id: string) {
   const index = tabs.value.findIndex((tab) => tab.id === id);
   if (index < 0) return;
 
@@ -1685,6 +2114,18 @@ function closeQueryTab(id: string) {
   if (closing.inTransaction || closing.transactionBusy) {
     void api.closeTransactionSession(id);
   }
+  closedTabs.value = pushClosedTab(closedTabs.value, {
+    kind: "query",
+    tabId: closing.id,
+    title: closing.title,
+    connectionId: closing.connectionId,
+    database: closing.database,
+    schema: closing.schema,
+    sql: closing.sql,
+    filePath: closing.filePath,
+    savedSql: closing.savedSql,
+    hadTransaction: closing.inTransaction || closing.transactionBusy,
+  });
 
   const wasActive = activeWorkspaceTabId.value === id;
   const neighbor = neighborTabId(id);
@@ -1696,6 +2137,10 @@ function closeQueryTab(id: string) {
   if (!wasActive) return;
 
   if (neighbor) {
+    activeWorkspaceTabId.value = neighbor;
+    if (tabs.value.some((tab) => tab.id === neighbor)) {
+      activeTabId.value = neighbor;
+    }
     void activateWorkspaceTabById(neighbor);
     return;
   }
@@ -1713,6 +2158,16 @@ function closeQueryTab(id: string) {
 function closeTableTab(id: string) {
   const tab = tableTabs.value.find((item) => item.id === id);
   if (!tab) return;
+  closedTabs.value = pushClosedTab(closedTabs.value, {
+    kind: "table",
+    tabId: tab.id,
+    connectionId: tab.connectionId,
+    database: tab.database,
+    schema: tab.schema,
+    table: { ...tab.table },
+    mode: tab.mode,
+    focusedIndex: tab.focusedIndex,
+  });
   const wasActive = activeWorkspaceTabId.value === id;
   const neighbor = neighborTabId(id);
   tableTabs.value = tableTabs.value.filter((item) => item.id !== id);
@@ -1730,6 +2185,13 @@ function closeTableTab(id: string) {
 function closeErTab(id: string) {
   const tab = erTabs.value.find((item) => item.id === id);
   if (!tab) return;
+  closedTabs.value = pushClosedTab(closedTabs.value, {
+    kind: "er",
+    tabId: tab.id,
+    connectionId: tab.connectionId,
+    database: tab.database,
+    schema: tab.schema,
+  });
   const wasActive = activeWorkspaceTabId.value === id;
   const neighbor = neighborTabId(id);
   erTabs.value = erTabs.value.filter((item) => item.id !== id);
@@ -2695,6 +3157,9 @@ function onWindowMouseDown(event: MouseEvent) {
   if (groupMenu.value && !groupMenuRef.value?.contains(target)) {
     closeGroupMenu();
   }
+  if (tabMenu.value && !tabMenuRef.value?.contains(target)) {
+    closeTabMenu();
+  }
   if (!appContextMenu.value) return;
   if (appMenuRef.value?.contains(target)) return;
   closeAppContextMenu();
@@ -2711,6 +3176,51 @@ function cycleQueryTab(direction: number) {
 }
 
 function onWindowKeydown(event: KeyboardEvent) {
+  if (paletteOpen.value) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closePalette(true);
+    }
+    return;
+  }
+  if (domModalOpen.value) {
+    if (event.ctrlKey && event.key === "Tab") {
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "Tab" && !event.defaultPrevented) {
+      const backdrop = Array.from(
+        document.querySelectorAll<HTMLElement>(".modal-backdrop"),
+      ).pop();
+      if (backdrop) {
+        const items = Array.from(
+          backdrop.querySelectorAll<HTMLElement>(
+            'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+          ),
+        ).filter((item) => item.offsetParent !== null);
+        if (items.length) {
+          const first = items[0];
+          const last = items[items.length - 1];
+          const active = document.activeElement as HTMLElement | null;
+          if (!active || !backdrop.contains(active)) {
+            event.preventDefault();
+            first.focus();
+            return;
+          }
+          if (event.shiftKey && active === first) {
+            event.preventDefault();
+            last.focus();
+            return;
+          }
+          if (!event.shiftKey && active === last) {
+            event.preventDefault();
+            first.focus();
+            return;
+          }
+        }
+      }
+    }
+  }
   if (event.ctrlKey && !event.metaKey && event.key === "Tab") {
     event.preventDefault();
     cycleQueryTab(event.shiftKey ? -1 : 1);
@@ -2721,6 +3231,73 @@ function onWindowKeydown(event: KeyboardEvent) {
   // to the window-level shortcuts.
   if (!isMacPlatform && modifier && !event.altKey && !event.repeat) {
     const key = event.key.toLowerCase();
+    if (hasOpenModal.value) {
+      if (
+        ["n", "t", "w", "r", "y", "m", "q", "o", "s"].includes(
+          key,
+        )
+      ) {
+        event.preventDefault();
+      }
+      return;
+    }
+    if (key === "n" && !event.shiftKey) {
+      event.preventDefault();
+      openNewConnection();
+      return;
+    }
+    if (key === "t") {
+      event.preventDefault();
+      if (event.shiftKey) {
+        void reopenClosedTab();
+      } else {
+        newQuery();
+      }
+      return;
+    }
+    if (key === "w") {
+      event.preventDefault();
+      if (event.shiftKey) {
+        closeWindow();
+      } else {
+        closeActiveWorkspaceTab();
+      }
+      return;
+    }
+    if (key === "r" && !event.shiftKey) {
+      event.preventDefault();
+      if (selectedId.value) void refreshTables();
+      return;
+    }
+    if (key === "y" && !event.shiftKey) {
+      event.preventDefault();
+      void toggleHistory();
+      return;
+    }
+    if (key === "m" && !event.shiftKey) {
+      event.preventDefault();
+      void getCurrentWindow().minimize();
+      return;
+    }
+    if (key === "q" && !event.shiftKey) {
+      event.preventDefault();
+      quitApp();
+      return;
+    }
+    if (key === "o" && !event.shiftKey) {
+      event.preventDefault();
+      void openSqlFile();
+      return;
+    }
+    if (key === "s") {
+      event.preventDefault();
+      if (event.shiftKey) {
+        saveActiveSqlAs();
+      } else {
+        saveActiveSql();
+      }
+      return;
+    }
     if (key === "b" && event.shiftKey) {
       event.preventDefault();
       toggleObjects();
@@ -2743,6 +3320,14 @@ function onWindowKeydown(event: KeyboardEvent) {
     }
   }
   if (event.key === "Escape") {
+    if (tabMenu.value) {
+      closeTabMenu();
+      return;
+    }
+    if (shortcutHelpOpen.value) {
+      shortcutHelpOpen.value = false;
+      return;
+    }
     if (aboutOpen.value) {
       aboutOpen.value = false;
       return;
@@ -2880,14 +3465,302 @@ function menuHistory() {
   void toggleHistory();
 }
 
+async function reopenClosedTab() {
+  const entry = popClosedTab(closedTabs.value);
+  if (!entry) {
+    status.value = "没有最近关闭的标签";
+    return;
+  }
+  closedTabs.value = entry.rest;
+  const snapshot = entry.snapshot;
+  const connection = snapshot.connectionId
+    ? connectionFor(snapshot.connectionId)
+    : null;
+  if (snapshot.connectionId && !connection) {
+    status.value = "来源连接已删除，无法恢复该标签";
+    return;
+  }
+  if (snapshot.kind === "redis") {
+    if (!connection || connection.driver !== "redis") {
+      status.value = "来源连接已删除，无法恢复 Redis 控制台";
+      return;
+    }
+    selectedId.value = snapshot.connectionId;
+    redisWorkspaceOpen.value = true;
+    status.value = "已恢复 Redis 控制台";
+    return;
+  }
+  if (snapshot.kind === "query") {
+    if (snapshot.connectionId && connection?.driver === "redis") {
+      status.value = "来源连接不是 SQL 连接，无法恢复该标签";
+      return;
+    }
+    const tab = createQueryTab(
+      snapshot.connectionId,
+      snapshot.database,
+      snapshot.schema,
+    );
+    tab.title = snapshot.title;
+    tab.sql = snapshot.sql;
+    tab.filePath = snapshot.filePath;
+    tab.savedSql = snapshot.savedSql;
+    tabs.value.push(tab);
+    tabOrder.value.push(tab.id);
+    if (snapshot.connectionId) {
+      await showQueryTab(tab.id);
+    } else {
+      activeTabId.value = tab.id;
+      activeWorkspaceTabId.value = tab.id;
+    }
+    if (activeWorkspaceTabId.value !== tab.id) {
+      status.value = `已恢复标签：${snapshot.title} · 来源上下文切换被阻止`;
+      return;
+    }
+    status.value = snapshot.hadTransaction
+      ? `已恢复：${snapshot.title} · 事务未恢复`
+      : `已恢复：${snapshot.title}`;
+    return;
+  }
+  if (snapshot.kind === "table") {
+    if (!connection || connection.driver === "redis") {
+      status.value = "来源连接已删除，无法恢复表标签";
+      return;
+    }
+    const tab = createTableTab(
+      { ...snapshot.table },
+      snapshot.connectionId,
+      snapshot.database,
+      snapshot.schema,
+      snapshot.mode,
+      snapshot.focusedIndex,
+    );
+    tableTabs.value.push(tab);
+    tabOrder.value.push(tab.id);
+    await reopenTableTab(tab, snapshot.table.name);
+    return;
+  }
+  if (snapshot.kind === "er") {
+    if (!connection || connection.driver === "redis") {
+      status.value = "来源连接已删除，无法恢复 ER 图";
+      return;
+    }
+    const tab = createErTab(
+      snapshot.connectionId,
+      snapshot.database,
+      snapshot.schema,
+    );
+    erTabs.value.push(tab);
+    tabOrder.value.push(tab.id);
+    await showErTab(tab);
+    status.value =
+      activeWorkspaceTabId.value === tab.id
+        ? "已恢复 ER 图"
+        : "已恢复 ER 标签 · 来源上下文切换被阻止";
+  }
+}
+
+async function reopenTableTab(tab: TableTab, tableName: string) {
+  const activated = await selectTableTab(tab);
+  if (!activated) {
+    tableTabs.value = tableTabs.value.filter((item) => item.id !== tab.id);
+    removeTabFromOrder(tab.id);
+    fallbackToQueryTab();
+    return;
+  }
+  if (
+    !tables.value.some(
+      (item) => item.name === tab.table.name && item.kind === tab.table.kind,
+    )
+  ) {
+    tableTabs.value = tableTabs.value.filter((item) => item.id !== tab.id);
+    removeTabFromOrder(tab.id);
+    fallbackToQueryTab();
+    status.value = `对象「${tableName}」已不存在，未恢复`;
+    return;
+  }
+  status.value = tab.mode === "structure"
+    ? `已恢复表结构：${tableName}`
+    : `已恢复表数据：${tableName}`;
+}
+
+function openTabMenu(event: MouseEvent, tabId: string) {
+  tabMenu.value = {
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - 230)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 260)),
+    tabId,
+  };
+}
+
+function closeTabMenu() {
+  tabMenu.value = null;
+}
+
+const tabMenuCounts = computed(() => {
+  if (!tabMenu.value) return { other: 0, right: 0, all: 0 };
+  const index = tabOrder.value.indexOf(tabMenu.value.tabId);
+  return {
+    other: Math.max(0, tabOrder.value.length - 1),
+    right: index >= 0 ? tabOrder.value.length - index - 1 : 0,
+    all: tabOrder.value.length,
+  };
+});
+
+function tabIdsForMenu(kind: "other" | "right" | "all"): string[] {
+  const menu = tabMenu.value;
+  if (!menu) return [];
+  const index = tabOrder.value.indexOf(menu.tabId);
+  if (kind === "all") return [...tabOrder.value];
+  if (kind === "other") {
+    return tabOrder.value.filter((id) => id !== menu.tabId);
+  }
+  return index >= 0 ? tabOrder.value.slice(index + 1) : [];
+}
+
+function closeTabsImmediately(ids: string[]) {
+  for (const id of ids) {
+    if (tabs.value.some((tab) => tab.id === id)) {
+      closeQueryTabNow(id);
+    } else if (tableTabs.value.some((tab) => tab.id === id)) {
+      closeTableTab(id);
+    } else if (erTabs.value.some((tab) => tab.id === id)) {
+      closeErTab(id);
+    }
+  }
+  void nextTick(() => {
+    if (tabOrder.value.includes(activeWorkspaceTabId.value)) return;
+    const remaining = tabOrder.value[0];
+    if (remaining) {
+      void activateWorkspaceTabById(remaining);
+    } else {
+      activeWorkspaceTabId.value = "";
+      activeTabId.value = "";
+    }
+  });
+}
+
+function requestCloseTabs(kind: "other" | "right" | "all") {
+  const ids = tabIdsForMenu(kind);
+  closeTabMenu();
+  if (!ids.length) {
+    status.value = "没有可关闭的标签";
+    return;
+  }
+  const closing = ids
+    .map((id) => tabs.value.find((tab) => tab.id === id))
+    .filter((tab): tab is QueryTab => Boolean(tab));
+  const dirty = closing.filter(isQueryTabDirty).length;
+  const transaction = closing.filter(
+    (tab) => tab.inTransaction || tab.transactionBusy,
+  ).length;
+  const label =
+    kind === "other"
+      ? "关闭其他标签"
+      : kind === "right"
+        ? "关闭右侧标签"
+        : "关闭全部标签";
+  if (!dirty && !transaction) {
+    closeTabsImmediately(ids);
+    status.value = `已关闭 ${ids.length} 个标签`;
+    return;
+  }
+  askConfirm({
+    title: label,
+    message:
+      dirty > 0
+        ? `其中 ${dirty} 个标签有未保存的 SQL 文件修改，关闭后会丢失。`
+        : `其中 ${transaction} 个标签有未提交事务，关闭后会回滚。`,
+    detail: `将关闭 ${ids.length} 个标签。`,
+    confirmText: "关闭",
+    danger: true,
+    action: () => {
+      closeTabsImmediately(ids);
+      status.value = `已关闭 ${ids.length} 个标签`;
+    },
+  });
+}
+
+function closeTabFromMenu() {
+  const id = tabMenu.value?.tabId;
+  closeTabMenu();
+  if (id) closeWorkspaceTab(id);
+}
+
+function reopenFromTabMenu() {
+  closeTabMenu();
+  void reopenClosedTab();
+}
+
+function copyTabMenuSource() {
+  const menu = tabMenu.value;
+  if (!menu) return;
+  const view = workspaceTabViews.value.find(
+    (item) => item.id === menu.tabId,
+  );
+  const text = view ? `${view.label} · ${view.source}` : menu.tabId;
+  closeTabMenu();
+  void writeClipboard(text)
+    .then(() => {
+      status.value = "已复制标签来源";
+    })
+    .catch(() => {
+      status.value = "复制标签来源失败";
+    });
+}
+
 function closeActiveWorkspaceTab() {
+  if (isRedisConnection.value) {
+    if (redisWorkspaceOpen.value) closeRedisWorkspace();
+    return;
+  }
   if (activeWorkspaceTabId.value) {
     closeWorkspaceTab(activeWorkspaceTabId.value);
   }
 }
 
 function closeWindow() {
-  void getCurrentWindow().close();
+  const dirty = tabs.value.some(isQueryTabDirty);
+  const transaction = tabs.value.some(
+    (tab) => tab.inTransaction || tab.transactionBusy,
+  );
+  if (!dirty && !transaction) {
+    void getCurrentWindow().close();
+    return;
+  }
+  askConfirm({
+    title: "关闭窗口？",
+    message: dirty
+      ? "还有未保存的 SQL 文件修改，关闭后会丢失。"
+      : "还有未提交的事务，关闭后会被回滚。",
+    detail: "确定要关闭窗口吗？",
+    confirmText: "关闭",
+    danger: true,
+    action: () => {
+      void getCurrentWindow().close();
+    },
+  });
+}
+
+function quitApp() {
+  const dirty = tabs.value.some(isQueryTabDirty);
+  const transaction = tabs.value.some(
+    (tab) => tab.inTransaction || tab.transactionBusy,
+  );
+  if (!dirty && !transaction) {
+    void api.quitApp();
+    return;
+  }
+  askConfirm({
+    title: "退出 mydb？",
+    message: dirty
+      ? "还有未保存的 SQL 文件修改，退出后会丢失。"
+      : "还有未提交的事务，退出后会被回滚。",
+    detail: "确定要退出 mydb 吗？",
+    confirmText: "退出",
+    danger: true,
+    action: () => {
+      void api.quitApp();
+    },
+  });
 }
 
 async function toggleFullscreen() {
@@ -2917,14 +3790,16 @@ async function copyContactEmail() {
   }
 }
 
-const canCloseActiveTab = computed(
-  () =>
-    Boolean(activeWorkspaceTabId.value) &&
-    tabOrder.value.includes(activeWorkspaceTabId.value),
+const canCloseActiveTab = computed(() =>
+  isRedisConnection.value
+    ? redisWorkspaceOpen.value
+    : Boolean(activeWorkspaceTabId.value) &&
+      tabOrder.value.includes(activeWorkspaceTabId.value),
 );
 
 const appActions = computed<AppAction[]>(() => {
   const modifier = isMacPlatform ? "⌘" : "Ctrl+";
+  const shift = isMacPlatform ? "⇧" : "Shift+";
   const readOnly = Boolean(selected.value?.readOnly);
   const noConnection = !selectedId.value;
   const redis = isRedisConnection.value;
@@ -2982,6 +3857,65 @@ const appActions = computed<AppAction[]>(() => {
       enabled: !redis,
       disabledReason: redis ? "Redis 连接请使用命令控制台" : undefined,
       run: newQuery,
+    },
+    {
+      id: "open-sql-file",
+      group: "query",
+      label: "打开 SQL 文件…",
+      icon: "code",
+      shortcut: `${modifier}O`,
+      priority: 3,
+      enabled: !redis,
+      disabledReason: redis ? "Redis 连接请使用命令控制台" : undefined,
+      run: () => void openSqlFile(),
+    },
+    {
+      id: "save-sql",
+      group: "query",
+      label: "保存 SQL",
+      icon: "download",
+      shortcut: `${modifier}S`,
+      priority: 4,
+      enabled: !redis && viewMode.value === "sql" && Boolean(activeTab.value),
+      disabledReason: redis
+        ? "Redis 连接请使用命令控制台"
+        : viewMode.value !== "sql"
+          ? "请先切换到查询标签"
+          : activeTab.value
+            ? undefined
+            : "当前没有查询标签",
+      run: saveActiveSql,
+    },
+    {
+      id: "save-sql-as",
+      group: "query",
+      label: "另存为…",
+      icon: "download",
+      shortcut: `${modifier}${shift}S`,
+      priority: 5,
+      enabled: !redis && viewMode.value === "sql" && Boolean(activeTab.value),
+      disabledReason: redis
+        ? "Redis 连接请使用命令控制台"
+        : viewMode.value !== "sql"
+          ? "请先切换到查询标签"
+          : activeTab.value
+            ? undefined
+            : "当前没有查询标签",
+      run: saveActiveSqlAs,
+    },
+    {
+      id: "reopen-closed-tab",
+      group: "query",
+      label: "重新打开关闭的标签",
+      icon: "history",
+      shortcut: `${modifier}${shift}T`,
+      priority: 6,
+      enabled: closedTabs.value.length > 0,
+      disabledReason:
+        closedTabs.value.length > 0
+          ? undefined
+          : "没有最近关闭的标签",
+      run: () => void reopenClosedTab(),
     },
     {
       id: "new-table",
@@ -3098,25 +4032,115 @@ const appActions = computed<AppAction[]>(() => {
   ];
 });
 
+const canEditSql = computed(
+  () =>
+    viewMode.value === "sql" &&
+    Boolean(activeTab.value) &&
+    !isRedisConnection.value,
+);
+
+const hasOpenModal = computed(
+  () =>
+    paletteOpen.value ||
+    domModalOpen.value ||
+    dialogOpen.value ||
+    createOpen.value ||
+    importOpen.value ||
+    syncOpen.value ||
+    dataSyncOpen.value ||
+    aboutOpen.value ||
+    shortcutHelpOpen.value ||
+    duplicateOpen.value ||
+    groupPromptOpen.value ||
+    Boolean(confirmRequest.value),
+);
+
+const modalBlockedActionIds = new Set([
+  "new-connection",
+  "new-query",
+  "open-sql-file",
+  "save-sql",
+  "save-sql-as",
+  "reopen-closed-tab",
+  "import-data",
+  "export-result",
+  "close-tab",
+  "refresh",
+  "er-diagram",
+  "structure-sync",
+  "data-sync",
+  "edit-connection",
+  "close-connection",
+  "editor-search",
+  "editor-find-next",
+  "editor-find-previous",
+  "editor-goto-line",
+  "editor-toggle-comment",
+  "close-window",
+  "quit-app",
+  "command-palette",
+  "toggle-sidebar",
+  "toggle-objects",
+  "toggle-result",
+  "toggle-right",
+  "reset-layout",
+  "toggle-fullscreen",
+  "about",
+  "shortcut-help",
+]);
+
+function blockedByModal(id: string | undefined): boolean {
+  return Boolean(
+    id && hasOpenModal.value && modalBlockedActionIds.has(id),
+  );
+}
+
+function modalDisabledReason(id: string | undefined): string | undefined {
+  return blockedByModal(id) ? "请先关闭当前对话框" : undefined;
+}
+
+function runSqlEditorCommand(
+  command:
+    | "search"
+    | "find-next"
+    | "find-previous"
+    | "goto-line"
+    | "toggle-comment",
+) {
+  if (!canEditSql.value) return;
+  if (hasOpenModal.value) {
+    status.value = "请先关闭当前对话框";
+    return;
+  }
+  queryWorkspaceRef.value?.runEditorCommand(command);
+}
+
 const appMenus = computed<MenuBarMenu[]>(() => {
   const modifier = isMacPlatform ? "⌘" : "Ctrl+";
   const shift = isMacPlatform ? "⇧" : "Shift+";
+  const alt = isMacPlatform ? "⌥" : "Alt+";
   const fromAction = (id: string): MenuBarItem => {
     const action = appActions.value.find((item) => item.id === id);
     if (!action) return { label: id, disabled: true };
+    const blocked = blockedByModal(action.id);
     return {
+      id: action.id,
       label: action.label,
       shortcut: action.shortcut,
-      disabled: !action.enabled,
-      disabledReason: action.disabledReason,
+      disabled: !action.enabled || blocked,
+      disabledReason: blocked
+        ? "请先关闭当前对话框"
+        : action.disabledReason,
       action: action.run,
     };
   };
   const editItem = (
+    id: string,
     label: string,
     shortcut: string,
     command: "undo" | "redo" | "cut" | "copy" | "paste" | "selectAll",
   ): MenuBarItem => ({
+    id,
     label,
     shortcut,
     disabled: !hasEditableTarget.value,
@@ -3131,33 +4155,99 @@ const appMenus = computed<MenuBarMenu[]>(() => {
         fromAction("new-connection"),
         fromAction("new-query"),
         { separator: true },
+        fromAction("open-sql-file"),
+        fromAction("save-sql"),
+        fromAction("save-sql-as"),
+        fromAction("reopen-closed-tab"),
+        { separator: true },
         fromAction("import-data"),
         fromAction("export-result"),
         { separator: true },
         fromAction("close-tab"),
         { separator: true },
         {
+          id: "close-window",
           label: "关闭窗口",
           shortcut: `${modifier}${shift}W`,
+          disabled: blockedByModal("close-window"),
+          disabledReason: modalDisabledReason("close-window"),
           action: closeWindow,
         },
-        {
-          label: "退出 mydb",
-          shortcut: `${modifier}Q`,
-          action: closeWindow,
-        },
+        ...(isMacPlatform
+          ? []
+          : [
+              {
+                id: "quit-app",
+                label: "退出 mydb",
+                shortcut: `${modifier}Q`,
+                disabled: blockedByModal("quit-app"),
+                disabledReason: modalDisabledReason("quit-app"),
+                action: quitApp,
+              },
+            ]),
       ],
     },
     {
       label: "编辑",
       items: [
-        editItem("撤销", `${modifier}Z`, "undo"),
-        editItem("重做", `${modifier}${shift}Z`, "redo"),
+        editItem("edit-undo", "撤销", `${modifier}Z`, "undo"),
+        editItem(
+          "edit-redo",
+          "重做",
+          `${modifier}${shift}Z`,
+          "redo",
+        ),
         { separator: true },
-        editItem("剪切", `${modifier}X`, "cut"),
-        editItem("复制", `${modifier}C`, "copy"),
-        editItem("粘贴", `${modifier}V`, "paste"),
-        editItem("全选", `${modifier}A`, "selectAll"),
+        editItem("edit-cut", "剪切", `${modifier}X`, "cut"),
+        editItem("edit-copy", "复制", `${modifier}C`, "copy"),
+        editItem("edit-paste", "粘贴", `${modifier}V`, "paste"),
+        editItem(
+          "edit-select-all",
+          "全选",
+          `${modifier}A`,
+          "selectAll",
+        ),
+        { separator: true },
+        {
+          id: "editor-search",
+          label: "查找和替换…",
+          shortcut: `${modifier}F`,
+          disabled: !canEditSql.value,
+          disabledReason: "请先打开查询标签",
+          action: () => runSqlEditorCommand("search"),
+        },
+        {
+          id: "editor-find-next",
+          label: "查找下一个",
+          shortcut: "F3",
+          disabled: !canEditSql.value,
+          disabledReason: "请先打开查询标签",
+          action: () => runSqlEditorCommand("find-next"),
+        },
+        {
+          id: "editor-find-previous",
+          label: "查找上一个",
+          shortcut: `${shift}F3`,
+          disabled: !canEditSql.value,
+          disabledReason: "请先打开查询标签",
+          action: () => runSqlEditorCommand("find-previous"),
+        },
+        {
+          id: "editor-goto-line",
+          label: "转到行…",
+          shortcut: `${modifier}${alt}G`,
+          disabled: !canEditSql.value,
+          disabledReason: "请先打开查询标签",
+          action: () => runSqlEditorCommand("goto-line"),
+        },
+        {
+          id: "editor-toggle-comment",
+          label: "注释 / 取消注释",
+          shortcut: `${modifier}/`,
+          disabled: !canEditSql.value,
+          disabledReason: "请先打开查询标签",
+          action: () => runSqlEditorCommand("toggle-comment"),
+        },
       ],
     },
     {
@@ -3165,31 +4255,67 @@ const appMenus = computed<MenuBarMenu[]>(() => {
       items: [
         fromAction("refresh"),
         fromAction("history"),
+        {
+          id: "command-palette",
+          label: "命令面板…",
+          shortcut: `${modifier}K`,
+          disabled: blockedByModal("command-palette"),
+          disabledReason: modalDisabledReason("command-palette"),
+          action: openPalette,
+        },
         { separator: true },
         {
+          id: "toggle-sidebar",
           label: "连接侧栏",
           shortcut: layoutShortcuts.value.sidebar,
+          checked: !layout.sidebarCollapsed,
+          disabled: blockedByModal("toggle-sidebar"),
+          disabledReason: modalDisabledReason("toggle-sidebar"),
           action: toggleSidebar,
         },
         {
+          id: "toggle-objects",
           label: "对象树",
           shortcut: layoutShortcuts.value.objects,
+          checked: !layout.objectsCollapsed,
+          disabled: blockedByModal("toggle-objects"),
+          disabledReason: modalDisabledReason("toggle-objects"),
           action: toggleObjects,
         },
         {
+          id: "toggle-result",
           label: "结果面板",
           shortcut: layoutShortcuts.value.result,
+          checked: !layout.resultCollapsed,
+          disabled: blockedByModal("toggle-result"),
+          disabledReason: modalDisabledReason("toggle-result"),
           action: toggleResultPanel,
         },
         {
+          id: "toggle-right",
           label: "右侧面板",
           shortcut: layoutShortcuts.value.right,
+          checked: layout.rightOpen,
+          disabled: blockedByModal("toggle-right"),
+          disabledReason: modalDisabledReason("toggle-right"),
           action: toggleRightPanel,
         },
         { separator: true },
-        { label: "重置布局", action: resetLayout },
+        {
+          id: "reset-layout",
+          label: "重置布局",
+          disabled: blockedByModal("reset-layout"),
+          disabledReason: modalDisabledReason("reset-layout"),
+          action: resetLayout,
+        },
         { separator: true },
-        { label: "切换全屏", action: () => void toggleFullscreen() },
+        {
+          id: "toggle-fullscreen",
+          label: "切换全屏",
+          disabled: blockedByModal("toggle-fullscreen"),
+          disabledReason: modalDisabledReason("toggle-fullscreen"),
+          action: () => void toggleFullscreen(),
+        },
       ],
     },
     {
@@ -3199,18 +4325,24 @@ const appMenus = computed<MenuBarMenu[]>(() => {
         fromAction("structure-sync"),
         fromAction("data-sync"),
         { separator: true },
-        fromAction("import-data"),
-        { separator: true },
         {
+          id: "edit-connection",
           label: "编辑当前连接…",
-          disabled: !selected.value,
-          disabledReason: "请先选择连接",
+          disabled:
+            !selected.value || blockedByModal("edit-connection"),
+          disabledReason: blockedByModal("edit-connection")
+            ? "请先关闭当前对话框"
+            : "请先选择连接",
           action: editSelectedConnection,
         },
         {
+          id: "close-connection",
           label: "关闭当前连接",
-          disabled: !selected.value,
-          disabledReason: "请先选择连接",
+          disabled:
+            !selected.value || blockedByModal("close-connection"),
+          disabledReason: blockedByModal("close-connection")
+            ? "请先关闭当前对话框"
+            : "请先选择连接",
           action: () => void closeSelectedConnection(),
         },
       ],
@@ -3219,16 +4351,12 @@ const appMenus = computed<MenuBarMenu[]>(() => {
       label: "窗口",
       items: [
         {
+          id: "minimize-window",
           label: "最小化",
           shortcut: `${modifier}M`,
           action: () => {
             void getCurrentWindow().minimize();
           },
-        },
-        {
-          label: "关闭窗口",
-          shortcut: `${modifier}${shift}W`,
-          action: closeWindow,
         },
       ],
     },
@@ -3236,13 +4364,26 @@ const appMenus = computed<MenuBarMenu[]>(() => {
       label: "帮助",
       items: [
         {
+          id: "about",
           label: "关于 mydb",
+          disabled: blockedByModal("about"),
+          disabledReason: modalDisabledReason("about"),
           action: () => {
             aboutOpen.value = true;
           },
         },
+        {
+          id: "shortcut-help",
+          label: "键盘快捷键",
+          disabled: blockedByModal("shortcut-help"),
+          disabledReason: modalDisabledReason("shortcut-help"),
+          action: () => {
+            shortcutHelpOpen.value = true;
+          },
+        },
         { separator: true },
         {
+          id: "github",
           label: "GitHub 项目主页",
           action: () => {
             void openUrl(
@@ -3255,10 +4396,343 @@ const appMenus = computed<MenuBarMenu[]>(() => {
   ];
 });
 
+const nativeMenuState = computed<api.NativeMenuState>(() => {
+  const enabled: Record<string, boolean> = {};
+  const checked: Record<string, boolean> = {};
+  for (const menu of appMenus.value) {
+    for (const item of menu.items) {
+      if (!item.id) continue;
+      enabled[`menu-${item.id}`] =
+        !item.disabled &&
+        !(hasOpenModal.value && modalBlockedActionIds.has(item.id));
+      if (item.checked !== undefined) {
+        checked[`menu-${item.id}`] = item.checked;
+      }
+    }
+  }
+  return { enabled, checked };
+});
+
+let menuSyncTimer = 0;
+
+watch(
+  nativeMenuState,
+  (state) => {
+    if (!isMacPlatform) return;
+    window.clearTimeout(menuSyncTimer);
+    menuSyncTimer = window.setTimeout(() => {
+      void api.syncMenuState(state).catch(() => {
+        // The native menu is optional; keep the in-window menu working.
+      });
+    }, 80);
+  },
+  { deep: true },
+);
+
+const paletteConnections = computed<PaletteItem[]>(() =>
+  connections.value.map((connection) => ({
+    id: connection.id,
+    kind: "connection",
+    label: connection.name,
+    detail: [
+      connection.driver,
+      connectionTarget(connection),
+      connection.id === selectedId.value
+        ? connectionStatusLabel.value
+        : "未打开",
+      connection.group || "",
+    ]
+      .filter(Boolean)
+      .join(" · "),
+    badge: connection.driver,
+    icon: "database",
+    keywords: [
+      connection.driver,
+      connection.group,
+      connection.name,
+      connection.host,
+    ].filter(Boolean),
+    run: () => openConnectionFromPalette(connection.id),
+  })),
+);
+
+async function openConnectionFromPalette(id: string) {
+  await selectConnection(id);
+  if (isRedisConnection.value) {
+    redisWorkspaceOpen.value = true;
+    return;
+  }
+  ensureTabForSource(true);
+}
+
+const paletteObjects = computed<PaletteItem[]>(() => {
+  if (!selectedId.value || isRedisConnection.value) return [];
+  const items: PaletteItem[] = [];
+  const source = {
+    connectionId: selectedId.value,
+    database: activeDatabase.value,
+    schema: activeSchema.value,
+  };
+  const sourceLabel = tabSourceLabel(source);
+  for (const database of databases.value) {
+    items.push({
+      id: `database:${database}`,
+      kind: "object",
+      label: database,
+      detail: `数据库 · ${selected.value?.name ?? ""}`,
+      badge: "库",
+      icon: "database",
+      keywords: ["database", "db"],
+      run: () => void selectDatabase(database),
+    });
+  }
+  for (const schema of schemas.value) {
+    items.push({
+      id: `schema:${schema}`,
+      kind: "object",
+      label: schema,
+      detail: `模式 · ${selected.value?.name ?? ""}`,
+      badge: "模式",
+      icon: "structure",
+      keywords: ["schema"],
+      run: () => void selectSchema(schema),
+    });
+  }
+  for (const table of tables.value.filter(isViewableTable)) {
+    const isView = table.kind !== "table";
+    items.push({
+      id: `table:${table.kind}:${table.name}`,
+      kind: "object",
+      label: table.name,
+      detail: sourceLabel,
+      badge: isView ? "视图" : "表",
+      icon: isView ? "view" : "table",
+      keywords: [table.kind, table.name],
+      run: () => openTable(table),
+      runAlt: () => openTableInNewTab(table),
+    });
+  }
+  return items;
+});
+
+const paletteTabs = computed<PaletteItem[]>(() =>
+  workspaceTabViews.value.map((view) => ({
+    id: view.id,
+    kind: "tab",
+    label: view.label,
+    detail: view.running ? `${view.source} · 执行中` : view.source,
+    badge:
+      view.kind === "query"
+        ? "查询"
+        : view.kind === "er"
+          ? "ER"
+          : "表",
+    icon:
+      view.kind === "query"
+        ? "code"
+        : view.kind === "er"
+          ? "diagram"
+          : "table",
+    keywords: [view.title, view.source],
+    run: () => void activateWorkspaceTabById(view.id),
+  })),
+);
+
+const paletteActionIds = [
+  "new-connection",
+  "new-query",
+  "new-table",
+  "refresh",
+  "er-diagram",
+  "structure-sync",
+  "data-sync",
+  "history",
+  "import-data",
+  "export-result",
+  "open-sql-file",
+  "save-sql",
+  "reopen-closed-tab",
+  "close-tab",
+];
+
+const paletteCommands = computed<PaletteItem[]>(() => {
+  const commands: PaletteItem[] = [];
+  for (const id of paletteActionIds) {
+    const action = appActions.value.find((item) => item.id === id);
+    if (!action) continue;
+    commands.push({
+      id: `command:${action.id}`,
+      kind: "command",
+      label: action.label,
+      detail: action.disabledReason || "命令",
+      badge: "命令",
+      icon: action.icon,
+      keywords: [action.id, action.label],
+      shortcut: action.shortcut,
+      disabledReason: action.enabled
+        ? undefined
+        : action.disabledReason || "当前不可用",
+      run: action.run,
+    });
+  }
+  commands.push({
+    id: "command:run-query",
+    kind: "command",
+    label: "运行当前查询",
+    detail: runDisabledReason.value || "执行当前 SQL",
+    badge: "命令",
+    icon: "play",
+    keywords: ["run", "execute", "sql"],
+    shortcut: runShortcutLabel.value,
+    disabledReason: runDisabledReason.value || undefined,
+    run: () => void runQuery(),
+  });
+  commands.push({
+    id: "command:edit-connection",
+    kind: "command",
+    label: "编辑当前连接",
+    detail: selected.value ? selected.value.name : "请先选择连接",
+    badge: "命令",
+    icon: "database",
+    keywords: ["edit", "connection"],
+    disabledReason: selected.value ? undefined : "请先选择连接",
+    run: editSelectedConnection,
+  });
+  for (const item of [
+    {
+      id: "command:layout.sidebar",
+      label: "切换连接侧栏",
+      shortcut: layoutShortcuts.value.sidebar,
+      run: toggleSidebar,
+    },
+    {
+      id: "command:layout.objects",
+      label: "切换对象树",
+      shortcut: layoutShortcuts.value.objects,
+      run: toggleObjects,
+    },
+    {
+      id: "command:layout.result",
+      label: "切换结果面板",
+      shortcut: layoutShortcuts.value.result,
+      run: toggleResultPanel,
+    },
+    {
+      id: "command:layout.right",
+      label: "切换右侧面板",
+      shortcut: layoutShortcuts.value.right,
+      run: toggleRightPanel,
+    },
+    {
+      id: "command:layout.reset",
+      label: "重置布局",
+      shortcut: "",
+      run: resetLayout,
+    },
+  ]) {
+    commands.push({
+      id: item.id,
+      kind: "command",
+      label: item.label,
+      detail: "布局",
+      badge: "命令",
+      icon: "structure",
+      keywords: ["layout", item.label],
+      shortcut: item.shortcut,
+      run: item.run,
+    });
+  }
+  return commands;
+});
+
+function openPalette() {
+  if (paletteOpen.value || hasOpenModal.value) return;
+  closeLayoutMenu();
+  closeConnectionMenu();
+  closeGroupMenu();
+  closeAppContextMenu();
+  palettePreviousFocus =
+    document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+  paletteOpen.value = true;
+}
+
+function closePalette(restoreFocus = true) {
+  const previous = palettePreviousFocus;
+  palettePreviousFocus = null;
+  paletteOpen.value = false;
+  if (restoreFocus && previous?.isConnected) {
+    void nextTick(() => {
+      if (previous.isConnected) {
+        previous.focus({ preventScroll: true });
+      }
+    });
+  }
+}
+
+function executePaletteItem(item: PaletteItem, alt: boolean) {
+  if (item.disabledReason) return;
+  if (item.kind === "connection" || item.kind === "command") {
+    paletteRecent.value = recordPaletteRecent(
+      paletteRecent.value,
+      item.kind,
+      item.id,
+    );
+    savePaletteRecent(paletteRecent.value);
+  }
+  const previous = palettePreviousFocus;
+  closePalette(false);
+  if (previous?.isConnected) {
+    previous.focus({ preventScroll: true });
+  }
+  const action = alt && item.runAlt ? item.runAlt : item.run;
+  try {
+    void action();
+  } catch (reason) {
+    status.value = String(reason);
+  }
+}
+
+function clearPaletteRecentItems() {
+  clearPaletteRecent();
+  paletteRecent.value = [];
+}
+
+function onPaletteShortcut(event: KeyboardEvent) {
+  const modifier = isMacPlatform ? event.metaKey : event.ctrlKey;
+  if (
+    !modifier ||
+    event.altKey ||
+    event.shiftKey ||
+    event.repeat ||
+    event.key.toLowerCase() !== "k"
+  ) {
+    return;
+  }
+  if (!paletteOpen.value && hasOpenModal.value) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (paletteOpen.value) {
+    closePalette(true);
+  } else {
+    openPalette();
+  }
+}
+
 async function bindMenuEvents() {
   const handlers: Array<[string, () => void]> = [
     ["menu:new-connection", openNewConnection],
     ["menu:new-query", newQuery],
+    ["menu:open-sql-file", () => void openSqlFile()],
+    ["menu:save-sql", saveActiveSql],
+    ["menu:save-sql-as", saveActiveSqlAs],
+    ["menu:reopen-closed-tab", () => void reopenClosedTab()],
+    ["menu:import-data", () => {
+      const table = activeTable.value;
+      if (table) void openImportData(table);
+    }],
+    ["menu:export-result", () => queryWorkspaceRef.value?.requestExport()],
     ["menu:close-tab", closeActiveWorkspaceTab],
     ["menu:close-window", closeWindow],
     [
@@ -3268,6 +4742,7 @@ async function bindMenuEvents() {
       },
     ],
     ["menu:history", () => void toggleHistory()],
+    ["menu:command-palette", openPalette],
     ["menu:toggle-sidebar", toggleSidebar],
     ["menu:toggle-objects", toggleObjects],
     ["menu:toggle-result", toggleResultPanel],
@@ -3297,11 +4772,70 @@ async function bindMenuEvents() {
         }
       },
     ],
+    [
+      "menu:edit-connection",
+      () => {
+        if (selected.value) editSelectedConnection();
+      },
+    ],
+    [
+      "menu:close-connection",
+      () => {
+        if (selected.value) void closeSelectedConnection();
+      },
+    ],
+    [
+      "menu:github",
+      () => {
+        void openUrl(
+          "https://github.com/mengqi19990203-creator/mydb",
+        );
+      },
+    ],
+    [
+      "menu:shortcut-help",
+      () => {
+        shortcutHelpOpen.value = true;
+      },
+    ],
+    [
+      "menu:editor-search",
+      () => runSqlEditorCommand("search"),
+    ],
+    [
+      "menu:editor-find-next",
+      () => runSqlEditorCommand("find-next"),
+    ],
+    [
+      "menu:editor-find-previous",
+      () => runSqlEditorCommand("find-previous"),
+    ],
+    [
+      "menu:editor-goto-line",
+      () => runSqlEditorCommand("goto-line"),
+    ],
+    [
+      "menu:editor-toggle-comment",
+      () => runSqlEditorCommand("toggle-comment"),
+    ],
   ];
 
   try {
     for (const [name, handler] of handlers) {
-      unlisteners.push(await listen(name, handler));
+      unlisteners.push(
+        await listen(name, () => {
+          const actionId = name.startsWith("menu:")
+            ? name.slice("menu:".length)
+            : "";
+          if (
+            hasOpenModal.value &&
+            modalBlockedActionIds.has(actionId)
+          ) {
+            return;
+          }
+          handler();
+        }),
+      );
     }
   } catch (reason) {
     console.error("无法绑定应用菜单事件", reason);
@@ -3309,6 +4843,12 @@ async function bindMenuEvents() {
 }
 
 onMounted(async () => {
+  if (import.meta.env.DEV) {
+    const duplicates = findDuplicateShortcuts();
+    if (duplicates.length) {
+      console.warn("快捷键冲突：", duplicates);
+    }
+  }
   window.addEventListener("contextmenu", openAppContextMenu);
   window.addEventListener("mousedown", onWindowMouseDown);
   window.addEventListener("keydown", onWindowKeydown);
@@ -3316,7 +4856,18 @@ onMounted(async () => {
   window.addEventListener("resize", updateTabScroll);
   window.addEventListener("resize", updateViewportWidth);
   window.addEventListener("blur", closeAppContextMenu);
+  window.addEventListener("blur", closeTabMenu);
+  window.addEventListener("resize", closeTabMenu);
+  window.addEventListener("keydown", onPaletteShortcut, true);
   document.addEventListener("focusin", trackEditableFocus);
+  modalObserver = new MutationObserver(syncDomModalOpen);
+  modalObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["class", "style"],
+  });
+  syncDomModalOpen();
 
   await bindMenuEvents();
   await nextTick();
@@ -3338,6 +4889,11 @@ onMounted(async () => {
   ) {
     void loadHistory();
   }
+  if (isMacPlatform) {
+    void api.syncMenuState(nativeMenuState.value).catch(() => {
+      // Native menu state is best-effort.
+    });
+  }
 });
 
 onBeforeUnmount(() => {
@@ -3353,6 +4909,10 @@ onBeforeUnmount(() => {
   }
   window.clearTimeout(tabsSaveTimer);
   window.clearTimeout(layoutSaveTimer);
+  window.clearTimeout(menuSyncTimer);
+  window.clearTimeout(locatedConnectionTimer);
+  modalObserver?.disconnect();
+  modalObserver = null;
   saveWorkspaceLayout(layout);
   for (const unlisten of unlisteners) unlisten();
   window.removeEventListener("contextmenu", openAppContextMenu);
@@ -3362,6 +4922,9 @@ onBeforeUnmount(() => {
   window.removeEventListener("resize", updateTabScroll);
   window.removeEventListener("resize", updateViewportWidth);
   window.removeEventListener("blur", closeAppContextMenu);
+  window.removeEventListener("blur", closeTabMenu);
+  window.removeEventListener("resize", closeTabMenu);
+  window.removeEventListener("keydown", onPaletteShortcut, true);
   document.removeEventListener("focusin", trackEditableFocus);
 });
 </script>
@@ -3493,6 +5056,37 @@ onBeforeUnmount(() => {
           <span class="sidebar-toolbar-title">连接</span>
           <button
             class="icon-button"
+            :class="{ active: sidebarOpenOnly }"
+            :aria-pressed="sidebarOpenOnly"
+            :title="
+              sidebarOpenOnly
+                ? '显示全部连接'
+                : '只看有打开标签的连接'
+            "
+            aria-label="筛选有打开标签的连接"
+            @click="toggleSidebarOpenOnly"
+          >
+            <Icon name="filter" :size="14" />
+          </button>
+          <button
+            class="icon-button"
+            title="定位当前标签的连接"
+            aria-label="定位当前标签的连接"
+            :disabled="!activeConnectionId"
+            @click="locateActiveConnection"
+          >
+            <Icon name="target" :size="14" />
+          </button>
+          <button
+            class="icon-button"
+            title="全部折叠"
+            aria-label="折叠全部连接分组"
+            @click="collapseAllGroups"
+          >
+            <Icon name="collapse" :size="14" />
+          </button>
+          <button
+            class="icon-button"
             title="新建分组"
             @click="openNewGroupPrompt"
           >
@@ -3547,7 +5141,11 @@ onBeforeUnmount(() => {
                 v-for="connection in group.connections"
                 :key="connection.id"
                 class="connection-item"
-                :class="{ active: connection.id === selectedId }"
+                :class="{
+                  active: connection.id === selectedId,
+                  located: locatedConnectionId === connection.id,
+                }"
+                :data-connection-id="connection.id"
                 role="button"
                 tabindex="0"
                 @click="selectConnection(connection.id)"
@@ -3615,7 +5213,11 @@ onBeforeUnmount(() => {
             v-else-if="!filteredGroups.length"
             class="sidebar-empty"
           >
-            没有匹配的连接
+            {{
+              sidebarOpenOnly
+                ? "没有带打开标签的连接"
+                : "没有匹配的连接"
+            }}
           </div>
         </div>
 
@@ -3645,11 +5247,27 @@ onBeforeUnmount(() => {
 
       <section class="main">
         <div v-if="isRedisConnection" class="workspace-tabs">
-          <div class="workspace-tab active redis-tab">
+          <div v-if="redisWorkspaceOpen" class="workspace-tab active redis-tab">
             <Icon name="database" :size="14" />
             <span class="tab-label">Redis</span>
             <span v-if="selected" class="hint">{{ selected.name }}</span>
+            <button
+              class="tab-close"
+              title="关闭 Redis 控制台"
+              @click.stop="closeRedisWorkspace"
+            >
+              <Icon name="close" :size="12" />
+            </button>
           </div>
+          <span v-else class="workspace-start-label">主工作区</span>
+          <button
+            v-if="!redisWorkspaceOpen"
+            class="workspace-tab-add"
+            title="打开 Redis 控制台"
+            @click="openRedisWorkspace"
+          >
+            <Icon name="plus" :size="14" />
+          </button>
         </div>
         <div v-else-if="connections.length" class="workspace-tabs">
           <span
@@ -3687,10 +5305,17 @@ onBeforeUnmount(() => {
             tabindex="0"
             :title="view.title"
             @click="activateWorkspaceTabById(view.id)"
+            @contextmenu.prevent.stop="openTabMenu($event, view.id)"
             @keydown.enter="activateWorkspaceTabById(view.id)"
           >
             <Icon :name="view.icon" :size="14" />
             <span class="tab-label">{{ view.label }}</span>
+            <span
+              v-if="view.dirty"
+              class="tab-dirty"
+              title="有未保存的修改"
+              aria-label="有未保存的修改"
+            ></span>
             <span class="tab-source" :title="view.source">
               {{ view.source }}
             </span>
@@ -3745,16 +5370,8 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="workspace">
-          <RedisWorkspace
-            v-if="isRedisConnection && selectedId"
-            :key="selectedId"
-            :connection-id="selectedId"
-            :connection-name="selected?.name"
-            :database="redisDatabase ?? selected?.database"
-            @database-change="handleRedisDatabaseChange"
-          />
           <WorkspaceStart
-            v-else-if="connectionsLoaded && !connections.length"
+            v-if="connectionsLoaded && !connections.length"
             :connections-count="0"
             :selected="null"
             :target="''"
@@ -3767,6 +5384,31 @@ onBeforeUnmount(() => {
             :history-loading="false"
             :command-key="commandKeyLabel"
             @new-connection="openNewConnection"
+          />
+          <RedisWorkspace
+            v-else-if="isRedisConnection && selectedId && redisWorkspaceOpen"
+            :key="selectedId"
+            :connection-id="selectedId"
+            :connection-name="selected?.name"
+            :database="redisDatabase ?? selected?.database"
+            @database-change="handleRedisDatabaseChange"
+          />
+          <WorkspaceStart
+            v-else-if="isRedisConnection && selectedId"
+            :connections-count="connections.length"
+            :selected="selected"
+            :target="selected ? connectionTarget(selected) : ''"
+            :scope="connectionChipScope"
+            :connection-status="connectionStatus"
+            :connection-status-label="connectionStatusLabel"
+            :tables="[]"
+            :tables-loading="false"
+            :history="[]"
+            :history-loading="false"
+            :command-key="commandKeyLabel"
+            :redis="true"
+            @new-connection="openNewConnection"
+            @open-redis="openRedisWorkspace"
           />
           <template v-else>
             <ObjectBrowser
@@ -3782,6 +5424,8 @@ onBeforeUnmount(() => {
               :loading="tablesLoading"
               :active-table="treeActiveTableName"
               :collapsed="layout.objectsCollapsed"
+              :locate-reason="objectLocateReason"
+              :locate-scope="objectLocateScope"
               @toggle="toggleObjects"
               @select="openTable"
               @select-structure="openTableStructure"
@@ -3889,6 +5533,7 @@ onBeforeUnmount(() => {
                 v-if="tab.mode === 'data'"
                 :connection-id="tab.connectionId ?? ''"
                 :table="tab.table.name"
+                :table-kind="tab.table.kind"
                 :driver="driverForConnection(tab.connectionId)"
                 :database-label="scopeLabelFor(tab)"
                 :database="tab.database ?? undefined"
@@ -3942,16 +5587,51 @@ onBeforeUnmount(() => {
         <StatusBar
           :status="status"
           :connection="selected"
-          :result="isRedisConnection ? null : result"
+          :result="viewMode === 'sql' ? result : null"
           :database="
             isRedisConnection
               ? redisDatabase
               : activeDatabase ?? selected?.database ?? null
           "
           :schema="activeSchema"
+          :active-label="statusActiveLabel"
+          :active-kind="statusActiveKind"
+          :connection-status="connectionStatus"
+          :connection-status-label="connectionStatusLabel"
+          :read-only="selected?.readOnly ?? false"
+          :in-transaction="
+            viewMode === 'sql' && (activeTab?.inTransaction ?? false)
+          "
+          :running="viewMode === 'sql' && (activeTab?.running ?? false)"
+          :error="viewMode === 'sql' ? queryError : null"
         />
       </section>
     </div>
+
+    <ShortcutHelpDialog
+      :open="shortcutHelpOpen"
+      @close="shortcutHelpOpen = false"
+    />
+
+    <CommandPalette
+      :open="paletteOpen"
+      :connections="paletteConnections"
+      :objects="paletteObjects"
+      :tabs="paletteTabs"
+      :commands="paletteCommands"
+      :recent="paletteRecent"
+      :objects-loading="tablesLoading"
+      :object-status="
+        connectionStatus === 'failed'
+          ? '连接不可用，无法搜索对象'
+          : ''
+      "
+      :has-connections="connections.length > 0"
+      :command-key="isMacPlatform ? '⌘' : 'Ctrl+'"
+      @close="closePalette(true)"
+      @execute="executePaletteItem"
+      @clear-recent="clearPaletteRecentItems"
+    />
 
     <div
       v-if="aboutOpen"
@@ -4276,8 +5956,11 @@ onBeforeUnmount(() => {
       :message="confirmRequest?.message ?? ''"
       :detail="confirmRequest?.detail ?? null"
       :confirm-text="confirmRequest?.confirmText"
+      :cancel-text="confirmRequest?.cancelText"
+      :extra-text="confirmRequest?.extraText"
       :danger="confirmRequest?.danger !== false"
       @confirm="runConfirmed"
+      @extra="runConfirmExtra"
       @cancel="confirmRequest = null"
     />
 
@@ -4313,6 +5996,72 @@ onBeforeUnmount(() => {
       :initial-table="activeTable?.kind === 'table' ? activeTable.name : ''"
       @close="dataSyncOpen = false"
     />
+
+    <div
+      v-if="tabMenu"
+      ref="tabMenuRef"
+      class="context-menu tab-context-menu"
+      role="menu"
+      :style="{
+        position: 'fixed',
+        left: `${tabMenu.x}px`,
+        top: `${tabMenu.y}px`,
+      }"
+      @click.stop
+    >
+      <button
+        class="context-menu-item"
+        role="menuitem"
+        @click="closeTabFromMenu"
+      >
+        <span>关闭标签</span>
+      </button>
+      <button
+        class="context-menu-item"
+        role="menuitem"
+        :disabled="!tabMenuCounts.other"
+        @click="requestCloseTabs('other')"
+      >
+        <span>关闭其他标签</span>
+        <span class="context-menu-shortcut">
+          {{ tabMenuCounts.other }}
+        </span>
+      </button>
+      <button
+        class="context-menu-item"
+        role="menuitem"
+        :disabled="!tabMenuCounts.right"
+        @click="requestCloseTabs('right')"
+      >
+        <span>关闭右侧标签</span>
+        <span class="context-menu-shortcut">
+          {{ tabMenuCounts.right }}
+        </span>
+      </button>
+      <button
+        class="context-menu-item"
+        role="menuitem"
+        @click="requestCloseTabs('all')"
+      >
+        <span>关闭全部标签</span>
+      </button>
+      <div class="context-separator"></div>
+      <button
+        class="context-menu-item"
+        role="menuitem"
+        @click="reopenFromTabMenu"
+      >
+        <span>重新打开关闭的标签</span>
+      </button>
+      <div class="context-separator"></div>
+      <button
+        class="context-menu-item"
+        role="menuitem"
+        @click="copyTabMenuSource"
+      >
+        <span>复制来源</span>
+      </button>
+    </div>
 
     <div
       v-if="appContextMenu"

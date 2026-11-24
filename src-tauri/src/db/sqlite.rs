@@ -275,6 +275,139 @@ impl DatabaseDriver for SqliteDriver {
         })
     }
 
+    async fn rebuild_column(
+        &self,
+        table: &str,
+        column: &str,
+        name: &str,
+        data_type: &str,
+        nullable: bool,
+        default_value: Option<&str>,
+    ) -> Result<(), String> {
+        let table_ref = quote_identifier(table);
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|error| format!("获取数据库连接失败: {error}"))?;
+
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| format!("关闭外键检查失败: {error}"))?;
+
+        let outcome = async {
+            sqlx::raw_sql("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| format!("开启重建事务失败: {error}"))?;
+
+            if name != column {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                    "ALTER TABLE {table_ref} RENAME COLUMN {} TO {}",
+                    quote_identifier(column),
+                    quote_identifier(name)
+                )))
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| format!("重命名字段失败: {error}"))?;
+            }
+
+            let ddl: Option<String> = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|error| format!("读取表定义失败: {error}"))?
+            .flatten();
+            let ddl = ddl.filter(|value| !value.trim().is_empty()).ok_or_else(|| {
+                format!("没有可用的表定义，无法重建表: {table}")
+            })?;
+
+            let columns = sqlite_column_names(&mut *connection, table).await?;
+            if columns.is_empty() {
+                return Err("表没有可复制的字段".to_string());
+            }
+            let objects: Vec<(String, String)> = sqlx::query_as(
+                "SELECT type, sql FROM sqlite_master \
+                 WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL \
+                 ORDER BY type DESC, name",
+            )
+            .bind(table)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|error| format!("读取索引 / 触发器失败: {error}"))?;
+
+            let rewritten = rewrite_sqlite_column(
+                &ddl,
+                name,
+                data_type,
+                nullable,
+                default_value,
+            )?;
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let temp = format!("__mydb_rebuild_{nanos}");
+            let temp_ref = quote_identifier(&temp);
+            let temp_ddl = super::driver::rename_ddl_object(&rewritten, &temp_ref)?;
+
+            sqlx::raw_sql(sqlx::AssertSqlSafe(temp_ddl))
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| format!("创建临时表失败: {error}"))?;
+
+            let column_list = columns
+                .iter()
+                .map(|value| quote_identifier(value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {temp_ref} ({column_list}) SELECT {column_list} FROM {table_ref}"
+            )))
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| format!("复制表数据失败: {error}"))?;
+
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP TABLE {table_ref}")))
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| format!("删除旧表失败: {error}"))?;
+
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {temp_ref} RENAME TO {table_ref}"
+            )))
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| format!("重命名临时表失败: {error}"))?;
+
+            for (kind, sql) in objects {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(|error| format!("恢复{kind}失败: {error}"))?;
+            }
+
+            sqlx::raw_sql("COMMIT")
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| format!("提交重建事务失败: {error}"))?;
+            Ok(())
+        }
+        .await;
+
+        if outcome.is_err() {
+            let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *connection).await;
+        }
+        let _ = sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *connection)
+            .await;
+
+        outcome
+    }
+
     async fn read_rows(
         &self,
         table: &str,
@@ -375,9 +508,10 @@ impl DatabaseDriver for SqliteDriver {
         table: &str,
         keys: &[ColumnValue],
         changes: &[ColumnValue],
+        single_row: bool,
     ) -> Result<u64, String> {
         if keys.is_empty() {
-            return Err("该表没有主键，无法安全编辑".to_string());
+            return Err("该表没有可用的行标识，无法安全编辑".to_string());
         }
         if changes.is_empty() {
             return Ok(0);
@@ -388,14 +522,27 @@ impl DatabaseDriver for SqliteDriver {
             .map(|item| format!("{} = ?", quote_identifier(&item.column)))
             .collect::<Vec<_>>()
             .join(", ");
-        let where_clause = keys
+        let key_clause = keys
             .iter()
-            .map(|item| format!("{} = ?", quote_identifier(&item.column)))
+            .map(|item| {
+                if item.value.is_null() {
+                    format!("{} IS NULL", quote_identifier(&item.column))
+                } else {
+                    format!("{} = ?", quote_identifier(&item.column))
+                }
+            })
             .collect::<Vec<_>>()
             .join(" AND ");
+        let table_ref = quote_identifier(table);
+        let where_clause = if single_row {
+            format!(
+                "rowid = (SELECT rowid FROM {table_ref} WHERE {key_clause} LIMIT 1)"
+            )
+        } else {
+            key_clause
+        };
         let sql = format!(
-            "UPDATE {} SET {set_clause} WHERE {where_clause}",
-            quote_identifier(table)
+            "UPDATE {table_ref} SET {set_clause} WHERE {where_clause}"
         );
 
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
@@ -403,7 +550,9 @@ impl DatabaseDriver for SqliteDriver {
             query = bind_json_sqlite(query, &change.value);
         }
         for key in keys {
-            query = bind_json_sqlite(query, &key.value);
+            if !key.value.is_null() {
+                query = bind_json_sqlite(query, &key.value);
+            }
         }
 
         let result = query
@@ -441,24 +590,42 @@ impl DatabaseDriver for SqliteDriver {
         Ok(result.rows_affected())
     }
 
-    async fn delete_row(&self, table: &str, keys: &[ColumnValue]) -> Result<u64, String> {
+    async fn delete_row(
+        &self,
+        table: &str,
+        keys: &[ColumnValue],
+        single_row: bool,
+    ) -> Result<u64, String> {
         if keys.is_empty() {
-            return Err("该表没有主键，无法安全删除".to_string());
+            return Err("该表没有可用的行标识，无法安全删除".to_string());
         }
 
-        let where_clause = keys
+        let key_clause = keys
             .iter()
-            .map(|item| format!("{} = ?", quote_identifier(&item.column)))
+            .map(|item| {
+                if item.value.is_null() {
+                    format!("{} IS NULL", quote_identifier(&item.column))
+                } else {
+                    format!("{} = ?", quote_identifier(&item.column))
+                }
+            })
             .collect::<Vec<_>>()
             .join(" AND ");
-        let sql = format!(
-            "DELETE FROM {} WHERE {where_clause}",
-            quote_identifier(table)
-        );
+        let table_ref = quote_identifier(table);
+        let where_clause = if single_row {
+            format!(
+                "rowid = (SELECT rowid FROM {table_ref} WHERE {key_clause} LIMIT 1)"
+            )
+        } else {
+            key_clause
+        };
+        let sql = format!("DELETE FROM {table_ref} WHERE {where_clause}");
 
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for key in keys {
-            query = bind_json_sqlite(query, &key.value);
+            if !key.value.is_null() {
+                query = bind_json_sqlite(query, &key.value);
+            }
         }
 
         let result = query
@@ -613,6 +780,377 @@ impl DatabaseDriver for SqliteDriver {
             .map_err(|error| format!("删除对象失败: {error}"))?;
         Ok(())
     }
+}
+
+async fn sqlite_column_names(
+    connection: &mut sqlx::SqliteConnection,
+    table: &str,
+) -> Result<Vec<String>, String> {
+    let sql = format!("PRAGMA table_info({})", quote_identifier(table));
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| format!("读取字段列表失败: {error}"))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.try_get::<String, _>("name").ok())
+        .collect())
+}
+
+const SQLITE_CONSTRAINT_KEYWORDS: &[&str] = &[
+    "PRIMARY",
+    "NOT",
+    "NULL",
+    "UNIQUE",
+    "CHECK",
+    "DEFAULT",
+    "COLLATE",
+    "REFERENCES",
+    "GENERATED",
+    "CONSTRAINT",
+    "AS",
+];
+
+fn skip_sqlite_ws(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn skip_sqlite_quote(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let quote = *bytes.get(start)?;
+    if quote == b'[' {
+        return text[start..].find(']').map(|offset| start + offset + 1);
+    }
+    if !matches!(quote, b'\'' | b'"' | b'`') {
+        return None;
+    }
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == quote {
+            if bytes.get(index + 1) == Some(&quote) {
+                index += 2;
+                continue;
+            }
+            return Some(index + 1);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn matching_sqlite_paren(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = open + 1;
+    let mut depth = 1usize;
+    while index < bytes.len() {
+        if let Some(end) = skip_sqlite_quote(text, index) {
+            index = end;
+            continue;
+        }
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn read_sqlite_word(text: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let mut index = skip_sqlite_ws(bytes, start);
+    if index >= bytes.len() || !(bytes[index].is_ascii_alphabetic() || bytes[index] == b'_') {
+        return None;
+    }
+    let begin = index;
+    while index < bytes.len()
+        && (bytes[index].is_ascii_alphanumeric()
+            || bytes[index] == b'_'
+            || bytes[index] == b'$')
+    {
+        index += 1;
+    }
+    Some((text[begin..index].to_ascii_uppercase(), index))
+}
+
+fn read_sqlite_identifier(text: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let mut index = skip_sqlite_ws(bytes, start);
+    if index >= bytes.len() {
+        return None;
+    }
+    if let Some(end) = skip_sqlite_quote(text, index) {
+        return Some((text[index..end].to_string(), end));
+    }
+    if !(bytes[index].is_ascii_alphabetic() || bytes[index] == b'_') {
+        return None;
+    }
+    let begin = index;
+    while index < bytes.len()
+        && (bytes[index].is_ascii_alphanumeric()
+            || bytes[index] == b'_'
+            || bytes[index] == b'$')
+    {
+        index += 1;
+    }
+    Some((text[begin..index].to_string(), index))
+}
+
+fn sqlite_identifier_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if trimmed.starts_with('"') && trimmed.ends_with('"') {
+            return inner.replace("\"\"", "\"");
+        }
+        if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+            return inner.replace("''", "'");
+        }
+        if trimmed.starts_with('`') && trimmed.ends_with('`') {
+            return inner.replace("``", "`");
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            return inner.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn sqlite_table_body(ddl: &str) -> Option<(usize, usize)> {
+    let bytes = ddl.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if let Some(end) = skip_sqlite_quote(ddl, index) {
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'(' {
+            return matching_sqlite_paren(ddl, index).map(|close| (index, close));
+        }
+        index += 1;
+    }
+    None
+}
+
+fn split_sqlite_definitions(
+    text: &str,
+    start: usize,
+    end: usize,
+) -> Result<Vec<(usize, usize)>, String> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut depth = 0usize;
+    let mut part_start = start;
+    let mut index = start;
+    while index < end {
+        if let Some(quote_end) = skip_sqlite_quote(text, index) {
+            if quote_end > end {
+                return Err("表定义中的引号未闭合".to_string());
+            }
+            index = quote_end;
+            continue;
+        }
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                ranges.push((part_start, index));
+                part_start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    ranges.push((part_start, end));
+    Ok(ranges)
+}
+
+fn skip_sqlite_default_value(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = skip_sqlite_ws(bytes, start);
+    if index >= bytes.len() {
+        return index;
+    }
+    if bytes[index] == b'(' {
+        return matching_sqlite_paren(text, index)
+            .map(|close| close + 1)
+            .unwrap_or(text.len());
+    }
+    if let Some(end) = skip_sqlite_quote(text, index) {
+        return end;
+    }
+    if matches!(bytes[index], b'+' | b'-') {
+        index = skip_sqlite_ws(bytes, index + 1);
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && !matches!(bytes[index], b',' | b')')
+        {
+            index += 1;
+        }
+        return index;
+    }
+    while index < bytes.len()
+        && !bytes[index].is_ascii_whitespace()
+        && !matches!(bytes[index], b',' | b')')
+    {
+        index += 1;
+    }
+    index
+}
+
+fn strip_sqlite_null_and_default(suffix: &str) -> String {
+    let bytes = suffix.as_bytes();
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if let Some(end) = skip_sqlite_quote(suffix, index) {
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'(' {
+            index = matching_sqlite_paren(suffix, index)
+                .map(|close| close + 1)
+                .unwrap_or(bytes.len());
+            continue;
+        }
+        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+            let Some((word, word_end)) = read_sqlite_word(suffix, index) else {
+                index += 1;
+                continue;
+            };
+            if word == "NOT" {
+                if let Some((next, next_end)) = read_sqlite_word(suffix, word_end) {
+                    if next == "NULL" {
+                        removals.push((index, next_end));
+                        index = next_end;
+                        continue;
+                    }
+                }
+            } else if word == "DEFAULT" {
+                let end = skip_sqlite_default_value(suffix, word_end);
+                removals.push((index, end));
+                index = end;
+                continue;
+            }
+            index = word_end;
+            continue;
+        }
+        index += 1;
+    }
+
+    if removals.is_empty() {
+        return suffix.trim().to_string();
+    }
+
+    let mut result = String::new();
+    let mut cursor = 0usize;
+    for (start, end) in removals {
+        if start > cursor {
+            result.push_str(&suffix[cursor..start]);
+        }
+        cursor = end;
+    }
+    if cursor < suffix.len() {
+        result.push_str(&suffix[cursor..]);
+    }
+    result.trim().to_string()
+}
+
+fn rewrite_sqlite_column(
+    ddl: &str,
+    column: &str,
+    new_type: &str,
+    nullable: bool,
+    default_value: Option<&str>,
+) -> Result<String, String> {
+    let (open, close) = sqlite_table_body(ddl)
+        .ok_or_else(|| "无法解析表定义中的字段列表".to_string())?;
+    let ranges = split_sqlite_definitions(ddl, open + 1, close)?;
+    for (start, end) in ranges {
+        let definition = &ddl[start..end];
+        let leading = &definition[..definition.len() - definition.trim_start().len()];
+        let inner = definition.trim_start();
+        let Some((raw_name, name_end)) = read_sqlite_identifier(inner, 0) else {
+            continue;
+        };
+        if !sqlite_identifier_value(&raw_name).eq_ignore_ascii_case(column) {
+            continue;
+        }
+
+        let bytes = inner.as_bytes();
+        let type_start = skip_sqlite_ws(bytes, name_end);
+        let mut suffix_start = inner.len();
+        let mut index = type_start;
+        while index < inner.len() {
+            if let Some(quote_end) = skip_sqlite_quote(inner, index) {
+                index = quote_end;
+                continue;
+            }
+            if bytes[index] == b'(' {
+                index = matching_sqlite_paren(inner, index)
+                    .map(|paren| paren + 1)
+                    .unwrap_or(inner.len());
+                continue;
+            }
+            if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+                let Some((word, word_end)) = read_sqlite_word(inner, index) else {
+                    index += 1;
+                    continue;
+                };
+                if SQLITE_CONSTRAINT_KEYWORDS.contains(&word.as_str()) {
+                    suffix_start = index;
+                    break;
+                }
+                index = word_end;
+                continue;
+            }
+            index += 1;
+        }
+
+        let suffix = &inner[suffix_start..];
+        let generated = read_sqlite_word(suffix, 0)
+            .map(|(word, _)| word == "GENERATED" || word == "AS")
+            .unwrap_or(false)
+            || suffix.to_ascii_uppercase().contains("GENERATED ALWAYS AS");
+        if generated {
+            return Err(format!(
+                "字段 {column} 是生成列，SQLite 重建暂不支持修改生成列"
+            ));
+        }
+
+        let remaining = strip_sqlite_null_and_default(suffix);
+        let mut rebuilt = format!("{} {}", &inner[..name_end], new_type);
+        if !remaining.is_empty() {
+            rebuilt.push(' ');
+            rebuilt.push_str(&remaining);
+        }
+        if !nullable {
+            rebuilt.push_str(" NOT NULL");
+        }
+        if let Some(default) = default_value {
+            rebuilt.push_str(" DEFAULT ");
+            rebuilt.push_str(default);
+        }
+
+        return Ok(format!(
+            "{}{}{}{}",
+            &ddl[..start],
+            leading,
+            rebuilt,
+            &ddl[end..]
+        ));
+    }
+
+    Err(format!("在表定义中找不到字段 {column}"))
 }
 
 fn quote_identifier(name: &str) -> String {
@@ -1001,6 +1539,7 @@ mod tests {
                     column: "name".to_string(),
                     value: json!("aa"),
                 }],
+                false,
             )
             .await
             .expect("update");
@@ -1029,6 +1568,7 @@ mod tests {
                     column: "id".to_string(),
                     value: json!(2),
                 }],
+                false,
             )
             .await
             .expect("delete");
@@ -1316,12 +1856,23 @@ mod tests {
             .await
             .expect("create orders");
         driver
-            .execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, message TEXT)", 1000)
+            .execute(
+                "CREATE TABLE logs (id INTEGER PRIMARY KEY, message TEXT)",
+                1000,
+            )
             .await
             .expect("create logs");
+        driver
+            .execute(
+                "CREATE VIEW order_totals AS \
+                 SELECT user_id, SUM(total) AS total FROM orders GROUP BY user_id",
+                1000,
+            )
+            .await
+            .expect("create view");
 
         let diagram = driver.er_diagram().await.expect("diagram");
-        assert_eq!(diagram.tables.len(), 3);
+        assert_eq!(diagram.tables.len(), 4);
         assert!(diagram.relations.iter().any(|relation| {
             relation.from_table == "orders"
                 && relation.to_table == "users"
@@ -1347,6 +1898,17 @@ mod tests {
                 .data_type,
             "INTEGER"
         );
+
+        let view = diagram
+            .tables
+            .iter()
+            .find(|table| table.name == "order_totals")
+            .expect("view node");
+        assert_eq!(view.kind, "view");
+        assert!(view
+            .columns
+            .iter()
+            .any(|column| column.name == "user_id"));
     }
 
     #[tokio::test]
@@ -1385,6 +1947,240 @@ mod tests {
             .await
             .expect("export all");
         assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn updates_and_deletes_one_duplicate_row_without_primary_key() {
+        let (_dir, driver) = test_driver().await;
+        driver
+            .execute(
+                "CREATE TABLE notes (message TEXT, tag TEXT)",
+                1000,
+            )
+            .await
+            .expect("create table");
+        driver
+            .execute(
+                "INSERT INTO notes (message, tag) VALUES ('same', 'x'), ('same', 'x')",
+                1000,
+            )
+            .await
+            .expect("insert");
+
+        let keys = vec![
+            ColumnValue {
+                column: "message".to_string(),
+                value: json!("same"),
+            },
+            ColumnValue {
+                column: "tag".to_string(),
+                value: json!("x"),
+            },
+        ];
+        let updated = driver
+            .update_row(
+                "notes",
+                &keys,
+                &[ColumnValue {
+                    column: "tag".to_string(),
+                    value: json!("y"),
+                }],
+                true,
+            )
+            .await
+            .expect("update one");
+        assert_eq!(updated, 1);
+
+        let rows = driver
+            .read_rows("notes", 10, 0, None, None, None)
+            .await
+            .expect("rows");
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(
+            rows.rows
+                .iter()
+                .filter(|row| row[1] == json!("y"))
+                .count(),
+            1
+        );
+
+        let remaining = vec![
+            ColumnValue {
+                column: "message".to_string(),
+                value: json!("same"),
+            },
+            ColumnValue {
+                column: "tag".to_string(),
+                value: json!("y"),
+            },
+        ];
+        let deleted = driver
+            .delete_row("notes", &remaining, true)
+            .await
+            .expect("delete one");
+        assert_eq!(deleted, 1);
+        let rows = driver
+            .read_rows("notes", 10, 0, None, None, None)
+            .await
+            .expect("rows after delete");
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0][1], json!("x"));
+    }
+
+    #[tokio::test]
+    async fn updates_null_key_columns_with_is_null() {
+        let (_dir, driver) = test_driver().await;
+        driver
+            .execute("CREATE TABLE notes (message TEXT, tag TEXT)", 1000)
+            .await
+            .expect("create table");
+        driver
+            .execute("INSERT INTO notes (message, tag) VALUES ('a', NULL)", 1000)
+            .await
+            .expect("insert");
+
+        let keys = vec![
+            ColumnValue {
+                column: "message".to_string(),
+                value: json!("a"),
+            },
+            ColumnValue {
+                column: "tag".to_string(),
+                value: Value::Null,
+            },
+        ];
+        let updated = driver
+            .update_row(
+                "notes",
+                &keys,
+                &[ColumnValue {
+                    column: "tag".to_string(),
+                    value: json!("b"),
+                }],
+                true,
+            )
+            .await
+            .expect("update null key");
+        assert_eq!(updated, 1);
+        let rows = driver
+            .read_rows("notes", 10, 0, None, None, None)
+            .await
+            .expect("rows");
+        assert_eq!(rows.rows[0][1], json!("b"));
+    }
+
+    #[tokio::test]
+    async fn rebuilds_column_and_preserves_indexes_triggers_and_data() {
+        let (_dir, driver) = test_driver().await;
+        driver
+            .execute(
+                "CREATE TABLE items (\
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                   name TEXT NOT NULL DEFAULT 'n/a', \
+                   qty TEXT\
+                 )",
+                1000,
+            )
+            .await
+            .expect("create table");
+        driver
+            .execute("CREATE INDEX idx_items_name ON items(name)", 1000)
+            .await
+            .expect("create index");
+        driver
+            .execute(
+                "CREATE TRIGGER trg_items AFTER INSERT ON items \
+                 BEGIN UPDATE items SET name = name WHERE id = new.id; END",
+                1000,
+            )
+            .await
+            .expect("create trigger");
+        driver
+            .execute(
+                "INSERT INTO items (name, qty) VALUES ('a', '1'), ('b', '2')",
+                1000,
+            )
+            .await
+            .expect("insert");
+
+        driver
+            .rebuild_column("items", "qty", "quantity", "INTEGER", false, Some("0"))
+            .await
+            .expect("rebuild column");
+
+        let structure = driver.table_structure("items").await.expect("structure");
+        let quantity = structure
+            .columns
+            .iter()
+            .find(|column| column.name == "quantity")
+            .expect("renamed column");
+        assert_eq!(quantity.data_type, "INTEGER");
+        assert!(!quantity.nullable);
+        assert_eq!(quantity.default_value.as_deref(), Some("0"));
+        assert!(structure.indexes.iter().any(|index| index.name == "idx_items_name"));
+
+        let rows = driver
+            .read_rows("items", 10, 0, None, Some("id"), Some("asc"))
+            .await
+            .expect("rows");
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.rows[0][2], json!(1));
+        assert_eq!(rows.rows[1][2], json!(2));
+
+        driver
+            .execute("INSERT INTO items (name) VALUES ('c')", 1000)
+            .await
+            .expect("insert after rebuild");
+        let rows = driver
+            .read_rows("items", 10, 0, None, Some("id"), Some("asc"))
+            .await
+            .expect("rows after insert");
+        assert_eq!(rows.rows.len(), 3);
+        assert_eq!(rows.rows[2][0], json!(3));
+        assert_eq!(rows.rows[2][2], json!(0));
+
+        let objects = driver
+            .execute(
+                "SELECT type, name FROM sqlite_master \
+                 WHERE name IN ('idx_items_name', 'trg_items') ORDER BY name",
+                100,
+            )
+            .await
+            .expect("objects");
+        assert_eq!(objects.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rebuild_column_rolls_back_when_existing_data_violates_not_null() {
+        let (_dir, driver) = test_driver().await;
+        driver
+            .execute("CREATE TABLE notes (id INTEGER, note TEXT)", 1000)
+            .await
+            .expect("create table");
+        driver
+            .execute("INSERT INTO notes (id, note) VALUES (1, NULL)", 1000)
+            .await
+            .expect("insert");
+
+        let error = driver
+            .rebuild_column("notes", "note", "note", "TEXT", false, None)
+            .await
+            .expect_err("NOT NULL should fail");
+        assert!(error.contains("复制表数据失败"));
+
+        let structure = driver.table_structure("notes").await.expect("structure");
+        let note = structure
+            .columns
+            .iter()
+            .find(|column| column.name == "note")
+            .expect("note column");
+        assert!(note.nullable);
+        let rows = driver
+            .read_rows("notes", 10, 0, None, None, None)
+            .await
+            .expect("rows");
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0][1], json!(null));
     }
 }
 

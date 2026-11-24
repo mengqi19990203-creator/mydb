@@ -78,13 +78,32 @@ pub fn database_index(config: &ConnectionConfig) -> Result<i64, String> {
         })
 }
 
+pub fn tls_enabled(config: &ConnectionConfig) -> bool {
+    matches!(
+        config.ssl_mode.trim().to_ascii_lowercase().as_str(),
+        "required" | "preferred"
+    )
+}
+
 pub async fn connect(
     config: &ConnectionConfig,
+    host: &str,
+    port: u16,
     password: Option<&str>,
 ) -> Result<MultiplexedConnection, String> {
     let username = config.username.trim();
+    let addr = if tls_enabled(config) {
+        ConnectionAddr::TcpTls {
+            host: host.to_string(),
+            port,
+            insecure: false,
+            tls_params: None,
+        }
+    } else {
+        ConnectionAddr::Tcp(host.to_string(), port)
+    };
     let info = ConnectionInfo {
-        addr: ConnectionAddr::Tcp(config.host.clone(), config.port),
+        addr,
         redis: RedisConnectionInfo {
             // Always start on db0: Redis Cluster rejects SELECT, so the
             // requested database is applied later by `ensure_database`.
@@ -120,9 +139,11 @@ pub async fn connect(
 
 pub async fn test_connection(
     config: &ConnectionConfig,
+    host: &str,
+    port: u16,
     password: Option<&str>,
 ) -> Result<(), String> {
-    let mut connection = connect(config, password).await?;
+    let mut connection = connect(config, host, port, password).await?;
     let database = database_index(config)?;
     ensure_database(&mut connection, database).await?;
     Ok(())

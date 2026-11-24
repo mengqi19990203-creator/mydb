@@ -19,6 +19,7 @@ examples/demo.db
 connections.json
 history.json
 groups.json
+dev-credentials.json
 
 # Editor directories and files
 .vscode/*

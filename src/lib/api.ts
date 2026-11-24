@@ -267,8 +267,15 @@ export function updateTableRow(
   table: string,
   keys: ColumnValue[],
   changes: ColumnValue[],
+  singleRow = false,
 ): Promise<number> {
-  return invoke("update_table_row", { connectionId, table, keys, changes });
+  return invoke("update_table_row", {
+    connectionId,
+    table,
+    keys,
+    changes,
+    singleRow,
+  });
 }
 
 export function insertTableRow(
@@ -283,8 +290,14 @@ export function deleteTableRow(
   connectionId: string,
   table: string,
   keys: ColumnValue[],
+  singleRow = false,
 ): Promise<number> {
-  return invoke("delete_table_row", { connectionId, table, keys });
+  return invoke("delete_table_row", {
+    connectionId,
+    table,
+    keys,
+    singleRow,
+  });
 }
 
 export function getObjectDdl(
@@ -317,6 +330,7 @@ export function compareSchemas(
   targetTable: string | null,
   includeIndexes: boolean,
   includeForeignKeys: boolean,
+  includeDrops: boolean,
 ): Promise<SchemaDiff> {
   return invoke("compare_schemas", {
     sourceConnectionId,
@@ -329,6 +343,27 @@ export function compareSchemas(
     targetTable,
     includeIndexes,
     includeForeignKeys,
+    includeDrops,
+  });
+}
+
+export function alterTableColumn(
+  connectionId: string,
+  table: string,
+  column: string,
+  name: string,
+  dataType: string,
+  nullable: boolean,
+  defaultValue: string | null,
+): Promise<void> {
+  return invoke("alter_table_column", {
+    connectionId,
+    table,
+    column,
+    name,
+    dataType,
+    nullable,
+    defaultValue,
   });
 }
 
@@ -453,6 +488,23 @@ export function dropObject(
 
 export function writeTextFile(path: string, contents: string): Promise<void> {
   return invoke("write_text_file", { path, contents });
+}
+
+export function readTextFile(path: string): Promise<string> {
+  return invoke("read_text_file", { path });
+}
+
+export function quitApp(): Promise<void> {
+  return invoke("quit_app");
+}
+
+export interface NativeMenuState {
+  enabled: Record<string, boolean>;
+  checked: Record<string, boolean>;
+}
+
+export function syncMenuState(state: NativeMenuState): Promise<void> {
+  return invoke("sync_menu_state", { state });
 }
 
 export function importCsv(

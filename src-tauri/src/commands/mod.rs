@@ -20,6 +20,7 @@ pub use transaction::*;
 
 use crate::db::DatabaseDriver;
 use crate::db::DatabaseSession;
+use crate::ssh::SshTunnel;
 use ::redis::aio::MultiplexedConnection;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,6 +37,8 @@ pub struct TransactionEntry {
 pub struct AppState {
     pub drivers: Mutex<HashMap<String, Arc<dyn DatabaseDriver>>>,
     pub redis_clients: Mutex<HashMap<String, MultiplexedConnection>>,
+    /// SSH tunnels forwarding Redis traffic, kept alive with the cached client.
+    pub redis_tunnels: Mutex<HashMap<String, SshTunnel>>,
     /// Last Redis logical database selected for a connection, reapplied when
     /// the multiplexed connection is recreated.
     pub redis_databases: Mutex<HashMap<String, i64>>,

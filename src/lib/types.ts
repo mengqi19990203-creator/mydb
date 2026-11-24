@@ -104,6 +104,7 @@ export interface ErColumn {
 
 export interface ErTable {
   name: string;
+  kind: string;
   columns: ErColumn[];
 }
 

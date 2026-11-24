@@ -2,12 +2,22 @@
 import { computed } from "vue";
 import type { ConnectionConfig, QueryResult } from "../lib/types";
 
+type ConnectionStatus = "idle" | "connecting" | "connected" | "failed";
+
 const props = defineProps<{
   status: string;
   connection: ConnectionConfig | null;
   result: QueryResult | null;
   database?: string | null;
   schema?: string | null;
+  activeLabel?: string;
+  activeKind?: "query" | "table" | "er" | null;
+  connectionStatus?: ConnectionStatus;
+  connectionStatusLabel?: string;
+  readOnly?: boolean;
+  inTransaction?: boolean;
+  running?: boolean;
+  error?: string | null;
 }>();
 
 function redisDatabaseLabel(value: string): string {
@@ -39,6 +49,33 @@ function connectionTarget(connection: ConnectionConfig): string {
   const user = connection.username ? `${connection.username}@` : "";
   return `${user}${connection.host}:${connection.port}`;
 }
+
+const activeLabel = computed(() => {
+  if (props.activeLabel) return props.activeLabel;
+  if (!props.connection) return "未连接";
+  return scope.value
+    ? `${props.connection.name} · ${scope.value}`
+    : props.connection.name;
+});
+
+const resultSummary = computed(() => {
+  if (props.running) return "";
+  if (props.error) return "查询失败";
+  const result = props.result;
+  if (!result) return "";
+  const elapsed = `${result.elapsedMs} ms`;
+  if (result.isQuery) {
+    return `${result.rows.length} 行 · ${elapsed}${
+      result.truncated ? " · 已截断" : ""
+    }`;
+  }
+  return `影响 ${result.rowsAffected} 行 · ${elapsed}`;
+});
+
+const stateLabel = computed(() => {
+  if (!props.connection) return "未连接";
+  return props.connectionStatusLabel ?? props.connectionStatus ?? "idle";
+});
 </script>
 
 <template>
@@ -47,12 +84,39 @@ function connectionTarget(connection: ConnectionConfig): string {
       {{ status }}
     </span>
     <span class="status-meta">
-      <span v-if="connection">
-        {{ connection.driver }} · {{ connectionTarget(connection) }}
+      <span
+        v-if="connection"
+        class="status-active"
+        :class="{ 'status-active-table': activeKind === 'table' }"
+        :title="activeLabel"
+      >
+        {{ activeLabel }}
       </span>
-      <span v-if="scope" class="status-scope" :title="scope">{{ scope }}</span>
-      <span v-if="result && result.rows.length">{{ result.rows.length }} 行</span>
-      <span v-if="result">{{ result.elapsedMs }} ms</span>
+      <span v-else class="status-active">未连接</span>
+      <span v-if="readOnly" class="status-readonly">只读</span>
+      <span
+        v-if="connection"
+        class="status-connection"
+        :title="`${connection.driver} · ${connectionTarget(connection)}`"
+      >
+        <span class="status-dot" :class="connectionStatus ?? 'idle'"></span>
+        {{ stateLabel }}
+      </span>
+      <span v-if="inTransaction" class="status-transaction">
+        事务中 · 未提交
+      </span>
+      <span v-if="running" class="status-running">
+        <span class="spinner" aria-hidden="true"></span>
+        执行中…
+      </span>
+      <span
+        v-else-if="resultSummary"
+        class="status-result"
+        :class="{ 'status-result-error': !!error }"
+        :title="error || resultSummary"
+      >
+        {{ resultSummary }}
+      </span>
     </span>
   </footer>
 </template>

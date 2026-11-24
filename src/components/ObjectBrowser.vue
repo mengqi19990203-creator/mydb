@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import Icon from "./Icon.vue";
 import ObjectCategoryGroups from "./ObjectCategoryGroups.vue";
 import { writeClipboard } from "../lib/clipboard";
@@ -17,6 +17,8 @@ const props = defineProps<{
   loading: boolean;
   activeTable: string | null;
   collapsed?: boolean;
+  locateReason?: string;
+  locateScope?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -36,6 +38,10 @@ const emit = defineEmits<{
 const search = ref("");
 const expandedDatabase = ref<string | null>(null);
 const collapsedSchemas = reactive<Record<string, boolean>>({});
+const collapseNonce = ref(0);
+const locateNonce = ref(0);
+const locateTarget = ref<string | null>(null);
+let locateTimer = 0;
 const nodeMenu = ref<{
   x: number;
   y: number;
@@ -81,6 +87,65 @@ function flashToast(message: string) {
   window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => {
     toast.value = "";
+  }, 1800);
+}
+
+function collapseAllObjects() {
+  if (props.databases.length && props.activeDatabase) {
+    expandedDatabase.value = props.activeDatabase;
+  } else {
+    expandedDatabase.value = null;
+  }
+  for (const schema of props.schemas) {
+    collapsedSchemas[schema] = schema !== props.activeSchema;
+  }
+  collapseNonce.value += 1;
+  flashToast("已折叠全部对象");
+}
+
+function locateCurrentScope() {
+  if (props.activeDatabase) {
+    expandedDatabase.value = props.activeDatabase;
+  }
+  if (isPostgres.value && props.activeSchema) {
+    delete collapsedSchemas[props.activeSchema];
+  }
+  void nextTick(() => {
+    const element = document.querySelector<HTMLElement>(
+      isPostgres.value && props.activeSchema
+        ? ".tree-schema-row.active"
+        : ".tree-database-header.active",
+    );
+    element?.scrollIntoView({ block: "nearest" });
+    element?.focus({ preventScroll: true });
+  });
+}
+
+function locateActiveObject() {
+  if (props.locateReason) {
+    flashToast(props.locateReason);
+    return;
+  }
+  if (!props.activeTable) {
+    if (props.locateScope) {
+      locateCurrentScope();
+      return;
+    }
+    flashToast("当前没有可定位的对象");
+    return;
+  }
+  if (search.value) search.value = "";
+  if (props.activeDatabase) {
+    expandedDatabase.value = props.activeDatabase;
+  }
+  if (isPostgres.value && props.activeSchema) {
+    delete collapsedSchemas[props.activeSchema];
+  }
+  locateTarget.value = props.activeTable;
+  locateNonce.value += 1;
+  window.clearTimeout(locateTimer);
+  locateTimer = window.setTimeout(() => {
+    locateTarget.value = null;
   }, 1800);
 }
 
@@ -217,6 +282,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onWindowKey);
   window.removeEventListener("resize", closeNodeMenu);
   window.clearTimeout(toastTimer);
+  window.clearTimeout(locateTimer);
 });
 
 watch(
@@ -270,6 +336,22 @@ watch(
     <header class="panel-header">
       <span>对象</span>
       <div class="panel-actions">
+        <button
+          class="icon-button"
+          title="定位当前对象"
+          aria-label="定位当前对象"
+          @click="locateActiveObject"
+        >
+          <Icon name="target" />
+        </button>
+        <button
+          class="icon-button"
+          title="全部折叠"
+          aria-label="折叠全部对象"
+          @click="collapseAllObjects"
+        >
+          <Icon name="collapse" />
+        </button>
         <button
           class="icon-button"
           title="新建表"
@@ -434,6 +516,9 @@ watch(
                       :tables="tables"
                       :search="search"
                       :active-table="activeTable"
+                      :locate-target="locateTarget"
+                      :locate-nonce="locateNonce"
+                      :collapse-nonce="collapseNonce"
                       :database="database"
                       :schema="schema"
                       @select="emit('select', $event)"
@@ -458,6 +543,9 @@ watch(
               :tables="tables"
               :search="search"
               :active-table="activeTable"
+              :locate-target="locateTarget"
+              :locate-nonce="locateNonce"
+              :collapse-nonce="collapseNonce"
               :database="database"
               @select="emit('select', $event)"
               @select-structure="emit('select-structure', $event)"
@@ -480,6 +568,9 @@ watch(
           :tables="tables"
           :search="search"
           :active-table="activeTable"
+          :locate-target="locateTarget"
+          :locate-nonce="locateNonce"
+          :collapse-nonce="collapseNonce"
           :database="activeDatabase ?? 'main'"
           @select="emit('select', $event)"
           @select-structure="emit('select-structure', $event)"

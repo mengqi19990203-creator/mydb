@@ -42,6 +42,7 @@ const emit = defineEmits<{
 }>();
 
 const resultGrid = ref<InstanceType<typeof ResultGrid> | null>(null);
+const sqlEditor = ref<InstanceType<typeof SqlEditor> | null>(null);
 const hiddenColumns = ref(0);
 const exportOpen = ref(false);
 const exportSnapshot = ref<ResultExportSnapshot | null>(null);
@@ -79,7 +80,17 @@ function handleExported(path: string, rows: number) {
   }, 3000);
 }
 
-defineExpose({ requestExport });
+defineExpose({
+  requestExport,
+  runEditorCommand: (
+    command:
+      | "search"
+      | "find-next"
+      | "find-previous"
+      | "goto-line"
+      | "toggle-comment",
+  ) => sqlEditor.value?.runCommand(command),
+});
 
 onBeforeUnmount(() => {
   window.clearTimeout(toastTimer);
@@ -145,6 +156,7 @@ async function copyError(error: string) {
         </div>
       </div>
       <SqlEditor
+        ref="sqlEditor"
         :model-value="sql"
         :tab-id="tabId"
         :driver="driver"

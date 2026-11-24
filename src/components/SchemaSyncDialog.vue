@@ -31,6 +31,7 @@ const targetTable = ref("");
 const syncAllTables = ref(true);
 const includeIndexes = ref(true);
 const includeForeignKeys = ref(true);
+const includeDrops = ref(false);
 const tablesLoading = ref(false);
 const comparing = ref(false);
 const error = ref("");
@@ -187,6 +188,7 @@ watch(
     syncAllTables.value = true;
     includeIndexes.value = true;
     includeForeignKeys.value = true;
+    includeDrops.value = false;
     diff.value = null;
     error.value = "";
     message.value = "";
@@ -226,7 +228,7 @@ watch(targetTable, () => {
 });
 
 watch(
-  [includeIndexes, includeForeignKeys],
+  [includeIndexes, includeForeignKeys, includeDrops],
   () => {
     diff.value = null;
   },
@@ -251,6 +253,7 @@ async function compare() {
       syncAllTables.value ? null : targetTable.value || null,
       includeIndexes.value,
       includeForeignKeys.value,
+      includeDrops.value,
     );
   } catch (reason) {
     diff.value = null;
@@ -497,6 +500,10 @@ async function saveSql() {
           <label class="checkbox-row">
             <input v-model="includeForeignKeys" type="checkbox" />
             包含外键
+          </label>
+          <label class="checkbox-row danger">
+            <input v-model="includeDrops" type="checkbox" />
+            包含删除语句（危险）
           </label>
           <p v-if="scopeLoading || tablesLoading" class="draft-hint">
             正在读取源 / 目标范围与表列表…

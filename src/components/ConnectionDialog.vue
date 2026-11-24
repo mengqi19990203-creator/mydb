@@ -93,6 +93,20 @@ const sshPasswordPlaceholder = computed(() =>
   props.editing?.hasSshPassword ? "已保存，留空保持不变" : "SSH 密码",
 );
 
+const devLocalCredentials =
+  import.meta.env.DEV &&
+  navigator.platform.toUpperCase().includes("MAC");
+const passwordStorageLabel = computed(() =>
+  devLocalCredentials
+    ? "保存密码到本机凭据文件（开发版，仅当前用户可读）"
+    : "保存密码到系统钥匙串",
+);
+const sshPasswordStorageLabel = computed(() =>
+  devLocalCredentials
+    ? "保存 SSH 密码到本机凭据文件（开发版）"
+    : "保存 SSH 密码到系统钥匙串",
+);
+
 watch(
   [() => props.open, () => props.editing],
   ([open, editing]) => {
@@ -171,8 +185,6 @@ watch(
         form.port = 6379;
       }
       if (!form.database.trim()) form.database = "0";
-      form.sshEnabled = false;
-      form.sslMode = "disabled";
     }
   },
 );
@@ -303,19 +315,19 @@ function validate(): boolean {
       error.value = "请输入用户名";
       return false;
     }
-    if (form.sshEnabled) {
-      if (!form.sshHost.trim()) {
-        error.value = "请输入 SSH 主机";
-        return false;
-      }
-      if (!form.sshUsername.trim()) {
-        error.value = "请输入 SSH 用户名";
-        return false;
-      }
-      if (form.sshAuth === "key" && !form.sshKeyPath.trim()) {
-        error.value = "请选择 SSH 私钥";
-        return false;
-      }
+  }
+  if (form.sshEnabled && form.driver !== "sqlite") {
+    if (!form.sshHost.trim()) {
+      error.value = "请输入 SSH 主机";
+      return false;
+    }
+    if (!form.sshUsername.trim()) {
+      error.value = "请输入 SSH 用户名";
+      return false;
+    }
+    if (form.sshAuth === "key" && !form.sshKeyPath.trim()) {
+      error.value = "请选择 SSH 私钥";
+      return false;
     }
   }
   return true;
@@ -446,17 +458,21 @@ function submit() {
                 "
               />
             </label>
-            <label v-if="form.driver === 'mysql' || form.driver === 'postgres'">
-              SSL
+            <label>
+              {{ form.driver === "redis" ? "TLS" : "SSL" }}
               <select v-model="form.sslMode">
                 <option value="disabled">禁用</option>
-                <option value="preferred">优先使用</option>
-                <option value="required">必须使用</option>
+                <option v-if="form.driver !== 'redis'" value="preferred">
+                  优先使用
+                </option>
+                <option value="required">
+                  {{ form.driver === "redis" ? "必须使用（TLS）" : "必须使用" }}
+                </option>
               </select>
             </label>
             <label class="checkbox-row span-2">
               <input v-model="form.savePassword" type="checkbox" />
-              保存密码到系统钥匙串
+              {{ passwordStorageLabel }}
             </label>
           </template>
 
@@ -484,7 +500,7 @@ function submit() {
             </div>
           </label>
 
-          <template v-if="form.driver === 'mysql' || form.driver === 'postgres'">
+          <template v-if="form.driver === 'mysql' || form.driver === 'postgres' || form.driver === 'redis'">
             <label class="checkbox-row span-2 ssh-toggle">
               <input v-model="form.sshEnabled" type="checkbox" />
               通过 SSH 隧道连接
@@ -536,7 +552,7 @@ function submit() {
                 class="checkbox-row span-2"
               >
                 <input v-model="form.saveSshPassword" type="checkbox" />
-                保存 SSH 密码到系统钥匙串
+                {{ sshPasswordStorageLabel }}
               </label>
             </template>
           </template>

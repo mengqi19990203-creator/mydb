@@ -36,7 +36,9 @@ type IconName =
   | "paste"
   | "select-all"
   | "diagram"
-  | "sync";
+  | "sync"
+  | "target"
+  | "collapse";
 
 defineProps<{
   name: IconName;
@@ -197,6 +199,15 @@ defineProps<{
       <path d="M20 4v4h-4" />
       <path d="M20 15a7 7 0 0 1-12 4l-3-3" />
       <path d="M4 20v-4h4" />
+    </template>
+    <template v-else-if="name === 'target'">
+      <circle cx="12" cy="12" r="7" />
+      <circle cx="12" cy="12" r="2.5" />
+      <path d="M12 2v3M12 19v3M2 12h3M19 12h3" />
+    </template>
+    <template v-else-if="name === 'collapse'">
+      <path d="M8 4l4 4 4-4M8 20l4-4 4 4" />
+      <path d="M4 12h16" />
     </template>
   </svg>
 </template>
