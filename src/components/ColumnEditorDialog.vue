@@ -22,6 +22,7 @@ const name = ref("");
 const type = ref("");
 const nullable = ref(true);
 const defaultValue = ref("");
+const comment = ref("");
 const executing = ref(false);
 const error = ref("");
 
@@ -105,6 +106,7 @@ const preview = computed(() => {
         type: type.value,
         nullable: nullable.value,
         defaultValue: defaultValue.value,
+        comment: comment.value,
       },
     );
     return { statements, error: "", rebuild: false };
@@ -135,6 +137,7 @@ watch(
     type.value = column?.dataType ?? defaultType.value;
     nullable.value = column?.nullable ?? true;
     defaultValue.value = column?.defaultValue ?? "";
+    comment.value = column?.comment ?? "";
     executing.value = false;
     error.value = "";
   },
@@ -229,6 +232,14 @@ async function submit() {
               type="checkbox"
             />
             可空
+          </label>
+          <label class="span-2">
+            注释
+            <input
+              v-model="comment"
+              :disabled="driver === 'sqlite'"
+              placeholder="可选；MySQL 使用 COMMENT，PostgreSQL 使用 COMMENT ON"
+            />
           </label>
           <label class="span-2">
             默认值

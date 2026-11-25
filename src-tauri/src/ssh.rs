@@ -1,6 +1,8 @@
 use crate::models::ConnectionConfig;
 use russh::client;
-use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key};
+use russh::keys::{
+    Error as KeyError, PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key,
+};
 use russh::{ChannelMsg, Disconnect};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -233,8 +235,10 @@ async fn connect_ssh(
             .await
             .map_err(|error| format!("SSH 密码认证失败: {error}"))?
     } else {
-        let key = load_secret_key(key_path, None)
-            .map_err(|error| format!("读取 SSH 私钥失败: {error}"))?;
+        let key = load_secret_key(key_path, password).map_err(|error| match error {
+            KeyError::KeyIsEncrypted => "私钥已加密，请填写 SSH 私钥口令".to_string(),
+            other => format!("读取 SSH 私钥失败（可能是私钥口令错误）: {other}"),
+        })?;
         let hash = session
             .best_supported_rsa_hash()
             .await

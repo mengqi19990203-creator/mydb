@@ -1,5 +1,5 @@
-use crate::db::{DatabaseDriver, DatabaseSession};
 use crate::db::query::is_read_query;
+use crate::db::{DatabaseDriver, DatabaseSession};
 use crate::models::{
     ColumnInfo, ColumnValue, ForeignKeyInfo, IndexInfo, QueryResult, TableInfo, TableRows,
     TableStructure,
@@ -167,13 +167,11 @@ impl DatabaseDriver for SqliteDriver {
     }
 
     async fn index_table(&self, index_name: &str) -> Result<Option<String>, String> {
-        sqlx::query_scalar(
-            "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?",
-        )
-        .bind(index_name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| format!("读取索引所属表失败: {error}"))
+        sqlx::query_scalar("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?")
+            .bind(index_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| format!("读取索引所属表失败: {error}"))
     }
 
     async fn execute(&self, sql: &str, max_rows: usize) -> Result<QueryResult, String> {
@@ -209,10 +207,7 @@ impl DatabaseDriver for SqliteDriver {
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| {
-                    format!(
-                        "第 {} 条语句执行失败（事务已回滚）: {error}",
-                        index + 1
-                    )
+                    format!("第 {} 条语句执行失败（事务已回滚）: {error}", index + 1)
                 })?;
             count += 1;
         }
@@ -247,6 +242,7 @@ impl DatabaseDriver for SqliteDriver {
                     nullable: not_null == 0,
                     primary_key: primary_key > 0,
                     default_value,
+                    comment: None,
                 }
             })
             .collect())
@@ -321,9 +317,9 @@ impl DatabaseDriver for SqliteDriver {
             .await
             .map_err(|error| format!("读取表定义失败: {error}"))?
             .flatten();
-            let ddl = ddl.filter(|value| !value.trim().is_empty()).ok_or_else(|| {
-                format!("没有可用的表定义，无法重建表: {table}")
-            })?;
+            let ddl = ddl
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| format!("没有可用的表定义，无法重建表: {table}"))?;
 
             let columns = sqlite_column_names(&mut *connection, table).await?;
             if columns.is_empty() {
@@ -339,13 +335,7 @@ impl DatabaseDriver for SqliteDriver {
             .await
             .map_err(|error| format!("读取索引 / 触发器失败: {error}"))?;
 
-            let rewritten = rewrite_sqlite_column(
-                &ddl,
-                name,
-                data_type,
-                nullable,
-                default_value,
-            )?;
+            let rewritten = rewrite_sqlite_column(&ddl, name, data_type, nullable, default_value)?;
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -503,6 +493,332 @@ impl DatabaseDriver for SqliteDriver {
         Ok(count)
     }
 
+    async fn dump_index_statements(&self, table: &str) -> Result<Vec<String>, String> {
+        let rows = sqlx::query(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL \
+             ORDER BY name",
+        )
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("读取索引定义失败: {error}"))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<Option<String>, _>(0).ok().flatten())
+            .map(|sql| {
+                let trimmed = sql.trim().trim_end_matches(';').to_string();
+                format!("{trimmed};")
+            })
+            .collect())
+    }
+
+    fn dump_indexes_separately(&self) -> bool {
+        true
+    }
+
+    async fn dump_insert_plan(&self, table: &str) -> Result<(Vec<String>, String), String> {
+        Ok((
+            self.list_columns(table)
+                .await?
+                .into_iter()
+                .map(|column| column.name)
+                .collect(),
+            String::new(),
+        ))
+    }
+
+    async fn stream_sql_literal_rows(
+        &self,
+        table: &str,
+        columns: &[String],
+        sink: &mut (dyn FnMut(Vec<Option<String>>) -> Result<(), String> + Send),
+    ) -> Result<u64, String> {
+        if columns.is_empty() {
+            return Ok(0);
+        }
+        let expressions = columns
+            .iter()
+            .map(|column| format!("quote({})", quote_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {expressions} FROM {}", quote_identifier(table));
+        let mut stream = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&self.pool);
+        let mut count = 0u64;
+        while let Some(row) = stream
+            .try_next()
+            .await
+            .map_err(|error| format!("读取表数据失败: {error}"))?
+        {
+            let values = (0..columns.len())
+                .map(|index| {
+                    row.try_get::<Option<String>, _>(index)
+                        .ok()
+                        .flatten()
+                        .or_else(|| Some("NULL".to_string()))
+                })
+                .collect::<Vec<_>>();
+            sink(values)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn dump_object_drop(&self, kind: &str, name: &str) -> Result<String, String> {
+        let keyword = match kind {
+            "table" => "TABLE",
+            "view" => "VIEW",
+            "trigger" => "TRIGGER",
+            "index" => "INDEX",
+            _ => return Err(format!("SQLite 不支持删除该对象类型: {kind}")),
+        };
+        Ok(format!(
+            "DROP {keyword} IF EXISTS {};",
+            quote_identifier(name)
+        ))
+    }
+
+    async fn read_rows_sorted(
+        &self,
+        table: &str,
+        limit: u64,
+        offset: u64,
+        filter: Option<&str>,
+        sorts: &[crate::models::TableSort],
+    ) -> Result<TableRows, String> {
+        let columns = self.list_columns(table).await?;
+        let identifier = quote_identifier(table);
+        let filter = filter.map(str::trim).filter(|value| !value.is_empty());
+        if filter.is_some_and(|value| value.contains(';')) {
+            return Err("WHERE 条件不能包含分号".to_string());
+        }
+        let where_clause = filter
+            .map(|value| format!(" WHERE {value}"))
+            .unwrap_or_default();
+
+        let count_sql = format!("SELECT COUNT(*) FROM {identifier}{where_clause}");
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| format!("读取总行数失败: {error}"))?;
+
+        let mut order_columns: Vec<(String, String)> = Vec::new();
+        for sort in sorts {
+            if !columns.iter().any(|column| column.name == sort.column) {
+                return Err(format!("排序字段不存在: {}", sort.column));
+            }
+            if order_columns
+                .iter()
+                .any(|(column, _)| column == &sort.column)
+            {
+                continue;
+            }
+            order_columns.push((
+                sort.column.clone(),
+                if sort.direction.eq_ignore_ascii_case("desc") {
+                    "DESC".to_string()
+                } else {
+                    "ASC".to_string()
+                },
+            ));
+        }
+        if !order_columns.is_empty() {
+            for column in columns.iter().filter(|column| column.primary_key) {
+                if !order_columns.iter().any(|(name, _)| name == &column.name) {
+                    order_columns.push((column.name.clone(), "ASC".to_string()));
+                }
+            }
+        }
+        let order_clause = if order_columns.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ORDER BY {}",
+                order_columns
+                    .iter()
+                    .map(|(column, direction)| {
+                        format!("{} {direction}", quote_identifier(column))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+
+        let sql =
+            format!("SELECT * FROM {identifier}{where_clause}{order_clause} LIMIT ? OFFSET ?");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| format!("读取表数据失败: {error}"))?;
+        let values = rows
+            .iter()
+            .map(|row| {
+                (0..row.len())
+                    .map(|index| value_to_json(row, index))
+                    .collect()
+            })
+            .collect();
+        Ok(TableRows {
+            columns,
+            rows: values,
+            total: total.max(0) as u64,
+            offset,
+            limit,
+        })
+    }
+
+    async fn apply_table_changes(
+        &self,
+        table: &str,
+        changes: &[crate::models::PendingTableChange],
+    ) -> Result<usize, String> {
+        let table_ref = quote_identifier(table);
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| format!("开启批量事务失败: {error}"))?;
+        let mut applied = 0usize;
+        for (index, change) in changes.iter().enumerate() {
+            let label = format!("第 {} 项（{}）", index + 1, change.kind);
+            let result: Result<u64, String> = match change.kind.as_str() {
+                "delete" => {
+                    if change.keys.is_empty() {
+                        Err("删除缺少主键条件".to_string())
+                    } else {
+                        let key_clause = change
+                            .keys
+                            .iter()
+                            .map(|key| {
+                                if key.value.is_null() {
+                                    format!("{} IS NULL", quote_identifier(&key.column))
+                                } else {
+                                    format!("{} = ?", quote_identifier(&key.column))
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        let where_clause = if change.single_row {
+                            format!(
+                                "rowid = (SELECT rowid FROM {table_ref} WHERE {key_clause} LIMIT 1)"
+                            )
+                        } else {
+                            key_clause
+                        };
+                        let sql = format!("DELETE FROM {table_ref} WHERE {where_clause}");
+                        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+                        for key in &change.keys {
+                            if !key.value.is_null() {
+                                query = bind_json_sqlite(query, &key.value);
+                            }
+                        }
+                        query
+                            .execute(&mut *transaction)
+                            .await
+                            .map(|result| result.rows_affected())
+                            .map_err(|error| format!("删除失败: {error}"))
+                    }
+                }
+                "update" => {
+                    if change.keys.is_empty() {
+                        Err("更新缺少主键条件".to_string())
+                    } else if change.changes.is_empty() {
+                        Err("更新没有字段变更".to_string())
+                    } else {
+                        let set_clause = change
+                            .changes
+                            .iter()
+                            .map(|item| format!("{} = ?", quote_identifier(&item.column)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let key_clause = change
+                            .keys
+                            .iter()
+                            .map(|key| {
+                                if key.value.is_null() {
+                                    format!("{} IS NULL", quote_identifier(&key.column))
+                                } else {
+                                    format!("{} = ?", quote_identifier(&key.column))
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        let where_clause = if change.single_row {
+                            format!(
+                                "rowid = (SELECT rowid FROM {table_ref} WHERE {key_clause} LIMIT 1)"
+                            )
+                        } else {
+                            key_clause
+                        };
+                        let sql =
+                            format!("UPDATE {table_ref} SET {set_clause} WHERE {where_clause}");
+                        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+                        for item in &change.changes {
+                            query = bind_json_sqlite(query, &item.value);
+                        }
+                        for key in &change.keys {
+                            if !key.value.is_null() {
+                                query = bind_json_sqlite(query, &key.value);
+                            }
+                        }
+                        query
+                            .execute(&mut *transaction)
+                            .await
+                            .map(|result| result.rows_affected())
+                            .map_err(|error| format!("更新失败: {error}"))
+                    }
+                }
+                "insert" => {
+                    let sql = if change.values.is_empty() {
+                        format!("INSERT INTO {table_ref} DEFAULT VALUES")
+                    } else {
+                        let fields = change
+                            .values
+                            .iter()
+                            .map(|item| quote_identifier(&item.column))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let placeholders = vec!["?"; change.values.len()].join(", ");
+                        format!("INSERT INTO {table_ref} ({fields}) VALUES ({placeholders})")
+                    };
+                    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+                    for item in &change.values {
+                        query = bind_json_sqlite(query, &item.value);
+                    }
+                    query
+                        .execute(&mut *transaction)
+                        .await
+                        .map(|result| result.rows_affected())
+                        .map_err(|error| format!("新增失败: {error}"))
+                }
+                other => Err(format!("未知变更类型: {other}")),
+            };
+            match result {
+                Ok(rows) => {
+                    let needs_one = matches!(change.kind.as_str(), "delete" | "update");
+                    if needs_one && rows != 1 {
+                        let _ = transaction.rollback().await;
+                        return Err(format!(
+                            "{label} 目标行已不存在或已变化（影响 {rows} 行），已回滚"
+                        ));
+                    }
+                    applied += 1;
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(format!("{label} {error}，已回滚"));
+                }
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| format!("提交批量事务失败: {error}"))?;
+        Ok(applied)
+    }
+
     async fn update_row(
         &self,
         table: &str,
@@ -535,15 +851,11 @@ impl DatabaseDriver for SqliteDriver {
             .join(" AND ");
         let table_ref = quote_identifier(table);
         let where_clause = if single_row {
-            format!(
-                "rowid = (SELECT rowid FROM {table_ref} WHERE {key_clause} LIMIT 1)"
-            )
+            format!("rowid = (SELECT rowid FROM {table_ref} WHERE {key_clause} LIMIT 1)")
         } else {
             key_clause
         };
-        let sql = format!(
-            "UPDATE {table_ref} SET {set_clause} WHERE {where_clause}"
-        );
+        let sql = format!("UPDATE {table_ref} SET {set_clause} WHERE {where_clause}");
 
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for change in changes {
@@ -613,9 +925,7 @@ impl DatabaseDriver for SqliteDriver {
             .join(" AND ");
         let table_ref = quote_identifier(table);
         let where_clause = if single_row {
-            format!(
-                "rowid = (SELECT rowid FROM {table_ref} WHERE {key_clause} LIMIT 1)"
-            )
+            format!("rowid = (SELECT rowid FROM {table_ref} WHERE {key_clause} LIMIT 1)")
         } else {
             key_clause
         };
@@ -654,6 +964,30 @@ impl DatabaseDriver for SqliteDriver {
 
         ddl.filter(|value| !value.trim().is_empty())
             .ok_or_else(|| format!("没有可用的 DDL: {name}"))
+    }
+
+    async fn save_object_definition(
+        &self,
+        kind: &str,
+        name: &str,
+        definition: &str,
+    ) -> Result<(), String> {
+        if !matches!(kind, "view" | "trigger") {
+            return Err("SQLite 仅支持在应用内修改视图和触发器".to_string());
+        }
+        let _ = self.object_ddl(kind, name).await?;
+        let drop = format!(
+            "DROP {} {}",
+            if kind == "view" { "VIEW" } else { "TRIGGER" },
+            quote_identifier(name)
+        );
+        let create = definition.trim().trim_end_matches(';').trim();
+        if create.is_empty() {
+            return Err("对象定义不能为空".to_string());
+        }
+        self.execute_transaction(&[drop, create.to_string()])
+            .await
+            .map(|_| ())
     }
 
     async fn duplicate_table(&self, source: &str, target: &str) -> Result<(), String> {
@@ -744,12 +1078,7 @@ impl DatabaseDriver for SqliteDriver {
         Ok(())
     }
 
-    async fn rename_object(
-        &self,
-        kind: &str,
-        name: &str,
-        new_name: &str,
-    ) -> Result<(), String> {
+    async fn rename_object(&self, kind: &str, name: &str, new_name: &str) -> Result<(), String> {
         if kind != "table" {
             return Err("SQLite 仅支持重命名表".to_string());
         }
@@ -873,9 +1202,7 @@ fn read_sqlite_word(text: &str, start: usize) -> Option<(String, usize)> {
     }
     let begin = index;
     while index < bytes.len()
-        && (bytes[index].is_ascii_alphanumeric()
-            || bytes[index] == b'_'
-            || bytes[index] == b'$')
+        && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' || bytes[index] == b'$')
     {
         index += 1;
     }
@@ -896,9 +1223,7 @@ fn read_sqlite_identifier(text: &str, start: usize) -> Option<(String, usize)> {
     }
     let begin = index;
     while index < bytes.len()
-        && (bytes[index].is_ascii_alphanumeric()
-            || bytes[index] == b'_'
-            || bytes[index] == b'$')
+        && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' || bytes[index] == b'$')
     {
         index += 1;
     }
@@ -1072,8 +1397,8 @@ fn rewrite_sqlite_column(
     nullable: bool,
     default_value: Option<&str>,
 ) -> Result<String, String> {
-    let (open, close) = sqlite_table_body(ddl)
-        .ok_or_else(|| "无法解析表定义中的字段列表".to_string())?;
+    let (open, close) =
+        sqlite_table_body(ddl).ok_or_else(|| "无法解析表定义中的字段列表".to_string())?;
     let ranges = split_sqlite_definitions(ddl, open + 1, close)?;
     for (start, end) in ranges {
         let definition = &ddl[start..end];
@@ -1311,10 +1636,7 @@ mod tests {
             .await
             .expect("create table");
         driver
-            .execute(
-                "CREATE VIEW author_names AS SELECT name FROM authors",
-                1000,
-            )
+            .execute("CREATE VIEW author_names AS SELECT name FROM authors", 1000)
             .await
             .expect("create view");
 
@@ -1445,7 +1767,10 @@ mod tests {
             .expect("create index");
 
         assert_eq!(
-            driver.index_table("idx_items_name").await.expect("index table"),
+            driver
+                .index_table("idx_items_name")
+                .await
+                .expect("index table"),
             Some("items".to_string())
         );
         assert_eq!(
@@ -1660,7 +1985,10 @@ mod tests {
     async fn reads_renames_and_drops_objects() {
         let (_dir, driver) = test_driver().await;
         driver
-            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)", 1000)
+            .execute(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)",
+                1000,
+            )
             .await
             .expect("create table");
         driver
@@ -1679,26 +2007,34 @@ mod tests {
             .await
             .expect("create trigger");
 
-        assert!(driver
-            .object_ddl("table", "items")
-            .await
-            .expect("table ddl")
-            .contains("CREATE TABLE"));
-        assert!(driver
-            .object_ddl("view", "item_names")
-            .await
-            .expect("view ddl")
-            .contains("CREATE VIEW"));
-        assert!(driver
-            .object_ddl("index", "idx_items_name")
-            .await
-            .expect("index ddl")
-            .contains("CREATE INDEX"));
-        assert!(driver
-            .object_ddl("trigger", "trg_items")
-            .await
-            .expect("trigger ddl")
-            .contains("CREATE TRIGGER"));
+        assert!(
+            driver
+                .object_ddl("table", "items")
+                .await
+                .expect("table ddl")
+                .contains("CREATE TABLE")
+        );
+        assert!(
+            driver
+                .object_ddl("view", "item_names")
+                .await
+                .expect("view ddl")
+                .contains("CREATE VIEW")
+        );
+        assert!(
+            driver
+                .object_ddl("index", "idx_items_name")
+                .await
+                .expect("index ddl")
+                .contains("CREATE INDEX")
+        );
+        assert!(
+            driver
+                .object_ddl("trigger", "trg_items")
+                .await
+                .expect("trigger ddl")
+                .contains("CREATE TRIGGER")
+        );
 
         driver
             .rename_object("table", "items", "items2")
@@ -1708,7 +2044,12 @@ mod tests {
         assert!(objects.iter().any(|item| item.name == "items2"));
         assert!(!objects.iter().any(|item| item.name == "items"));
 
-        assert!(driver.rename_object("view", "item_names", "x").await.is_err());
+        assert!(
+            driver
+                .rename_object("view", "item_names", "x")
+                .await
+                .is_err()
+        );
 
         driver
             .drop_object("view", "item_names")
@@ -1797,10 +2138,12 @@ mod tests {
             .table_structure("items_copy")
             .await
             .expect("copied structure");
-        assert!(copied_structure
-            .indexes
-            .iter()
-            .any(|index| index.name == "items_copy_idx_items_name"));
+        assert!(
+            copied_structure
+                .indexes
+                .iter()
+                .any(|index| index.name == "items_copy_idx_items_name")
+        );
 
         driver
             .duplicate_view("item_names", "item_names_copy")
@@ -1885,10 +2228,12 @@ mod tests {
             .iter()
             .find(|table| table.name == "orders")
             .expect("orders node");
-        assert!(orders
-            .columns
-            .iter()
-            .any(|column| column.name == "id" && column.primary_key));
+        assert!(
+            orders
+                .columns
+                .iter()
+                .any(|column| column.name == "id" && column.primary_key)
+        );
         assert_eq!(
             orders
                 .columns
@@ -1905,10 +2250,7 @@ mod tests {
             .find(|table| table.name == "order_totals")
             .expect("view node");
         assert_eq!(view.kind, "view");
-        assert!(view
-            .columns
-            .iter()
-            .any(|column| column.name == "user_id"));
+        assert!(view.columns.iter().any(|column| column.name == "user_id"));
     }
 
     #[tokio::test]
@@ -1953,10 +2295,7 @@ mod tests {
     async fn updates_and_deletes_one_duplicate_row_without_primary_key() {
         let (_dir, driver) = test_driver().await;
         driver
-            .execute(
-                "CREATE TABLE notes (message TEXT, tag TEXT)",
-                1000,
-            )
+            .execute("CREATE TABLE notes (message TEXT, tag TEXT)", 1000)
             .await
             .expect("create table");
         driver
@@ -1997,10 +2336,7 @@ mod tests {
             .expect("rows");
         assert_eq!(rows.rows.len(), 2);
         assert_eq!(
-            rows.rows
-                .iter()
-                .filter(|row| row[1] == json!("y"))
-                .count(),
+            rows.rows.iter().filter(|row| row[1] == json!("y")).count(),
             1
         );
 
@@ -2070,6 +2406,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dumps_sql_literals_with_binary_and_quotes() {
+        let (_dir, driver) = test_driver().await;
+        driver
+            .execute(
+                "CREATE TABLE dump_items (\
+                   id INTEGER PRIMARY KEY, \
+                   name TEXT, \
+                   note TEXT, \
+                   payload BLOB\
+                 )",
+                1000,
+            )
+            .await
+            .expect("create table");
+        driver
+            .execute(
+                "INSERT INTO dump_items (id, name, note, payload) \
+                 VALUES (1, 'O''Brien', NULL, X'00FF10')",
+                1000,
+            )
+            .await
+            .expect("insert");
+        driver
+            .execute("CREATE INDEX idx_dump_items_name ON dump_items(name)", 1000)
+            .await
+            .expect("create index");
+
+        let (columns, clause) = driver.dump_insert_plan("dump_items").await.expect("plan");
+        assert_eq!(columns, vec!["id", "name", "note", "payload"]);
+        assert!(clause.is_empty());
+
+        let mut rows = Vec::new();
+        let count = driver
+            .stream_sql_literal_rows("dump_items", &columns, &mut |values| {
+                rows.push(values);
+                Ok(())
+            })
+            .await
+            .expect("dump rows");
+        assert_eq!(count, 1);
+        let values = rows[0]
+            .iter()
+            .map(|value| value.as_deref().unwrap_or("NULL"))
+            .collect::<Vec<_>>();
+        assert_eq!(values[0], "1");
+        assert_eq!(values[1], "'O''Brien'");
+        assert_eq!(values[2], "NULL");
+        assert_eq!(values[3], "X'00FF10'");
+
+        let ddl = driver.dump_table_ddl("dump_items").await.expect("ddl");
+        assert!(ddl.contains("CREATE TABLE dump_items"));
+        let indexes = driver
+            .dump_index_statements("dump_items")
+            .await
+            .expect("indexes");
+        assert_eq!(indexes.len(), 1);
+        assert!(indexes[0].contains("idx_dump_items_name"));
+        assert!(driver.dump_indexes_separately());
+        assert!(!driver.dump_foreign_keys_separately());
+
+        let target_dir = tempfile::tempdir().expect("target dir");
+        let target_file = target_dir.path().join("target.db");
+        let target = SqliteDriver::connect(target_file.to_str().expect("path"))
+            .await
+            .expect("target connect");
+        target
+            .execute(&ddl, 1000)
+            .await
+            .expect("create target table");
+        target
+            .execute(
+                &format!(
+                    "INSERT INTO dump_items ({}) VALUES ({})",
+                    columns
+                        .iter()
+                        .map(|column| quote_identifier(column))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    values.join(", ")
+                ),
+                1000,
+            )
+            .await
+            .expect("insert literals");
+        let check = target
+            .execute(
+                "SELECT name, note IS NULL, hex(payload) FROM dump_items",
+                10,
+            )
+            .await
+            .expect("check target");
+        assert_eq!(check.rows[0][0], json!("O'Brien"));
+        assert_eq!(check.rows[0][1], json!(1));
+        assert_eq!(check.rows[0][2], json!("00FF10"));
+        target
+            .execute(&indexes[0], 1000)
+            .await
+            .expect("create target index");
+    }
+
+    #[tokio::test]
+    async fn applies_batch_changes_atomically_and_sorts_multiple_columns() {
+        let (_dir, driver) = test_driver().await;
+        driver
+            .execute(
+                "CREATE TABLE items (\
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                   name TEXT, \
+                   status TEXT\
+                 )",
+                1000,
+            )
+            .await
+            .expect("create table");
+        driver
+            .execute(
+                "INSERT INTO items (name, status) VALUES \
+                 ('a', 'active'), ('b', 'active'), ('c', 'paused')",
+                1000,
+            )
+            .await
+            .expect("insert");
+
+        let changes = vec![
+            crate::models::PendingTableChange {
+                kind: "delete".to_string(),
+                keys: vec![ColumnValue {
+                    column: "id".to_string(),
+                    value: json!(3),
+                }],
+                changes: Vec::new(),
+                values: Vec::new(),
+                single_row: false,
+            },
+            crate::models::PendingTableChange {
+                kind: "update".to_string(),
+                keys: vec![ColumnValue {
+                    column: "id".to_string(),
+                    value: json!(1),
+                }],
+                changes: vec![ColumnValue {
+                    column: "name".to_string(),
+                    value: json!("aa"),
+                }],
+                values: Vec::new(),
+                single_row: false,
+            },
+            crate::models::PendingTableChange {
+                kind: "insert".to_string(),
+                keys: Vec::new(),
+                changes: Vec::new(),
+                values: vec![
+                    ColumnValue {
+                        column: "name".to_string(),
+                        value: json!("d"),
+                    },
+                    ColumnValue {
+                        column: "status".to_string(),
+                        value: json!("active"),
+                    },
+                ],
+                single_row: false,
+            },
+        ];
+        let applied = driver
+            .apply_table_changes("items", &changes)
+            .await
+            .expect("apply");
+        assert_eq!(applied, 3);
+        let rows = driver
+            .read_rows("items", 10, 0, None, None, None)
+            .await
+            .expect("rows");
+        assert_eq!(rows.rows.len(), 3);
+
+        let failing = vec![
+            crate::models::PendingTableChange {
+                kind: "delete".to_string(),
+                keys: vec![ColumnValue {
+                    column: "id".to_string(),
+                    value: json!(2),
+                }],
+                changes: Vec::new(),
+                values: Vec::new(),
+                single_row: false,
+            },
+            crate::models::PendingTableChange {
+                kind: "update".to_string(),
+                keys: vec![ColumnValue {
+                    column: "id".to_string(),
+                    value: json!(999),
+                }],
+                changes: vec![ColumnValue {
+                    column: "name".to_string(),
+                    value: json!("missing"),
+                }],
+                values: Vec::new(),
+                single_row: false,
+            },
+        ];
+        let error = driver
+            .apply_table_changes("items", &failing)
+            .await
+            .expect_err("missing row must fail");
+        assert!(error.contains("目标行已不存在"));
+        let rows = driver
+            .read_rows("items", 10, 0, None, None, None)
+            .await
+            .expect("rows after rollback");
+        assert_eq!(rows.rows.len(), 3, "delete must be rolled back");
+
+        let sorts = vec![crate::models::TableSort {
+            column: "status".to_string(),
+            direction: "desc".to_string(),
+        }];
+        let sorted = driver
+            .read_rows_sorted("items", 10, 0, None, &sorts)
+            .await
+            .expect("sorted rows");
+        assert_eq!(sorted.rows.len(), 3);
+        assert!(sorted.rows.iter().all(|row| row[2] == json!("active")));
+        let first_id = sorted.rows[0][0].as_i64().expect("id");
+        let second_id = sorted.rows[1][0].as_i64().expect("id");
+        let third_id = sorted.rows[2][0].as_i64().expect("id");
+        assert!(
+            first_id < second_id && second_id < third_id,
+            "primary key tiebreaker must apply"
+        );
+    }
+
+    #[tokio::test]
     async fn rebuilds_column_and_preserves_indexes_triggers_and_data() {
         let (_dir, driver) = test_driver().await;
         driver
@@ -2117,7 +2684,12 @@ mod tests {
         assert_eq!(quantity.data_type, "INTEGER");
         assert!(!quantity.nullable);
         assert_eq!(quantity.default_value.as_deref(), Some("0"));
-        assert!(structure.indexes.iter().any(|index| index.name == "idx_items_name"));
+        assert!(
+            structure
+                .indexes
+                .iter()
+                .any(|index| index.name == "idx_items_name")
+        );
 
         let rows = driver
             .read_rows("items", 10, 0, None, Some("id"), Some("asc"))
@@ -2181,6 +2753,79 @@ mod tests {
             .expect("rows");
         assert_eq!(rows.rows.len(), 1);
         assert_eq!(rows.rows[0][1], json!(null));
+    }
+
+    #[tokio::test]
+    async fn saves_view_and_trigger_definitions_in_a_transaction() {
+        let (_dir, driver) = test_driver().await;
+        driver
+            .execute(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)",
+                1000,
+            )
+            .await
+            .expect("create table");
+        driver
+            .execute("CREATE VIEW item_names AS SELECT name FROM items", 1000)
+            .await
+            .expect("create view");
+        driver
+            .execute(
+                "CREATE TRIGGER trg_items AFTER INSERT ON items BEGIN SELECT 1; END",
+                1000,
+            )
+            .await
+            .expect("create trigger");
+
+        driver
+            .save_object_definition(
+                "view",
+                "item_names",
+                "CREATE VIEW item_names AS SELECT name FROM items WHERE name IS NOT NULL",
+            )
+            .await
+            .expect("save view");
+        let view = driver
+            .object_ddl("view", "item_names")
+            .await
+            .expect("view ddl");
+        assert!(view.contains("WHERE name IS NOT NULL"));
+
+        driver
+            .save_object_definition(
+                "trigger",
+                "trg_items",
+                "CREATE TRIGGER trg_items AFTER INSERT ON items BEGIN SELECT 2; END",
+            )
+            .await
+            .expect("save trigger");
+        let trigger = driver
+            .object_ddl("trigger", "trg_items")
+            .await
+            .expect("trigger ddl");
+        assert!(trigger.contains("SELECT 2"));
+
+        let previous = driver
+            .object_ddl("view", "item_names")
+            .await
+            .expect("previous view");
+        assert!(
+            driver
+                .save_object_definition(
+                    "view",
+                    "item_names",
+                    "CREATE VIEW item_names AS SELEC broken",
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            driver
+                .object_ddl("view", "item_names")
+                .await
+                .expect("view survives failed save"),
+            previous
+        );
     }
 }
 

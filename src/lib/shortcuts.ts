@@ -36,6 +36,7 @@ export const SHORTCUT_SCOPE_LABELS: Record<ShortcutScope, string> = {
 
 export const SHORTCUTS: ShortcutEntry[] = [
   { scope: "global", action: "新建连接", keys: "Mod+N" },
+  { scope: "global", action: "设置", keys: "Mod+," },
   { scope: "global", action: "新建查询", keys: "Mod+T" },
   { scope: "global", action: "打开 SQL 文件", keys: "Mod+O" },
   { scope: "global", action: "保存 SQL", keys: "Mod+S" },
@@ -44,6 +45,18 @@ export const SHORTCUTS: ShortcutEntry[] = [
   { scope: "global", action: "关闭标签", keys: "Mod+W" },
   { scope: "global", action: "关闭窗口", keys: "Shift+Mod+W" },
   { scope: "global", action: "刷新对象", keys: "Mod+R" },
+  {
+    scope: "global",
+    action: "停止查询",
+    keys: "Mod+.",
+    context: "当前查询执行中",
+  },
+  {
+    scope: "global",
+    action: "SQL 片段库",
+    keys: "Shift+Mod+K",
+    context: "查询标签",
+  },
   { scope: "global", action: "执行历史", keys: "Mod+Y" },
   { scope: "global", action: "撤销", keys: "Mod+Z" },
   { scope: "global", action: "重做", keys: "Shift+Mod+Z" },
@@ -93,6 +106,12 @@ export const SHORTCUTS: ShortcutEntry[] = [
     action: "运行查询或选中 SQL",
     keys: "Mod+Enter",
     context: "编辑器聚焦时",
+  },
+  {
+    scope: "editor",
+    action: "格式化 SQL",
+    keys: "Shift+Mod+F",
+    context: "只格式化选区或光标所在语句",
   },
   {
     scope: "editor",

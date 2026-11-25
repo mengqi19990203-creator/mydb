@@ -3,6 +3,7 @@ pub mod mysql;
 pub mod postgres;
 pub mod query;
 pub mod sql_guard;
+pub mod sql_script;
 pub mod sqlite;
 
 pub use driver::DatabaseDriver;

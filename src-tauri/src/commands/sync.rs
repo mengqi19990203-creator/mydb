@@ -1,11 +1,18 @@
-use super::{AppState, context_label, resolve_source, resolve_target};
+use super::{
+    AppState, context_label, ensure_writable, isolated_driver_for, resolve_source, resolve_target,
+};
 use crate::db::DatabaseDriver;
 use crate::db::driver::rename_ddl_object;
-use crate::models::{ColumnInfo, ForeignKeyInfo, IndexInfo};
+use crate::models::{
+    ColumnInfo, ForeignKeyInfo, IndexInfo, SchemaApplyProgress, SchemaApplyResult,
+};
 use crate::storage;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use tauri::{AppHandle, State};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+use tauri::{AppHandle, Emitter, State};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -208,12 +215,9 @@ pub async fn compare_schemas(
             .ok_or_else(|| "源表不存在".to_string())?;
         let target_table_name = target_table.as_deref().unwrap_or(&source_diff.name);
         let table_diff = match target.tables.first() {
-            Some(target_diff) => compare_table(
-                source_diff,
-                target_diff,
-                &source_config.driver,
-                options,
-            ),
+            Some(target_diff) => {
+                compare_table(source_diff, target_diff, &source_config.driver, options)
+            }
             None => only_source_table(
                 source_diff,
                 &source_config.driver,
@@ -230,6 +234,181 @@ pub async fn compare_schemas(
     }
 
     Ok(diff_snapshots(&source, &target, options))
+}
+
+#[tauri::command]
+pub async fn apply_schema_sync(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    target_connection_id: String,
+    target_database: Option<String>,
+    target_schema: Option<String>,
+    statements: Vec<String>,
+    operation_id: Option<String>,
+) -> Result<SchemaApplyResult, String> {
+    ensure_writable(&app, &target_connection_id)?;
+    let statements: Vec<String> = statements
+        .into_iter()
+        .map(|statement| statement.trim().to_string())
+        .filter(|statement| !statement.is_empty())
+        .collect();
+    if statements.is_empty() {
+        return Err("没有可应用的语句".to_string());
+    }
+    let config = storage::load_connections(&app)?
+        .into_iter()
+        .find(|item| item.id == target_connection_id)
+        .ok_or_else(|| "目标连接不存在".to_string())?;
+    let has_database = target_database
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_schema = target_schema
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let driver = if has_database || has_schema {
+        isolated_driver_for(
+            &app,
+            &state,
+            &target_connection_id,
+            target_database.as_deref(),
+            target_schema.as_deref(),
+        )
+        .await?
+    } else {
+        super::driver_for(&app, &state, &target_connection_id).await?
+    };
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    if let Some(id) = &operation_id {
+        state
+            .export_cancels
+            .lock()
+            .await
+            .insert(id.clone(), cancel.clone());
+    }
+    let started = Instant::now();
+    let total = statements.len();
+    let mut applied = 0usize;
+    let mut failed_at = None;
+    let mut error = None;
+    let mut cancelled = false;
+    let mut rolled_back = false;
+
+    let emit = |index: usize, statement: &str, status: &str, error: Option<String>| {
+        let preview: String = statement
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect();
+        let _ = app.emit(
+            "schema-sync:progress",
+            SchemaApplyProgress {
+                operation_id: operation_id.clone(),
+                index,
+                total,
+                preview,
+                status: status.to_string(),
+                error,
+            },
+        );
+    };
+
+    if config.driver == "mysql" {
+        for (index, statement) in statements.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                cancelled = true;
+                break;
+            }
+            emit(index + 1, statement, "running", None);
+            match driver.execute(statement, 1).await {
+                Ok(_) => {
+                    applied += 1;
+                    emit(index + 1, statement, "success", None);
+                }
+                Err(message) => {
+                    failed_at = Some(index + 1);
+                    error = Some(format!(
+                        "第 {} 条执行失败（MySQL DDL 无法自动回滚）：{}",
+                        index + 1,
+                        message
+                    ));
+                    emit(index + 1, statement, "failed", Some(message));
+                    break;
+                }
+            }
+        }
+    } else {
+        let mut session = driver.open_session().await?;
+        let begin = session.begin().await;
+        if let Err(message) = begin {
+            if let Some(id) = &operation_id {
+                state.export_cancels.lock().await.remove(id);
+            }
+            return Err(format!("开启目标事务失败: {message}"));
+        }
+        for (index, statement) in statements.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                cancelled = true;
+                break;
+            }
+            emit(index + 1, statement, "running", None);
+            match session.execute(statement, 1).await {
+                Ok(_) => {
+                    applied += 1;
+                    emit(index + 1, statement, "success", None);
+                }
+                Err(message) => {
+                    failed_at = Some(index + 1);
+                    error = Some(message.clone());
+                    emit(index + 1, statement, "failed", Some(message));
+                    break;
+                }
+            }
+        }
+        let need_rollback = cancelled || failed_at.is_some();
+        if need_rollback {
+            match session.rollback().await {
+                Ok(()) => rolled_back = true,
+                Err(message) => {
+                    error = Some(match error {
+                        Some(existing) => format!("{existing}；回滚失败：{message}"),
+                        None => format!("回滚失败：{message}"),
+                    });
+                }
+            }
+        } else if let Err(message) = session.commit().await {
+            if let Some(id) = &operation_id {
+                state.export_cancels.lock().await.remove(id);
+            }
+            return Err(format!("提交目标事务失败: {message}"));
+        }
+    }
+
+    if let Some(id) = &operation_id {
+        state.export_cancels.lock().await.remove(id);
+    }
+    Ok(SchemaApplyResult {
+        applied,
+        total,
+        failed_at,
+        error,
+        rolled_back,
+        cancelled,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+#[tauri::command]
+pub async fn cancel_schema_sync(
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> Result<(), String> {
+    if let Some(flag) = state.export_cancels.lock().await.get(&operation_id) {
+        flag.store(true, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 async fn snapshot(
@@ -340,9 +519,7 @@ pub(crate) fn diff_snapshots(
             (Some(src), None) => {
                 tables.push(only_source_table(src, &target.driver, options, None));
             }
-            (None, Some(dst)) => {
-                tables.push(only_target_table(dst, &target.driver, options))
-            }
+            (None, Some(dst)) => tables.push(only_target_table(dst, &target.driver, options)),
             (None, None) => {}
         }
     }
@@ -533,16 +710,28 @@ fn compare_table(
     }
 
     if options.include_indexes {
-        let (added, extra, changed) =
-            compare_indexes(source, target, driver, &mut sql, &mut warnings, options.include_drops);
+        let (added, extra, changed) = compare_indexes(
+            source,
+            target,
+            driver,
+            &mut sql,
+            &mut warnings,
+            options.include_drops,
+        );
         added_indexes = added;
         extra_indexes = extra;
         changed_indexes = changed;
     }
 
     if options.include_foreign_keys {
-        let (added, extra, changed) =
-            compare_foreign_keys(source, target, driver, &mut sql, &mut warnings, options.include_drops);
+        let (added, extra, changed) = compare_foreign_keys(
+            source,
+            target,
+            driver,
+            &mut sql,
+            &mut warnings,
+            options.include_drops,
+        );
         added_foreign_keys = added;
         extra_foreign_keys = extra;
         changed_foreign_keys = changed;
@@ -716,8 +905,7 @@ fn only_target_table(
         warnings.push("目标存在但源中不存在该表，已生成 DROP TABLE；执行前请备份数据".to_string());
     } else {
         warnings.push(
-            "目标存在但源中不存在该表（未生成删除语句；勾选「包含删除语句」可生成）"
-                .to_string(),
+            "目标存在但源中不存在该表（未生成删除语句；勾选「包含删除语句」可生成）".to_string(),
         );
     }
     SchemaTableDiff {
@@ -740,9 +928,7 @@ fn only_target_table(
 }
 
 fn usable_index(index: &IndexInfo) -> bool {
-    !index.primary
-        && !index.name.starts_with("sqlite_autoindex_")
-        && !index.columns.is_empty()
+    !index.primary && !index.name.starts_with("sqlite_autoindex_") && !index.columns.is_empty()
 }
 
 fn create_index_sql(driver: &str, table: &str, index: &IndexInfo) -> String {
@@ -888,11 +1074,7 @@ fn foreign_key_key(foreign_key: &ForeignKeyInfo, driver: &str) -> String {
     }
 }
 
-fn add_foreign_key_sql(
-    driver: &str,
-    table: &str,
-    foreign_key: &ForeignKeyInfo,
-) -> Option<String> {
+fn add_foreign_key_sql(driver: &str, table: &str, foreign_key: &ForeignKeyInfo) -> Option<String> {
     if driver == "sqlite"
         || foreign_key.columns.is_empty()
         || foreign_key.referenced_columns.is_empty()
@@ -943,11 +1125,7 @@ fn foreign_key_signature(foreign_key: &ForeignKeyInfo) -> ForeignKeySignature {
 
 type ForeignKeySignature = (Vec<String>, String, Vec<String>, String, String);
 
-fn drop_foreign_key_sql(
-    driver: &str,
-    table: &str,
-    foreign_key_name: &str,
-) -> Option<String> {
+fn drop_foreign_key_sql(driver: &str, table: &str, foreign_key_name: &str) -> Option<String> {
     match driver {
         "sqlite" => None,
         "mysql" => Some(format!(
@@ -1018,8 +1196,12 @@ fn compare_foreign_keys(
                 if existing.columns != foreign_key.columns
                     || existing.referenced_table != foreign_key.referenced_table
                     || existing.referenced_columns != foreign_key.referenced_columns
-                    || !existing.on_delete.eq_ignore_ascii_case(&foreign_key.on_delete)
-                    || !existing.on_update.eq_ignore_ascii_case(&foreign_key.on_update)
+                    || !existing
+                        .on_delete
+                        .eq_ignore_ascii_case(&foreign_key.on_delete)
+                    || !existing
+                        .on_update
+                        .eq_ignore_ascii_case(&foreign_key.on_update)
                 {
                     changed.push(foreign_key.name.clone());
                     match drop_foreign_key_sql(driver, &target.name, &foreign_key.name) {
@@ -1134,9 +1316,7 @@ fn suggested_change_sql(driver: &str, table: &str, source: &ColumnInfo) -> Optio
             statements.push(if default.is_empty() {
                 format!("ALTER TABLE {table_ref} ALTER COLUMN {column_ref} DROP DEFAULT;")
             } else {
-                format!(
-                    "ALTER TABLE {table_ref} ALTER COLUMN {column_ref} SET DEFAULT {default};"
-                )
+                format!("ALTER TABLE {table_ref} ALTER COLUMN {column_ref} SET DEFAULT {default};")
             });
             Some(statements.join("\n"))
         }
@@ -1153,11 +1333,7 @@ fn normalized_default(value: Option<&str>) -> String {
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value {
-        "是"
-    } else {
-        "否"
-    }
+    if value { "是" } else { "否" }
 }
 
 fn mysql_default_literal(value: &str, data_type: &str) -> String {
@@ -1205,10 +1381,7 @@ fn mysql_default_literal(value: &str, data_type: &str) -> String {
         return trimmed.to_string();
     }
 
-    format!(
-        "'{}'",
-        trimmed.replace('\\', "\\\\").replace('\'', "''")
-    )
+    format!("'{}'", trimmed.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -1230,6 +1403,7 @@ mod tests {
             primary_key,
             auto_increment,
             default_value: default_value.map(str::to_string),
+            comment: None,
         }
     }
 
@@ -1296,10 +1470,12 @@ mod tests {
             .iter()
             .find(|item| item.name == "users")
             .expect("users diff");
-        assert!(users
-            .sql
-            .iter()
-            .any(|sql| sql == "ALTER TABLE \"users\" ADD COLUMN \"email\" TEXT;"));
+        assert!(
+            users
+                .sql
+                .iter()
+                .any(|sql| sql == "ALTER TABLE \"users\" ADD COLUMN \"email\" TEXT;")
+        );
         assert!(diff.sql.contains("CREATE TABLE audit"));
 
         let legacy = diff
@@ -1327,10 +1503,12 @@ mod tests {
             .expect("legacy diff");
         assert_eq!(legacy.status, "onlyTarget");
         assert!(legacy.sql.is_empty());
-        assert!(legacy
-            .warnings
-            .iter()
-            .any(|text| text.contains("未生成删除语句")));
+        assert!(
+            legacy
+                .warnings
+                .iter()
+                .any(|text| text.contains("未生成删除语句"))
+        );
     }
 
     #[test]
@@ -1341,7 +1519,14 @@ mod tests {
             tables: vec![table(
                 "orders",
                 "",
-                vec![column("total", "numeric(12,2)", false, false, false, Some("0"))],
+                vec![column(
+                    "total",
+                    "numeric(12,2)",
+                    false,
+                    false,
+                    false,
+                    Some("0"),
+                )],
                 3,
             )],
         };
@@ -1360,18 +1545,14 @@ mod tests {
         let orders = &diff.tables[0];
         assert_eq!(orders.status, "changed");
         assert_eq!(orders.changed_columns.len(), 1);
-        assert!(orders
-            .sql
-            .iter()
-            .any(|sql| sql.contains("TYPE numeric(12,2)")));
-        assert!(orders
-            .sql
-            .iter()
-            .any(|sql| sql.contains("SET NOT NULL")));
-        assert!(orders
-            .sql
-            .iter()
-            .any(|sql| sql.contains("SET DEFAULT 0")));
+        assert!(
+            orders
+                .sql
+                .iter()
+                .any(|sql| sql.contains("TYPE numeric(12,2)"))
+        );
+        assert!(orders.sql.iter().any(|sql| sql.contains("SET NOT NULL")));
+        assert!(orders.sql.iter().any(|sql| sql.contains("SET DEFAULT 0")));
         assert!(orders.warnings.iter().any(|text| text.contains("人工确认")));
         assert!(diff.sql.contains("USING \"total\"::numeric(12,2)"));
     }
@@ -1443,16 +1624,16 @@ mod tests {
         assert_eq!(users.added_indexes, vec!["idx_users_email".to_string()]);
         assert!(users.extra_indexes.contains(&"idx_old".to_string()));
         assert_eq!(users.added_foreign_keys, vec!["fk_users_org".to_string()]);
-        assert!(users
-            .sql
-            .iter()
-            .any(|sql| sql == "CREATE UNIQUE INDEX \"idx_users_email\" ON \"users\" (\"email\");"));
-        assert!(users
-            .sql
-            .iter()
-            .any(|sql| sql.contains("ADD CONSTRAINT")
-                && sql.contains("FOREIGN KEY")
-                && sql.contains("ON DELETE CASCADE")));
+        assert!(
+            users
+                .sql
+                .iter()
+                .any(|sql| sql
+                    == "CREATE UNIQUE INDEX \"idx_users_email\" ON \"users\" (\"email\");")
+        );
+        assert!(users.sql.iter().any(|sql| sql.contains("ADD CONSTRAINT")
+            && sql.contains("FOREIGN KEY")
+            && sql.contains("ON DELETE CASCADE")));
 
         let without_options = diff_snapshots(
             &source,
@@ -1499,14 +1680,14 @@ mod tests {
         let diff = diff_snapshots(&source, &target, DiffOptions::ALL);
         let users = &diff.tables[0];
         assert_eq!(users.status, "onlySource");
-        assert!(users
-            .sql
-            .iter()
-            .any(|sql| sql.starts_with("CREATE TABLE")));
-        assert!(users
-            .sql
-            .iter()
-            .any(|sql| sql == "CREATE UNIQUE INDEX \"idx_users_email\" ON \"users\" (\"email\");"));
+        assert!(users.sql.iter().any(|sql| sql.starts_with("CREATE TABLE")));
+        assert!(
+            users
+                .sql
+                .iter()
+                .any(|sql| sql
+                    == "CREATE UNIQUE INDEX \"idx_users_email\" ON \"users\" (\"email\");")
+        );
         assert_eq!(users.added_indexes, vec!["idx_users_email".to_string()]);
 
         let mut mysql_source = source.tables[0].clone();
@@ -1543,14 +1724,16 @@ mod tests {
             0,
         );
         let diff = only_source_table(&source, "postgres", DiffOptions::ALL, Some("users_copy"));
-        assert!(diff
-            .sql
-            .iter()
-            .any(|sql| sql == "CREATE TABLE \"users_copy\" (id INTEGER);"));
-        assert!(diff
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("目标表名 users_copy")));
+        assert!(
+            diff.sql
+                .iter()
+                .any(|sql| sql == "CREATE TABLE \"users_copy\" (id INTEGER);")
+        );
+        assert!(
+            diff.warnings
+                .iter()
+                .any(|warning| warning.contains("目标表名 users_copy"))
+        );
     }
 
     #[test]

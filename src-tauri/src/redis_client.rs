@@ -22,6 +22,29 @@ pub struct RedisScanResult {
     pub keys: Vec<RedisKeyEntry>,
     pub scanned: usize,
     pub truncated: bool,
+    /// Cursor for the next page; 0 means the scan is complete.
+    pub cursor: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisHashEntry {
+    pub field: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisListEntry {
+    pub index: i64,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisZsetEntry {
+    pub member: String,
+    pub score: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,6 +55,10 @@ pub struct RedisKeyDetail {
     pub ttl: i64,
     pub value: String,
     pub truncated: bool,
+    pub hash: Vec<RedisHashEntry>,
+    pub list_entries: Vec<RedisListEntry>,
+    pub set_members: Vec<String>,
+    pub zset_entries: Vec<RedisZsetEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -311,11 +338,15 @@ pub async fn scan_keys(
     connection: &mut MultiplexedConnection,
     pattern: Option<&str>,
     limit: Option<u32>,
+    start_cursor: Option<u64>,
 ) -> Result<RedisScanResult, String> {
-    let pattern = pattern.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("*");
+    let pattern = pattern
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("*");
     let limit = limit.unwrap_or(500).clamp(1, 5000) as usize;
 
-    let mut cursor = 0u64;
+    let mut cursor = start_cursor.unwrap_or(0);
     let mut raw_keys: Vec<Vec<u8>> = Vec::new();
     let mut scanned = 0usize;
     let mut truncated = false;
@@ -380,6 +411,7 @@ pub async fn scan_keys(
         keys,
         scanned,
         truncated,
+        cursor,
     })
 }
 
@@ -399,6 +431,10 @@ pub async fn key_detail(
     key: &str,
 ) -> Result<RedisKeyDetail, String> {
     let key_bytes = key.as_bytes();
+    let mut hash_entries: Vec<RedisHashEntry> = Vec::new();
+    let mut list_entries: Vec<RedisListEntry> = Vec::new();
+    let mut set_members: Vec<String> = Vec::new();
+    let mut zset_entries: Vec<RedisZsetEntry> = Vec::new();
     let key_type: String = redis::cmd("TYPE")
         .arg(key_bytes)
         .query_async(connection)
@@ -451,11 +487,13 @@ pub async fn key_detail(
                 .into_iter()
                 .take(MAX_COLLECTION_ITEMS)
                 .map(|(field, field_value)| {
-                    format!(
-                        "{}: {}",
-                        String::from_utf8_lossy(&field),
-                        String::from_utf8_lossy(&field_value)
-                    )
+                    let field = String::from_utf8_lossy(&field).to_string();
+                    let field_value = String::from_utf8_lossy(&field_value).to_string();
+                    hash_entries.push(RedisHashEntry {
+                        field: field.clone(),
+                        value: field_value.clone(),
+                    });
+                    format!("{field}: {field_value}")
                 })
                 .collect::<Vec<_>>();
             let (value, _) = join_items(items, truncated);
@@ -479,7 +517,12 @@ pub async fn key_detail(
                 .into_iter()
                 .enumerate()
                 .map(|(index, value)| {
-                    format!("{index}) {}", String::from_utf8_lossy(&value))
+                    let value = String::from_utf8_lossy(&value).to_string();
+                    list_entries.push(RedisListEntry {
+                        index: index as i64,
+                        value: value.clone(),
+                    });
+                    format!("{index}) {value}")
                 })
                 .collect::<Vec<_>>();
             let (value, _) = join_items(items, truncated);
@@ -501,7 +544,11 @@ pub async fn key_detail(
             let items = values
                 .into_iter()
                 .take(MAX_COLLECTION_ITEMS)
-                .map(|value| format!("• {}", String::from_utf8_lossy(&value)))
+                .map(|value| {
+                    let value = String::from_utf8_lossy(&value).to_string();
+                    set_members.push(value.clone());
+                    format!("• {value}")
+                })
                 .collect::<Vec<_>>();
             let (value, _) = join_items(items, truncated);
             (format!("共 {length} 个成员\n{value}"), truncated)
@@ -524,7 +571,12 @@ pub async fn key_detail(
             let items = values
                 .into_iter()
                 .map(|(member, score)| {
-                    format!("{score}\t{}", String::from_utf8_lossy(&member))
+                    let member = String::from_utf8_lossy(&member).to_string();
+                    zset_entries.push(RedisZsetEntry {
+                        member: member.clone(),
+                        score,
+                    });
+                    format!("{score}\t{member}")
                 })
                 .collect::<Vec<_>>();
             let (value, _) = join_items(items, truncated);
@@ -546,10 +598,7 @@ pub async fn key_detail(
                 .await
                 .map_err(|error| redis_error("读取 Redis Stream 失败", error))?;
             let output = format_value(&value);
-            (
-                format!("共 {length} 条记录\n{output}"),
-                length > 200,
-            )
+            (format!("共 {length} 条记录\n{output}"), length > 200)
         }
         "none" => ("(键不存在)".to_string(), false),
         other => (format!("暂不支持展示类型: {other}"), false),
@@ -561,18 +610,248 @@ pub async fn key_detail(
         ttl,
         value,
         truncated,
+        hash: hash_entries,
+        list_entries,
+        set_members,
+        zset_entries,
     })
 }
 
-pub async fn delete_key(
-    connection: &mut MultiplexedConnection,
-    key: &str,
-) -> Result<u64, String> {
+pub async fn delete_key(connection: &mut MultiplexedConnection, key: &str) -> Result<u64, String> {
     redis::cmd("DEL")
         .arg(key.as_bytes())
         .query_async(connection)
         .await
         .map_err(|error| redis_error("删除 Redis 键失败", error))
+}
+
+pub async fn set_ttl(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    ttl_seconds: Option<i64>,
+) -> Result<i64, String> {
+    match ttl_seconds {
+        None => redis::cmd("PERSIST")
+            .arg(key.as_bytes())
+            .query_async(connection)
+            .await
+            .map_err(|error| redis_error("设置 Redis 永久键失败", error)),
+        Some(seconds) => {
+            if seconds < 0 {
+                return Err("TTL 必须是非负整数".to_string());
+            }
+            redis::cmd("EXPIRE")
+                .arg(key.as_bytes())
+                .arg(seconds)
+                .query_async(connection)
+                .await
+                .map_err(|error| redis_error("设置 Redis TTL 失败", error))
+        }
+    }
+}
+
+pub async fn rename_key(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    new_key: &str,
+    overwrite: bool,
+) -> Result<(), String> {
+    let new_key = new_key.trim();
+    if new_key.is_empty() {
+        return Err("新键名不能为空".to_string());
+    }
+    if new_key == key {
+        return Ok(());
+    }
+    let exists: i64 = redis::cmd("EXISTS")
+        .arg(new_key.as_bytes())
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_error("检查目标键失败", error))?;
+    if exists > 0 && !overwrite {
+        return Err("目标键已存在".to_string());
+    }
+    let command = if overwrite { "RENAME" } else { "RENAMENX" };
+    let renamed: i64 = redis::cmd(command)
+        .arg(key.as_bytes())
+        .arg(new_key.as_bytes())
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_error("重命名 Redis 键失败", error))?;
+    if renamed == 0 {
+        return Err("目标键已存在，未覆盖".to_string());
+    }
+    Ok(())
+}
+
+pub async fn set_string(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let result: Result<(), _> = redis::cmd("SET")
+        .arg(key.as_bytes())
+        .arg(value.as_bytes())
+        .arg("KEEPTTL")
+        .query_async(connection)
+        .await;
+    if result.is_ok() {
+        return Ok(());
+    }
+    // Redis < 6 has no KEEPTTL; preserve the TTL manually when possible.
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(key.as_bytes())
+        .query_async(connection)
+        .await
+        .unwrap_or(-1);
+    redis::cmd("SET")
+        .arg(key.as_bytes())
+        .arg(value.as_bytes())
+        .query_async::<()>(connection)
+        .await
+        .map_err(|error| redis_error("保存 Redis 字符串失败", error))?;
+    if ttl > 0 {
+        let _: Result<i64, _> = redis::cmd("EXPIRE")
+            .arg(key.as_bytes())
+            .arg(ttl)
+            .query_async(connection)
+            .await;
+    }
+    Ok(())
+}
+
+pub async fn hash_set(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    field: &str,
+    value: &str,
+) -> Result<u64, String> {
+    if field.is_empty() {
+        return Err("Hash 字段名不能为空".to_string());
+    }
+    redis::cmd("HSET")
+        .arg(key.as_bytes())
+        .arg(field.as_bytes())
+        .arg(value.as_bytes())
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_error("写入 Redis Hash 字段失败", error))
+}
+
+pub async fn hash_delete_field(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    field: &str,
+) -> Result<u64, String> {
+    if field.is_empty() {
+        return Err("Hash 字段名不能为空".to_string());
+    }
+    redis::cmd("HDEL")
+        .arg(key.as_bytes())
+        .arg(field.as_bytes())
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_error("删除 Redis Hash 字段失败", error))
+}
+
+pub async fn list_push(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    value: &str,
+    left: bool,
+) -> Result<u64, String> {
+    redis::cmd(if left { "LPUSH" } else { "RPUSH" })
+        .arg(key.as_bytes())
+        .arg(value.as_bytes())
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_error("写入 Redis List 失败", error))
+}
+
+pub async fn list_set(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    index: i64,
+    value: &str,
+) -> Result<(), String> {
+    redis::cmd("LSET")
+        .arg(key.as_bytes())
+        .arg(index)
+        .arg(value.as_bytes())
+        .query_async::<()>(connection)
+        .await
+        .map_err(|error| redis_error("修改 Redis List 元素失败", error))
+}
+
+pub async fn list_remove(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    value: &str,
+) -> Result<u64, String> {
+    redis::cmd("LREM")
+        .arg(key.as_bytes())
+        .arg(1)
+        .arg(value.as_bytes())
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_error("删除 Redis List 元素失败", error))
+}
+
+pub async fn set_add(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    member: &str,
+) -> Result<u64, String> {
+    redis::cmd("SADD")
+        .arg(key.as_bytes())
+        .arg(member.as_bytes())
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_error("写入 Redis Set 失败", error))
+}
+
+pub async fn set_remove(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    member: &str,
+) -> Result<u64, String> {
+    redis::cmd("SREM")
+        .arg(key.as_bytes())
+        .arg(member.as_bytes())
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_error("删除 Redis Set 成员失败", error))
+}
+
+pub async fn zset_set(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    member: &str,
+    score: f64,
+) -> Result<u64, String> {
+    if !score.is_finite() {
+        return Err("ZSet score 必须是有限数字".to_string());
+    }
+    redis::cmd("ZADD")
+        .arg(key.as_bytes())
+        .arg(score)
+        .arg(member.as_bytes())
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_error("写入 Redis ZSet 失败", error))
+}
+
+pub async fn zset_remove(
+    connection: &mut MultiplexedConnection,
+    key: &str,
+    member: &str,
+) -> Result<u64, String> {
+    redis::cmd("ZREM")
+        .arg(key.as_bytes())
+        .arg(member.as_bytes())
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_error("删除 Redis ZSet 成员失败", error))
 }
 
 pub fn parse_command(input: &str) -> Result<Vec<String>, String> {
@@ -632,10 +911,7 @@ pub fn parse_command(input: &str) -> Result<Vec<String>, String> {
 
 fn truncate_value(text: String) -> (String, bool) {
     if text.chars().count() > MAX_VALUE_BYTES {
-        (
-            text.chars().take(MAX_VALUE_BYTES).collect::<String>(),
-            true,
-        )
+        (text.chars().take(MAX_VALUE_BYTES).collect::<String>(), true)
     } else {
         (text, false)
     }
@@ -730,9 +1006,8 @@ mod tests {
 
     #[test]
     fn parses_keyspace_counts() {
-        let counts = parse_keyspace(
-            "db0:keys=12,expires=2,avg_ttl=0\r\ndb3:keys=1,expires=0,avg_ttl=0\r\n",
-        );
+        let counts =
+            parse_keyspace("db0:keys=12,expires=2,avg_ttl=0\r\ndb3:keys=1,expires=0,avg_ttl=0\r\n");
         assert_eq!(counts.get(&0), Some(&12));
         assert_eq!(counts.get(&3), Some(&1));
         assert_eq!(counts.get(&9), None);

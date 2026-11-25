@@ -1,5 +1,5 @@
-use crate::db::{DatabaseDriver, DatabaseSession};
 use crate::db::query::is_read_query;
+use crate::db::{DatabaseDriver, DatabaseSession};
 use crate::models::{
     ColumnInfo, ColumnValue, ConnectionConfig, DatabaseObjects, ForeignKeyInfo, IndexInfo,
     QueryResult, ScopeTableColumns, TableInfo, TableRows, TableStructure,
@@ -13,6 +13,7 @@ use serde_json::Value;
 use sqlx::mysql::{MySqlArguments, MySqlConnectOptions, MySqlPoolOptions, MySqlRow, MySqlSslMode};
 use sqlx::{Column, Connection, MySqlConnection, MySqlPool, Row, TypeInfo};
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
@@ -36,8 +37,29 @@ impl MySqlDriver {
         let ssl_mode = match config.ssl_mode.as_str() {
             "preferred" => MySqlSslMode::Preferred,
             "required" => MySqlSslMode::Required,
+            "verify-ca" => MySqlSslMode::VerifyCa,
+            "verify-full" => MySqlSslMode::VerifyIdentity,
             _ => MySqlSslMode::Disabled,
         };
+        let needs_ca = matches!(config.ssl_mode.as_str(), "verify-ca" | "verify-full");
+        if needs_ca && config.ssl_ca_path.trim().is_empty() {
+            return Err("verify-ca / verify-full 必须选择 CA 证书文件".to_string());
+        }
+        let ca_path = config.ssl_ca_path.trim();
+        if !ca_path.is_empty() && !std::path::Path::new(ca_path).is_file() {
+            return Err(format!("CA 证书文件不存在: {ca_path}"));
+        }
+        let client_cert = config.ssl_client_cert_path.trim();
+        let client_key = config.ssl_client_key_path.trim();
+        if client_cert.is_empty() != client_key.is_empty() {
+            return Err("客户端证书与私钥必须同时选择".to_string());
+        }
+        if !client_cert.is_empty() && !std::path::Path::new(client_cert).is_file() {
+            return Err(format!("客户端证书文件不存在: {client_cert}"));
+        }
+        if !client_key.is_empty() && !std::path::Path::new(client_key).is_file() {
+            return Err(format!("客户端私钥文件不存在: {client_key}"));
+        }
 
         let database = if config.database.trim().is_empty() {
             "mysql".to_string()
@@ -45,13 +67,21 @@ impl MySqlDriver {
             config.database.trim().to_string()
         };
 
-        let options = MySqlConnectOptions::new()
+        let mut options = MySqlConnectOptions::new()
             .host(host)
             .port(if port == 0 { 3306 } else { port })
             .username(&config.username)
             .password(password.unwrap_or_default())
             .ssl_mode(ssl_mode)
             .database(&database);
+        if !ca_path.is_empty() {
+            options = options.ssl_ca(ca_path);
+        }
+        if !client_cert.is_empty() {
+            options = options
+                .ssl_client_cert(client_cert)
+                .ssl_client_key(client_key);
+        }
 
         let pool = MySqlPoolOptions::new()
             .max_connections(5)
@@ -165,6 +195,14 @@ impl DatabaseSession for MySqlSession {
             .await
             .map_err(|error| format!("回滚事务失败: {error}"))?;
         Ok(())
+    }
+
+    async fn backend_id(&mut self) -> Result<Option<i64>, String> {
+        let id: i64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut *self.connection)
+            .await
+            .map_err(|error| format!("读取连接 ID 失败: {error}"))?;
+        Ok(Some(id))
     }
 }
 
@@ -452,10 +490,26 @@ impl DatabaseDriver for MySqlDriver {
         Ok(Box::new(MySqlSession { connection }))
     }
 
+    async fn cancel_backend_query(&self, backend_id: i64) -> Result<bool, String> {
+        // KILL QUERY ends only the statement; the session itself stays open.
+        // Do not escalate to KILL <id>: that would drop the connection and
+        // any open transaction.
+        let sql = format!("KILL QUERY {backend_id}");
+        match sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) => Err(format!(
+                "取消查询失败（可能需要 PROCESS 权限，或语句已结束）: {error}"
+            )),
+        }
+    }
+
     async fn list_columns(&self, table: &str) -> Result<Vec<ColumnInfo>, String> {
         let database = self.current_database().await;
         let rows = sqlx::query(
-            "SELECT column_name, column_type, is_nullable, column_key, extra, column_default \
+            "SELECT column_name, column_type, is_nullable, column_key, extra, column_default, column_comment \
              FROM information_schema.columns \
              WHERE table_schema = ? AND table_name = ? \
              ORDER BY ordinal_position",
@@ -475,6 +529,7 @@ impl DatabaseDriver for MySqlDriver {
                 let column_key: String = row.try_get(3).unwrap_or_default();
                 let extra: String = row.try_get(4).unwrap_or_default();
                 let default_value: Option<String> = row.try_get(5).ok().flatten();
+                let comment: Option<String> = row.try_get(6).ok().flatten();
 
                 ColumnInfo {
                     name,
@@ -483,6 +538,7 @@ impl DatabaseDriver for MySqlDriver {
                     primary_key: column_key.eq_ignore_ascii_case("PRI"),
                     auto_increment: extra.to_ascii_lowercase().contains("auto_increment"),
                     default_value,
+                    comment: comment.filter(|value| !value.trim().is_empty()),
                 }
             })
             .collect())
@@ -524,6 +580,7 @@ impl DatabaseDriver for MySqlDriver {
                 primary_key: column_key.eq_ignore_ascii_case("PRI"),
                 auto_increment: extra.to_ascii_lowercase().contains("auto_increment"),
                 default_value,
+                comment: None,
             };
             grouped
                 .entry(table_name)
@@ -597,10 +654,7 @@ impl DatabaseDriver for MySqlDriver {
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| {
-                    format!(
-                        "第 {} 条语句执行失败（事务已回滚）: {error}",
-                        index + 1
-                    )
+                    format!("第 {} 条语句执行失败（事务已回滚）: {error}", index + 1)
                 })?;
             count += 1;
         }
@@ -706,6 +760,321 @@ impl DatabaseDriver for MySqlDriver {
             count += 1;
         }
         Ok(count)
+    }
+
+    async fn read_rows_sorted(
+        &self,
+        table: &str,
+        limit: u64,
+        offset: u64,
+        filter: Option<&str>,
+        sorts: &[crate::models::TableSort],
+    ) -> Result<TableRows, String> {
+        let database = self.current_database().await;
+        let columns = self.list_columns(table).await?;
+        let identifier = qualified_identifier(&database, table);
+        let filter = filter.map(str::trim).filter(|value| !value.is_empty());
+        if filter.is_some_and(|value| value.contains(';')) {
+            return Err("WHERE 条件不能包含分号".to_string());
+        }
+        let where_clause = filter
+            .map(|value| format!(" WHERE {value}"))
+            .unwrap_or_default();
+        let count_sql = format!("SELECT COUNT(*) FROM {identifier}{where_clause}");
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| format!("读取总行数失败: {error}"))?;
+
+        let mut order_columns: Vec<(String, String)> = Vec::new();
+        for sort in sorts {
+            if !columns.iter().any(|column| column.name == sort.column) {
+                return Err(format!("排序字段不存在: {}", sort.column));
+            }
+            if order_columns
+                .iter()
+                .any(|(column, _)| column == &sort.column)
+            {
+                continue;
+            }
+            order_columns.push((
+                sort.column.clone(),
+                if sort.direction.eq_ignore_ascii_case("desc") {
+                    "DESC".to_string()
+                } else {
+                    "ASC".to_string()
+                },
+            ));
+        }
+        if !order_columns.is_empty() {
+            for column in columns.iter().filter(|column| column.primary_key) {
+                if !order_columns.iter().any(|(name, _)| name == &column.name) {
+                    order_columns.push((column.name.clone(), "ASC".to_string()));
+                }
+            }
+        }
+        let order_clause = if order_columns.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ORDER BY {}",
+                order_columns
+                    .iter()
+                    .map(|(column, direction)| {
+                        format!("{} {direction}", quote_identifier(column))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let sql =
+            format!("SELECT * FROM {identifier}{where_clause}{order_clause} LIMIT ? OFFSET ?");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| format!("读取表数据失败: {error}"))?;
+        let values = rows
+            .iter()
+            .map(|row| {
+                (0..row.len())
+                    .map(|index| value_to_json(row, index))
+                    .collect()
+            })
+            .collect();
+        Ok(TableRows {
+            columns,
+            rows: values,
+            total: total.max(0) as u64,
+            offset,
+            limit,
+        })
+    }
+
+    async fn apply_table_changes(
+        &self,
+        table: &str,
+        changes: &[crate::models::PendingTableChange],
+    ) -> Result<usize, String> {
+        let database = self.current_database().await;
+        let table_ref = qualified_identifier(&database, table);
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| format!("开启批量事务失败: {error}"))?;
+        let mut applied = 0usize;
+        for (index, change) in changes.iter().enumerate() {
+            let label = format!("第 {} 项（{}）", index + 1, change.kind);
+            let result: Result<u64, String> = match change.kind.as_str() {
+                "delete" => {
+                    if change.keys.is_empty() {
+                        Err("删除缺少主键条件".to_string())
+                    } else {
+                        let where_clause = change
+                            .keys
+                            .iter()
+                            .map(|key| {
+                                if key.value.is_null() {
+                                    format!("{} IS NULL", quote_identifier(&key.column))
+                                } else {
+                                    format!("{} = ?", quote_identifier(&key.column))
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        let sql = format!(
+                            "DELETE FROM {table_ref} WHERE {where_clause}{}",
+                            if change.single_row { " LIMIT 1" } else { "" }
+                        );
+                        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+                        for key in &change.keys {
+                            if !key.value.is_null() {
+                                query = bind_json_mysql(query, &key.value);
+                            }
+                        }
+                        query
+                            .execute(&mut *transaction)
+                            .await
+                            .map(|result| result.rows_affected())
+                            .map_err(|error| format!("删除失败: {error}"))
+                    }
+                }
+                "update" => {
+                    if change.keys.is_empty() {
+                        Err("更新缺少主键条件".to_string())
+                    } else if change.changes.is_empty() {
+                        Err("更新没有字段变更".to_string())
+                    } else {
+                        let set_clause = change
+                            .changes
+                            .iter()
+                            .map(|item| format!("{} = ?", quote_identifier(&item.column)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let where_clause = change
+                            .keys
+                            .iter()
+                            .map(|key| {
+                                if key.value.is_null() {
+                                    format!("{} IS NULL", quote_identifier(&key.column))
+                                } else {
+                                    format!("{} = ?", quote_identifier(&key.column))
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        let sql = format!(
+                            "UPDATE {table_ref} SET {set_clause} WHERE {where_clause}{}",
+                            if change.single_row { " LIMIT 1" } else { "" }
+                        );
+                        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+                        for item in &change.changes {
+                            query = bind_json_mysql(query, &item.value);
+                        }
+                        for key in &change.keys {
+                            if !key.value.is_null() {
+                                query = bind_json_mysql(query, &key.value);
+                            }
+                        }
+                        query
+                            .execute(&mut *transaction)
+                            .await
+                            .map(|result| result.rows_affected())
+                            .map_err(|error| format!("更新失败: {error}"))
+                    }
+                }
+                "insert" => {
+                    let sql = if change.values.is_empty() {
+                        format!("INSERT INTO {table_ref} () VALUES ()")
+                    } else {
+                        let fields = change
+                            .values
+                            .iter()
+                            .map(|item| quote_identifier(&item.column))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let placeholders = vec!["?"; change.values.len()].join(", ");
+                        format!("INSERT INTO {table_ref} ({fields}) VALUES ({placeholders})")
+                    };
+                    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+                    for item in &change.values {
+                        query = bind_json_mysql(query, &item.value);
+                    }
+                    query
+                        .execute(&mut *transaction)
+                        .await
+                        .map(|result| result.rows_affected())
+                        .map_err(|error| format!("新增失败: {error}"))
+                }
+                other => Err(format!("未知变更类型: {other}")),
+            };
+            match result {
+                Ok(rows) => {
+                    let needs_one = matches!(change.kind.as_str(), "delete" | "update");
+                    if needs_one && rows != 1 {
+                        let _ = transaction.rollback().await;
+                        return Err(format!(
+                            "{label} 目标行已不存在或已变化（影响 {rows} 行），已回滚"
+                        ));
+                    }
+                    applied += 1;
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(format!("{label} {error}，已回滚"));
+                }
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| format!("提交批量事务失败: {error}"))?;
+        Ok(applied)
+    }
+
+    async fn dump_insert_plan(&self, table: &str) -> Result<(Vec<String>, String), String> {
+        let database = self.current_database().await;
+        let generated: HashSet<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = ? AND table_name = ? \
+               AND UPPER(extra) LIKE '%GENERATED%'",
+        )
+        .bind(&database)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("读取生成列失败: {error}"))?
+        .into_iter()
+        .collect();
+        let columns = self
+            .list_columns(table)
+            .await?
+            .into_iter()
+            .filter(|column| !generated.contains(&column.name))
+            .map(|column| column.name)
+            .collect();
+        Ok((columns, String::new()))
+    }
+
+    async fn stream_sql_literal_rows(
+        &self,
+        table: &str,
+        columns: &[String],
+        sink: &mut (dyn FnMut(Vec<Option<String>>) -> Result<(), String> + Send),
+    ) -> Result<u64, String> {
+        if columns.is_empty() {
+            return Ok(0);
+        }
+        let database = self.current_database().await;
+        let metadata = self.list_columns(table).await?;
+        let expressions = columns
+            .iter()
+            .map(|name| {
+                metadata
+                    .iter()
+                    .find(|column| &column.name == name)
+                    .map(mysql_dump_expression)
+                    .unwrap_or_else(|| format!("QUOTE({})", quote_identifier(name)))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {expressions} FROM {}",
+            qualified_identifier(&database, table)
+        );
+        let mut stream = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&self.pool);
+        let mut count = 0u64;
+        while let Some(row) = stream
+            .try_next()
+            .await
+            .map_err(|error| format!("读取表数据失败: {error}"))?
+        {
+            let values = (0..columns.len())
+                .map(|index| row.try_get::<Option<String>, _>(index).ok().flatten())
+                .collect::<Vec<_>>();
+            sink(values)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn dump_object_drop(&self, kind: &str, name: &str) -> Result<String, String> {
+        let keyword = match kind {
+            "table" => "TABLE",
+            "view" => "VIEW",
+            "procedure" => "PROCEDURE",
+            "function" => "FUNCTION",
+            "trigger" => "TRIGGER",
+            "event" => "EVENT",
+            "sequence" => "SEQUENCE",
+            _ => return Err(format!("MySQL 不支持删除该对象类型: {kind}")),
+        };
+        Ok(format!(
+            "DROP {keyword} IF EXISTS {};",
+            quote_identifier(name)
+        ))
     }
 
     async fn update_row(
@@ -844,6 +1213,7 @@ impl DatabaseDriver for MySqlDriver {
             "function" => (format!("SHOW CREATE FUNCTION {qualified}"), 2),
             "trigger" => (format!("SHOW CREATE TRIGGER {qualified}"), 2),
             "event" => (format!("SHOW CREATE EVENT {qualified}"), 3),
+            "sequence" => (format!("SHOW CREATE SEQUENCE {qualified}"), 1),
             _ => return Err("MySQL 不支持读取该对象类型的 DDL".to_string()),
         };
 
@@ -856,6 +1226,99 @@ impl DatabaseDriver for MySqlDriver {
             .and_then(|row| row_text(row, value_index))
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| format!("没有可用的 DDL（数据库 {database} · {name}）"))
+    }
+
+    async fn create_database(
+        &self,
+        name: &str,
+        charset: Option<&str>,
+        collation: Option<&str>,
+    ) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("数据库名称不能为空".to_string());
+        }
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "information_schema" | "mysql" | "performance_schema" | "sys"
+        ) {
+            return Err("不能创建或覆盖系统数据库".to_string());
+        }
+        let charset = charset.unwrap_or("utf8mb4").trim().to_ascii_lowercase();
+        const CHARSETS: &[&str] = &[
+            "utf8mb4", "utf8", "utf8mb3", "latin1", "gbk", "big5", "binary",
+        ];
+        if !CHARSETS.contains(&charset.as_str()) {
+            return Err("不支持的字符集".to_string());
+        }
+        let mut sql = format!(
+            "CREATE DATABASE {} CHARACTER SET {charset}",
+            quote_identifier(name)
+        );
+        if let Some(collation) = collation.map(str::trim).filter(|value| !value.is_empty()) {
+            if !collation
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            {
+                return Err("排序规则只能包含字母、数字和下划线".to_string());
+            }
+            sql.push_str(&format!(" COLLATE {collation}"));
+        }
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await
+            .map_err(|error| format!("创建数据库失败: {error}"))?;
+        Ok(())
+    }
+
+    async fn drop_database(&self, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("数据库名称不能为空".to_string());
+        }
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "information_schema" | "mysql" | "performance_schema" | "sys"
+        ) {
+            return Err("不能删除系统数据库".to_string());
+        }
+        if self.current_database().await == name {
+            self.switch_database("mysql").await?;
+        }
+        let sql = format!("DROP DATABASE {}", quote_identifier(name));
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await
+            .map_err(|error| format!("删除数据库失败: {error}"))?;
+        Ok(())
+    }
+
+    async fn save_object_definition(
+        &self,
+        kind: &str,
+        name: &str,
+        definition: &str,
+    ) -> Result<(), String> {
+        if kind != "view" {
+            return Err("MySQL 仅支持在应用内修改视图定义".to_string());
+        }
+        // Refuse to overwrite a view that was dropped or renamed since the
+        // dialog was opened.
+        let _ = self.object_ddl("view", name).await?;
+        let definition = definition.trim().trim_end_matches(';').trim();
+        let upper = definition.to_ascii_uppercase();
+        if !upper.starts_with("CREATE ") {
+            return Err("视图定义必须以 CREATE ... VIEW 开头".to_string());
+        }
+        let sql = if upper.starts_with("CREATE OR REPLACE ") {
+            definition.to_string()
+        } else {
+            format!(
+                "CREATE OR REPLACE {}",
+                definition["CREATE ".len()..].trim_start()
+            )
+        };
+        self.execute(&sql, 1).await.map(|_| ())
     }
 
     async fn duplicate_table(&self, source: &str, target: &str) -> Result<(), String> {
@@ -914,12 +1377,7 @@ impl DatabaseDriver for MySqlDriver {
         Ok(())
     }
 
-    async fn rename_object(
-        &self,
-        kind: &str,
-        name: &str,
-        new_name: &str,
-    ) -> Result<(), String> {
+    async fn rename_object(&self, kind: &str, name: &str, new_name: &str) -> Result<(), String> {
         if kind != "table" && kind != "view" {
             return Err("MySQL 仅支持重命名表或视图".to_string());
         }
@@ -948,10 +1406,7 @@ impl DatabaseDriver for MySqlDriver {
             _ => return Err("MySQL 不支持删除该对象类型".to_string()),
         };
         let database = self.current_database().await;
-        let sql = format!(
-            "DROP {keyword} {}",
-            qualified_identifier(&database, name)
-        );
+        let sql = format!("DROP {keyword} {}", qualified_identifier(&database, name));
         sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&self.pool)
             .await
@@ -1049,12 +1504,59 @@ fn quote_identifier(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
+fn mysql_dump_expression(column: &ColumnInfo) -> String {
+    let name = quote_identifier(&column.name);
+    let data_type = column.data_type.trim().to_ascii_lowercase();
+    let base = data_type
+        .split(|character: char| character == '(' || character.is_whitespace())
+        .next()
+        .unwrap_or("");
+    if base == "bit" {
+        return format!("CAST({name} AS UNSIGNED)");
+    }
+    if matches!(
+        base,
+        "binary"
+            | "varbinary"
+            | "blob"
+            | "tinyblob"
+            | "mediumblob"
+            | "longblob"
+            | "geometry"
+            | "point"
+            | "linestring"
+            | "polygon"
+            | "multipoint"
+            | "multilinestring"
+            | "multipolygon"
+            | "geometrycollection"
+    ) {
+        return format!("CONCAT(\"X'\", HEX({name}), \"'\")");
+    }
+    if matches!(
+        base,
+        "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "decimal"
+            | "numeric"
+            | "float"
+            | "double"
+            | "real"
+            | "year"
+            | "bool"
+            | "boolean"
+    ) {
+        return format!("CAST({name} AS CHAR)");
+    }
+    format!("QUOTE({name})")
+}
+
 fn qualified_identifier(database: &str, name: &str) -> String {
-    format!(
-        "{}.{}",
-        quote_identifier(database),
-        quote_identifier(name)
-    )
+    format!("{}.{}", quote_identifier(database), quote_identifier(name))
 }
 
 /// SHOW CREATE results can arrive as TEXT or BLOB and may use the server's
@@ -1198,9 +1700,35 @@ mod tests {
     #[test]
     fn quotes_identifiers_and_qualifies() {
         assert_eq!(quote_identifier("a`b"), "`a``b`");
+        assert_eq!(qualified_identifier("my db", "t"), "`my db`.`t`");
+    }
+
+    #[test]
+    fn builds_dump_literals_for_binary_numeric_and_text() {
+        let column = |name: &str, data_type: &str| ColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable: true,
+            primary_key: false,
+            auto_increment: false,
+            default_value: None,
+            comment: None,
+        };
         assert_eq!(
-            qualified_identifier("my db", "t"),
-            "`my db`.`t`"
+            mysql_dump_expression(&column("payload", "longblob")),
+            "CONCAT(\"X'\", HEX(`payload`), \"'\")"
+        );
+        assert_eq!(
+            mysql_dump_expression(&column("amount", "decimal(10,2)")),
+            "CAST(`amount` AS CHAR)"
+        );
+        assert_eq!(
+            mysql_dump_expression(&column("name", "varchar(255)")),
+            "QUOTE(`name`)"
+        );
+        assert_eq!(
+            mysql_dump_expression(&column("flags", "bit(8)")),
+            "CAST(`flags` AS UNSIGNED)"
         );
     }
 
@@ -1217,23 +1745,20 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(3306);
-        let username =
-            std::env::var("MYDB_TEST_MYSQL_USER").unwrap_or_else(|_| "root".to_string());
+        let username = std::env::var("MYDB_TEST_MYSQL_USER").unwrap_or_else(|_| "root".to_string());
         let database =
             std::env::var("MYDB_TEST_MYSQL_CONFIG_DB").unwrap_or_else(|_| "mysql".to_string());
-        let target_db =
-            std::env::var("MYDB_TEST_MYSQL_DB").unwrap_or_else(|_| database.clone());
+        let target_db = std::env::var("MYDB_TEST_MYSQL_DB").unwrap_or_else(|_| database.clone());
         let table = std::env::var("MYDB_TEST_MYSQL_TABLE").ok();
 
         let password = match std::env::var("MYDB_TEST_MYSQL_PASSWORD") {
             Ok(value) => Some(value),
             Err(_) => match std::env::var("MYDB_TEST_MYSQL_KEYCHAIN_ID") {
-                Ok(connection_id) => keyring::Entry::new(
-                    "mydb",
-                    &format!("connection:{connection_id}:db"),
-                )
-                .ok()
-                .and_then(|entry| entry.get_password().ok()),
+                Ok(connection_id) => {
+                    keyring::Entry::new("mydb", &format!("connection:{connection_id}:db"))
+                        .ok()
+                        .and_then(|entry| entry.get_password().ok())
+                }
                 Err(_) => None,
             },
         };

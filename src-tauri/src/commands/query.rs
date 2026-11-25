@@ -1,8 +1,9 @@
-use super::{AppState, connection_read_only, driver_for};
+use super::{AppState, connection_read_only, driver_for, execute_with_cancel, new_operation_id};
 use crate::db::sql_guard;
 use crate::history;
 use crate::models::{QueryResult, ScopeTableColumns, TableInfo};
 use crate::storage;
+use std::time::Instant;
 use tauri::{AppHandle, State};
 
 #[tauri::command]
@@ -46,14 +47,29 @@ pub async fn execute_query(
     connection_id: String,
     sql: String,
     max_rows: Option<usize>,
+    operation_id: Option<String>,
 ) -> Result<QueryResult, String> {
     ensure_query_allowed(&app, &connection_id, &sql)?;
 
     let driver = driver_for(&app, &state, &connection_id).await?;
     let max_rows = max_rows.unwrap_or(1000).clamp(1, 10_000);
+    let operation_id = operation_id.unwrap_or_else(new_operation_id);
 
-    let outcome = driver.execute(&sql, max_rows).await;
-    record_query_history(&app, &connection_id, &sql, &outcome);
+    let mut session = driver.open_session().await?;
+    let started = Instant::now();
+    let outcome = execute_with_cancel(
+        &app,
+        &state,
+        &connection_id,
+        &operation_id,
+        &mut session,
+        &sql,
+        max_rows,
+        driver.as_ref(),
+    )
+    .await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    record_query_history_timed(&app, &connection_id, &sql, elapsed_ms, &outcome);
 
     outcome
 }
@@ -78,6 +94,20 @@ pub(crate) fn record_query_history(
     app: &AppHandle,
     connection_id: &str,
     sql: &str,
+    outcome: &Result<QueryResult, String>,
+) {
+    let elapsed_ms = match outcome {
+        Ok(result) => result.elapsed_ms,
+        Err(_) => 0,
+    };
+    record_query_history_timed(app, connection_id, sql, elapsed_ms, outcome);
+}
+
+pub(crate) fn record_query_history_timed(
+    app: &AppHandle,
+    connection_id: &str,
+    sql: &str,
+    elapsed_ms: u64,
     outcome: &Result<QueryResult, String>,
 ) {
     let connection_name = storage::load_connections(app)
@@ -108,7 +138,7 @@ pub(crate) fn record_query_history(
                 connection_id,
                 &connection_name,
                 sql,
-                0,
+                elapsed_ms,
                 false,
                 Some(error.clone()),
             );

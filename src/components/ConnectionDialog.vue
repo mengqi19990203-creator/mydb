@@ -19,6 +19,7 @@ const emit = defineEmits<{
       config: ConnectionConfig;
       password?: string;
       sshPassword?: string;
+      sshKeyPassphrase?: string;
     },
   ];
 }>();
@@ -45,6 +46,9 @@ const form = reactive<{
   password: string;
   database: string;
   sslMode: SslMode;
+  sslCaPath: string;
+  sslClientCertPath: string;
+  sslClientKeyPath: string;
   savePassword: boolean;
   sshEnabled: boolean;
   sshHost: string;
@@ -52,6 +56,8 @@ const form = reactive<{
   sshUsername: string;
   sshAuth: SshAuth;
   sshKeyPath: string;
+  sshKeyPassphrase: string;
+  saveSshKeyPassphrase: boolean;
   sshPassword: string;
   saveSshPassword: boolean;
   readOnly: boolean;
@@ -68,6 +74,9 @@ const form = reactive<{
   password: "",
   database: "",
   sslMode: "disabled",
+  sslCaPath: "",
+  sslClientCertPath: "",
+  sslClientKeyPath: "",
   savePassword: true,
   sshEnabled: false,
   sshHost: "",
@@ -75,6 +84,8 @@ const form = reactive<{
   sshUsername: "",
   sshAuth: "key",
   sshKeyPath: "",
+  sshKeyPassphrase: "",
+  saveSshKeyPassphrase: true,
   sshPassword: "",
   saveSshPassword: true,
   readOnly: false,
@@ -83,6 +94,7 @@ const form = reactive<{
 const testing = ref(false);
 const testMessage = ref("");
 const error = ref("");
+const keyPassphraseSaved = ref(false);
 
 const passwordPlaceholder = computed(() => {
   if (props.editing?.hasPassword) return "已保存，留空保持不变";
@@ -91,6 +103,12 @@ const passwordPlaceholder = computed(() => {
 
 const sshPasswordPlaceholder = computed(() =>
   props.editing?.hasSshPassword ? "已保存，留空保持不变" : "SSH 密码",
+);
+
+const sshKeyPassphrasePlaceholder = computed(() =>
+  keyPassphraseSaved.value
+    ? "已保存，留空保持不变"
+    : "私钥口令（可选）",
 );
 
 const devLocalCredentials =
@@ -105,6 +123,11 @@ const sshPasswordStorageLabel = computed(() =>
   devLocalCredentials
     ? "保存 SSH 密码到本机凭据文件（开发版）"
     : "保存 SSH 密码到系统钥匙串",
+);
+const keyPassphraseStorageLabel = computed(() =>
+  devLocalCredentials
+    ? "保存私钥口令到本机凭据文件（开发版）"
+    : "保存私钥口令到系统钥匙串",
 );
 
 watch(
@@ -127,6 +150,9 @@ watch(
       form.password = "";
       form.database = editing.database;
       form.sslMode = editing.sslMode;
+      form.sslCaPath = editing.sslCaPath ?? "";
+      form.sslClientCertPath = editing.sslClientCertPath ?? "";
+      form.sslClientKeyPath = editing.sslClientKeyPath ?? "";
       form.savePassword = editing.savePassword;
       form.sshEnabled = editing.sshEnabled;
       form.sshHost = editing.sshHost;
@@ -134,6 +160,9 @@ watch(
       form.sshUsername = editing.sshUsername;
       form.sshAuth = editing.sshAuth;
       form.sshKeyPath = editing.sshKeyPath;
+      form.sshKeyPassphrase = "";
+      form.saveSshKeyPassphrase = editing.saveSshKeyPassphrase;
+      keyPassphraseSaved.value = editing.hasSshKeyPassphrase;
       form.sshPassword = "";
       form.saveSshPassword = editing.saveSshPassword;
       form.readOnly = editing.readOnly;
@@ -150,6 +179,9 @@ watch(
       form.password = "";
       form.database = "";
       form.sslMode = "disabled";
+      form.sslCaPath = "";
+      form.sslClientCertPath = "";
+      form.sslClientKeyPath = "";
       form.savePassword = true;
       form.sshEnabled = false;
       form.sshHost = "";
@@ -157,6 +189,9 @@ watch(
       form.sshUsername = "";
       form.sshAuth = "key";
       form.sshKeyPath = "";
+      form.sshKeyPassphrase = "";
+      form.saveSshKeyPassphrase = true;
+      keyPassphraseSaved.value = false;
       form.sshPassword = "";
       form.saveSshPassword = true;
       form.readOnly = false;
@@ -239,6 +274,9 @@ function toConfig(): ConnectionConfig {
     username: form.username.trim(),
     database: form.database.trim(),
     sslMode: form.sslMode,
+    sslCaPath: form.sslCaPath.trim(),
+    sslClientCertPath: form.sslClientCertPath.trim(),
+    sslClientKeyPath: form.sslClientKeyPath.trim(),
     sshEnabled: form.sshEnabled,
     sshHost: form.sshHost.trim(),
     sshPort: Number(form.sshPort) || 22,
@@ -250,9 +288,14 @@ function toConfig(): ConnectionConfig {
       form.sshEnabled && form.sshAuth === "password"
         ? form.saveSshPassword
         : false,
+    saveSshKeyPassphrase:
+      form.sshEnabled && form.sshAuth === "key"
+        ? form.saveSshKeyPassphrase
+        : false,
     readOnly: form.readOnly,
     hasPassword: props.editing?.hasPassword ?? false,
     hasSshPassword: props.editing?.hasSshPassword ?? false,
+    hasSshKeyPassphrase: keyPassphraseSaved.value,
   };
 }
 
@@ -284,6 +327,29 @@ async function browseKey() {
   if (typeof selected === "string") {
     form.sshKeyPath = selected;
   }
+}
+
+async function browseTlsFile(
+  kind: "ca" | "cert" | "key",
+) {
+  error.value = "";
+  const selected = await openDialog({
+    multiple: false,
+    directory: false,
+    title:
+      kind === "ca"
+        ? "选择 CA 证书"
+        : kind === "cert"
+          ? "选择客户端证书"
+          : "选择客户端私钥",
+    filters: [
+      { name: "证书 / 私钥", extensions: ["pem", "crt", "cer", "key"] },
+    ],
+  });
+  if (typeof selected !== "string") return;
+  if (kind === "ca") form.sslCaPath = selected;
+  else if (kind === "cert") form.sslClientCertPath = selected;
+  else form.sslClientKeyPath = selected;
 }
 
 function validate(): boolean {
@@ -344,12 +410,27 @@ async function test() {
       toConfig(),
       form.password || undefined,
       form.sshPassword || undefined,
+      form.sshKeyPassphrase || undefined,
     );
     testMessage.value = "连接成功";
   } catch (reason) {
     error.value = String(reason);
   } finally {
     testing.value = false;
+  }
+}
+
+async function clearKeyPassphrase() {
+  const id = props.editing?.id;
+  if (!id) return;
+  try {
+    await api.clearConnectionSecret(id, "ssh-key");
+    form.sshKeyPassphrase = "";
+    form.saveSshKeyPassphrase = false;
+    keyPassphraseSaved.value = false;
+    testMessage.value = "已清除保存的私钥口令";
+  } catch (reason) {
+    error.value = String(reason);
   }
 }
 
@@ -361,6 +442,7 @@ function submit() {
     config: toConfig(),
     password: form.password || undefined,
     sshPassword: form.sshPassword || undefined,
+    sshKeyPassphrase: form.sshKeyPassphrase || undefined,
   });
 }
 </script>
@@ -468,8 +550,82 @@ function submit() {
                 <option value="required">
                   {{ form.driver === "redis" ? "必须使用（TLS）" : "必须使用" }}
                 </option>
+                <template v-if="form.driver !== 'redis'">
+                  <option value="verify-ca">验证 CA（verify-ca）</option>
+                  <option value="verify-full">
+                    完整验证（verify-full，含主机名）
+                  </option>
+                </template>
               </select>
             </label>
+            <template
+              v-if="
+                form.driver !== 'redis' &&
+                (form.sslMode === 'verify-ca' ||
+                  form.sslMode === 'verify-full')
+              "
+            >
+              <label class="span-2">
+                CA 证书
+                <div class="file-row">
+                  <input
+                    v-model="form.sslCaPath"
+                    placeholder="/path/to/ca.pem"
+                  />
+                  <button
+                    type="button"
+                    class="button ghost"
+                    @click="browseTlsFile('ca')"
+                  >
+                    选择文件
+                  </button>
+                </div>
+              </label>
+            </template>
+            <template v-if="form.driver !== 'redis' && form.sslMode !== 'disabled'">
+              <label>
+                客户端证书（可选）
+                <div class="file-row">
+                  <input
+                    v-model="form.sslClientCertPath"
+                    placeholder="client-cert.pem"
+                  />
+                  <button
+                    type="button"
+                    class="button ghost"
+                    @click="browseTlsFile('cert')"
+                  >
+                    选择
+                  </button>
+                </div>
+              </label>
+              <label>
+                客户端私钥（可选）
+                <div class="file-row">
+                  <input
+                    v-model="form.sslClientKeyPath"
+                    placeholder="client-key.pem"
+                  />
+                  <button
+                    type="button"
+                    class="button ghost"
+                    @click="browseTlsFile('key')"
+                  >
+                    选择
+                  </button>
+                </div>
+              </label>
+            </template>
+            <p
+              v-if="
+                form.driver !== 'redis' &&
+                form.sshEnabled &&
+                form.sslMode === 'verify-full'
+              "
+              class="hint span-2"
+            >
+              SSH 隧道会把数据库主机名变成 127.0.0.1，verify-full 可能因主机名与证书不匹配而失败；这种情况可先用 verify-ca。
+            </p>
             <label class="checkbox-row span-2">
               <input v-model="form.savePassword" type="checkbox" />
               {{ passwordStorageLabel }}
@@ -546,6 +702,32 @@ function submit() {
                   autocomplete="current-password"
                   :placeholder="sshPasswordPlaceholder"
                 />
+              </label>
+              <label v-if="form.sshAuth === 'key'" class="span-2">
+                SSH 私钥口令
+                <div class="file-row">
+                  <input
+                    v-model="form.sshKeyPassphrase"
+                    type="password"
+                    autocomplete="off"
+                    :placeholder="sshKeyPassphrasePlaceholder"
+                  />
+                  <button
+                    v-if="keyPassphraseSaved"
+                    type="button"
+                    class="button ghost"
+                    @click="clearKeyPassphrase"
+                  >
+                    清除已保存
+                  </button>
+                </div>
+              </label>
+              <label
+                v-if="form.sshAuth === 'key'"
+                class="checkbox-row span-2"
+              >
+                <input v-model="form.saveSshKeyPassphrase" type="checkbox" />
+                {{ keyPassphraseStorageLabel }}
               </label>
               <label
                 v-if="form.sshAuth === 'password'"

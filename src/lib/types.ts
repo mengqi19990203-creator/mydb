@@ -1,5 +1,10 @@
 export type Driver = "sqlite" | "mysql" | "postgres" | "redis";
-export type SslMode = "disabled" | "preferred" | "required";
+export type SslMode =
+  | "disabled"
+  | "preferred"
+  | "required"
+  | "verify-ca"
+  | "verify-full";
 export type SshAuth = "key" | "password";
 
 export interface ConnectionConfig {
@@ -14,6 +19,9 @@ export interface ConnectionConfig {
   username: string;
   database: string;
   sslMode: SslMode;
+  sslCaPath: string;
+  sslClientCertPath: string;
+  sslClientKeyPath: string;
   sshEnabled: boolean;
   sshHost: string;
   sshPort: number;
@@ -22,9 +30,11 @@ export interface ConnectionConfig {
   sshKeyPath: string;
   savePassword: boolean;
   saveSshPassword: boolean;
+  saveSshKeyPassphrase: boolean;
   readOnly: boolean;
   hasPassword: boolean;
   hasSshPassword: boolean;
+  hasSshKeyPassphrase: boolean;
 }
 
 export interface ConnectionGroupInfo {
@@ -58,6 +68,19 @@ export interface QueryResult {
   isQuery: boolean;
 }
 
+export interface CancelQueryResult {
+  cancelled: boolean;
+  message: string;
+}
+
+export interface ExplainResult {
+  driver: Driver;
+  statement: string;
+  explainSql: string;
+  format: "json" | "table" | "text";
+  result: QueryResult;
+}
+
 export interface ColumnInfo {
   name: string;
   dataType: string;
@@ -65,6 +88,7 @@ export interface ColumnInfo {
   primaryKey: boolean;
   autoIncrement: boolean;
   defaultValue: string | null;
+  comment?: string | null;
 }
 
 export interface ScopeTableColumns {
@@ -119,6 +143,417 @@ export interface ErRelation {
 export interface ErDiagram {
   tables: ErTable[];
   relations: ErRelation[];
+}
+
+export interface ImportPreview {
+  columns: string[];
+  rows: string[][];
+  detectedDelimiter: string;
+  format: string;
+}
+
+export interface ImportMapping {
+  source: string;
+  target: string | null;
+}
+
+export interface ImportOptions {
+  delimiter: string | null;
+  hasHeader: boolean;
+  errorMode: "rollback" | "stop" | "skip" | string;
+  emptyAsNull: boolean;
+}
+
+export interface ImportFailure {
+  row: number;
+  message: string;
+}
+
+export interface ImportSummary {
+  inserted: number;
+  failed: number;
+  skipped: number;
+  elapsedMs: number;
+  cancelled: boolean;
+  rolledBack: boolean;
+  failures: ImportFailure[];
+}
+
+export interface ImportProgress {
+  operationId: string | null;
+  processed: number;
+  inserted: number;
+  failed: number;
+  total: number | null;
+  message: string;
+}
+
+export interface DatabaseDocsSnapshot {
+  tables: DocsTable[];
+  failures: DocsFailure[];
+  truncated: boolean;
+}
+
+export interface DocsTable {
+  name: string;
+  kind: string;
+  structure: TableStructure;
+}
+
+export interface DocsFailure {
+  name: string;
+  error: string;
+}
+
+export interface ObjectVariant {
+  id: string;
+  label: string;
+}
+
+export interface ExportObject {
+  kind: string;
+  name: string;
+}
+
+export interface DatabaseExportOptions {
+  includeStructure: boolean;
+  includeData: boolean;
+  includeDrops: boolean;
+  createDatabase: boolean;
+  removeDefiner: boolean;
+  rowsPerInsert: number;
+  useTransaction: boolean;
+}
+
+export interface DatabaseExportProgress {
+  operationId: string | null;
+  phase: string;
+  objectName: string;
+  objectIndex: number;
+  objectTotal: number;
+  rows: number;
+  bytes: number;
+  message: string;
+}
+
+export interface DatabaseExportFailure {
+  kind: string;
+  name: string;
+  message: string;
+}
+
+export interface DatabaseExportSummary {
+  path: string;
+  objectCount: number;
+  tableCount: number;
+  rows: number;
+  bytes: number;
+  failures: DatabaseExportFailure[];
+  warnings: string[];
+}
+
+export interface XlsxExportSummary {
+  path: string;
+  rows: number;
+  sheetName: string;
+  bytes: number;
+}
+
+export interface ScriptOptions {
+  stopOnError: boolean;
+  useTransaction: boolean;
+}
+
+export interface SqlFileStatementPreview {
+  index: number;
+  line: number;
+  preview: string;
+  kind: string;
+}
+
+export interface SqlFileViolation {
+  index: number;
+  line: number;
+  preview: string;
+  message: string;
+}
+
+export interface SqlFilePreview {
+  path: string;
+  bytes: number;
+  statementCount: number;
+  statements: SqlFileStatementPreview[];
+  violationCount: number;
+  violations: SqlFileViolation[];
+  readOnly: boolean;
+}
+
+export interface SqlScriptFailure {
+  index: number;
+  line: number;
+  preview: string;
+  message: string;
+}
+
+export interface SqlScriptSummary {
+  path: string;
+  total: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  rowsAffected: number;
+  elapsedMs: number;
+  rolledBack: boolean;
+  cancelled: boolean;
+  failures: SqlScriptFailure[];
+  notes: string[];
+}
+
+export interface SqlScriptProgress {
+  operationId: string | null;
+  index: number;
+  total: number;
+  line: number;
+  preview: string;
+  status: "running" | "success" | "failed";
+  rowsAffected: number;
+  elapsedMs: number;
+  error: string | null;
+}
+
+export interface TableSort {
+  column: string;
+  direction: "asc" | "desc";
+}
+
+export interface PendingTableChange {
+  kind: "delete" | "update" | "insert";
+  keys: ColumnValue[];
+  changes: ColumnValue[];
+  values: ColumnValue[];
+  singleRow: boolean;
+}
+
+export interface TableChangeResult {
+  applied: number;
+}
+
+export interface SchemaApplyResult {
+  applied: number;
+  total: number;
+  failedAt: number | null;
+  error: string | null;
+  rolledBack: boolean;
+  cancelled: boolean;
+  elapsedMs: number;
+}
+
+export interface SchemaApplyProgress {
+  operationId: string | null;
+  index: number;
+  total: number;
+  preview: string;
+  status: "running" | "success" | "failed";
+  error: string | null;
+}
+
+export interface BackupSchedule {
+  kind: "hourly" | "daily" | "weekly";
+  intervalHours: number;
+  hour: number;
+  minute: number;
+  weekday: number;
+}
+
+export interface BackupJob {
+  id: string;
+  name: string;
+  connectionId: string;
+  connectionName: string;
+  connectionAvailable: boolean;
+  database: string | null;
+  schema: string | null;
+  includeStructure: boolean;
+  includeData: boolean;
+  includeDrops: boolean;
+  tableMode: "all" | "include" | "exclude";
+  tablePattern: string;
+  outputDir: string;
+  filenameTemplate: string;
+  enabled: boolean;
+  schedule: BackupSchedule;
+  retention: number;
+  nextRun: string | null;
+  lastRun: string | null;
+  lastStatus: string | null;
+  lastError: string | null;
+  missed: boolean;
+}
+
+export interface BackupRun {
+  id: string;
+  jobId: string;
+  jobName: string;
+  connectionId: string;
+  connectionName: string;
+  startedAt: string;
+  finishedAt: string;
+  status: "success" | "failed" | "cancelled" | "running" | string;
+  path: string;
+  bytes: number;
+  rows: number;
+  tables: number;
+  error: string | null;
+}
+
+export interface BackupRunSummary {
+  run: BackupRun;
+  nextRun: string | null;
+}
+
+export interface GeneratorColumn {
+  name: string;
+  generator: string;
+  enabled: boolean;
+  nullPercent: number;
+  sequenceStart: number;
+  sequenceStep: number;
+  minNumber: number;
+  maxNumber: number;
+  decimals: number;
+  textMin: number;
+  textMax: number;
+  charset: "alpha" | "numeric" | "alphanumeric" | string;
+  regex: string;
+  dateFrom: string;
+  dateTo: string;
+  boolPercent: number;
+  fixedValue: string;
+}
+
+export interface GenerateRequest {
+  table: string;
+  columns: GeneratorColumn[];
+  count: number;
+  seed: number;
+  batchSize: number;
+  operationId?: string | null;
+}
+
+export interface GeneratePreview {
+  columns: string[];
+  rows: unknown[][];
+  warnings: string[];
+}
+
+export interface GenerateSummary {
+  inserted: number;
+  generated: number;
+  elapsedMs: number;
+  cancelled: boolean;
+}
+
+export interface GenerateProgress {
+  operationId: string | null;
+  phase: string;
+  generated: number;
+  inserted: number;
+  total: number;
+  message: string;
+}
+
+export interface ServerMetric {
+  label: string;
+  value: string;
+}
+
+export interface ServerOverview {
+  driver: string;
+  version: string;
+  currentUser: string;
+  currentDatabase: string;
+  metrics: ServerMetric[];
+  sampledAt: string;
+  maxConnections: number | null;
+  connectionUsagePercent: number | null;
+  databaseSizeBytes: number | null;
+  tableCount: number | null;
+  qps: number | null;
+  cacheHitPercent: number | null;
+  activeSessions: number | null;
+  idleSessions: number | null;
+  topTables: ServerTopTable[];
+}
+
+export interface ServerTopTable {
+  name: string;
+  totalBytes: number;
+  dataBytes: number;
+  indexBytes: number;
+}
+
+export interface ServerUser {
+  name: string;
+  host: string;
+  attributes: ServerMetric[];
+}
+
+export interface ServerUserDetail {
+  name: string;
+  host: string;
+  grants: string[];
+  memberships: string[];
+  privileges: ServerMetric[];
+  notes: string[];
+}
+
+export interface ServerProcess {
+  id: string;
+  user: string;
+  database: string;
+  state: string;
+  timeSeconds: number;
+  info: string;
+}
+
+export interface ScopeSearchHit {
+  database: string | null;
+  schema: string | null;
+  name: string;
+  kind: string;
+  column: string | null;
+  owner: string | null;
+}
+
+export interface TransferTable {
+  sourceTable: string;
+  targetTable: string;
+}
+
+export interface TransferOptions {
+  mode: "append" | "upsert" | "truncate";
+  createMissing: boolean;
+}
+
+export interface TransferFailure {
+  table: string;
+  message: string;
+}
+
+export interface TransferResult {
+  tables: number;
+  rows: number;
+  failures: TransferFailure[];
+  cancelled: boolean;
+}
+
+export interface TransferProgress {
+  operationId: string | null;
+  table: string;
+  tableIndex: number;
+  tableTotal: number;
+  rows: number;
+  message: string;
 }
 
 export interface ColumnChange {
@@ -222,6 +657,22 @@ export interface RedisScanResult {
   keys: RedisKeyEntry[];
   scanned: number;
   truncated: boolean;
+  cursor: number;
+}
+
+export interface RedisHashEntry {
+  field: string;
+  value: string;
+}
+
+export interface RedisListEntry {
+  index: number;
+  value: string;
+}
+
+export interface RedisZsetEntry {
+  member: string;
+  score: number;
 }
 
 export interface RedisKeyDetail {
@@ -230,6 +681,10 @@ export interface RedisKeyDetail {
   ttl: number;
   value: string;
   truncated: boolean;
+  hash: RedisHashEntry[];
+  listEntries: RedisListEntry[];
+  setMembers: string[];
+  zsetEntries: RedisZsetEntry[];
 }
 
 export interface RedisCommandResult {

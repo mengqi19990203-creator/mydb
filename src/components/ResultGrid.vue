@@ -1,15 +1,18 @@
 <script setup lang="ts">
 import {
   computed,
+  nextTick,
   onBeforeUnmount,
   onMounted,
   reactive,
   ref,
   watch,
 } from "vue";
+import CellValueDialog from "./CellValueDialog.vue";
 import Icon from "./Icon.vue";
 import { writeClipboard as copyToClipboard } from "../lib/clipboard";
 import { columnNameIssue, type ResultExportSnapshot } from "../lib/result-export";
+import { useVirtualRows } from "../lib/virtual-rows";
 import { buildRowJson } from "../lib/row-copy";
 import type { QueryResult } from "../lib/types";
 
@@ -50,6 +53,11 @@ const hiddenColumns = reactive(new Set<number>());
 const toast = ref("");
 const sortIndex = ref<number | null>(null);
 const sortDirection = ref<"asc" | "desc">("asc");
+const valueViewer = ref<{
+  rowIndex: number;
+  colIndex: number;
+} | null>(null);
+const scrollRef = ref<HTMLElement | null>(null);
 let resizeState: ResizeState | null = null;
 let toastTimer = 0;
 
@@ -90,6 +98,28 @@ const sortedRows = computed<unknown[][]>(() => {
       direction
     );
   });
+});
+
+const {
+  enabled: virtualEnabled,
+  start: virtualStart,
+  end: virtualEnd,
+  paddingTop: virtualPaddingTop,
+  paddingBottom: virtualPaddingBottom,
+  scrollToTop,
+} = useVirtualRows({
+  container: scrollRef,
+  rowCount: computed(() => sortedRows.value.length),
+  rowHeight: 30,
+  overscan: 10,
+});
+
+const virtualRows = computed(() => {
+  const list = sortedRows.value.slice(virtualStart.value, virtualEnd.value);
+  return list.map((row, offset) => ({
+    row,
+    index: virtualStart.value + offset,
+  }));
 });
 
 function formatCell(value: unknown): string {
@@ -187,14 +217,13 @@ function toggleSort(index: number) {
   if (sortIndex.value !== index) {
     sortIndex.value = index;
     sortDirection.value = "asc";
-    return;
-  }
-  if (sortDirection.value === "asc") {
+  } else if (sortDirection.value === "asc") {
     sortDirection.value = "desc";
-    return;
+  } else {
+    sortIndex.value = null;
+    sortDirection.value = "asc";
   }
-  sortIndex.value = null;
-  sortDirection.value = "asc";
+  scrollToTop();
 }
 
 function openCellMenu(
@@ -210,6 +239,50 @@ function openCellMenu(
     rowIndex,
     colIndex,
   };
+}
+
+const viewerValue = computed<unknown>(() => {
+  const viewer = valueViewer.value;
+  if (!viewer) return null;
+  return sortedRows.value[viewer.rowIndex]?.[viewer.colIndex];
+});
+
+const viewerColumn = computed(() => {
+  const viewer = valueViewer.value;
+  if (!viewer) return "";
+  return props.result?.columns[viewer.colIndex] ?? "";
+});
+
+function openValueViewer(rowIndex: number, colIndex: number) {
+  closeMenus();
+  valueViewer.value = { rowIndex, colIndex };
+}
+
+function openValueFromMenu() {
+  const menu = cellMenu.value;
+  if (!menu) return;
+  openValueViewer(menu.rowIndex, menu.colIndex);
+}
+
+function onCellDoubleClick(rowIndex: number, colIndex: number) {
+  const value = sortedRows.value[rowIndex]?.[colIndex];
+  if (typeof value === "number" || typeof value === "boolean") return;
+  openValueViewer(rowIndex, colIndex);
+}
+
+function closeValueViewer() {
+  const viewer = valueViewer.value;
+  valueViewer.value = null;
+  if (!viewer) return;
+  const row = viewer.rowIndex;
+  const column = viewer.colIndex;
+  void nextTick(() => {
+    scrollRef.value
+      ?.querySelector<HTMLElement>(
+        `[data-cell="${row}:${column}"]`,
+      )
+      ?.focus();
+  });
 }
 
 function openHeaderMenu(event: MouseEvent, colIndex: number) {
@@ -392,12 +465,14 @@ watch(
     toast.value = "";
     sortIndex.value = null;
     sortDirection.value = "asc";
+    valueViewer.value = null;
     for (const key of Object.keys(columnWidths)) {
       delete columnWidths[Number(key)];
     }
     defaultWidths.value = result
       ? result.columns.map((_, index) => estimateColumnWidth(result, index))
       : [];
+    scrollToTop();
   },
   { immediate: true },
 );
@@ -424,7 +499,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="result-grid-wrap">
+  <div ref="scrollRef" class="result-grid-wrap">
     <div v-if="running" class="panel-empty">执行中…</div>
     <div v-else-if="!result" class="panel-empty">
       运行 SQL 后在这里查看结果
@@ -436,7 +511,11 @@ onBeforeUnmount(() => {
       </template>
       <div v-if="result.truncated">结果已截断</div>
     </div>
-    <table v-else class="result-grid resizable-grid">
+    <table
+      v-else
+      class="result-grid resizable-grid"
+      :class="{ virtualized: virtualEnabled }"
+    >
       <colgroup>
         <col style="width: 46px" />
         <col
@@ -486,25 +565,52 @@ onBeforeUnmount(() => {
         </tr>
       </thead>
       <tbody>
-        <tr v-for="(row, rowIndex) in sortedRows" :key="rowIndex">
-          <td class="row-index">{{ rowIndex + 1 }}</td>
+        <tr
+          v-if="virtualEnabled && virtualPaddingTop > 0"
+          class="virtual-spacer"
+          aria-hidden="true"
+        >
+          <td
+            :colspan="visibleColumns.length + 1"
+            :style="{ height: `${virtualPaddingTop}px` }"
+          ></td>
+        </tr>
+        <tr
+          v-for="entry in virtualRows"
+          :key="entry.index"
+          class="data-row"
+        >
+          <td class="row-index">{{ entry.index + 1 }}</td>
           <td
             v-for="column in visibleColumns"
             :key="column.index"
             :class="{
-              null: isNull(row[column.index]),
-              num: typeof row[column.index] === 'number',
+              null: isNull(entry.row[column.index]),
+              num: typeof entry.row[column.index] === 'number',
               'menu-target':
-                cellMenu?.rowIndex === rowIndex &&
+                cellMenu?.rowIndex === entry.index &&
                 cellMenu?.colIndex === column.index,
             }"
-            :title="formatCell(row[column.index])"
+            :title="formatCell(entry.row[column.index])"
+            tabindex="-1"
+            :data-cell="`${entry.index}:${column.index}`"
+            @dblclick="onCellDoubleClick(entry.index, column.index)"
             @contextmenu.prevent="
-              openCellMenu($event, rowIndex, column.index)
+              openCellMenu($event, entry.index, column.index)
             "
           >
-            {{ formatCell(row[column.index]) }}
+            {{ formatCell(entry.row[column.index]) }}
           </td>
+        </tr>
+        <tr
+          v-if="virtualEnabled && virtualPaddingBottom > 0"
+          class="virtual-spacer"
+          aria-hidden="true"
+        >
+          <td
+            :colspan="visibleColumns.length + 1"
+            :style="{ height: `${virtualPaddingBottom}px` }"
+          ></td>
         </tr>
       </tbody>
     </table>
@@ -522,6 +628,11 @@ onBeforeUnmount(() => {
       :style="{ left: cellMenu.x + 'px', top: cellMenu.y + 'px' }"
       @click.stop
     >
+      <button class="context-menu-item" @click="openValueFromMenu">
+        <Icon name="view" :size="14" />
+        查看值…
+      </button>
+      <div class="context-separator"></div>
       <button class="context-menu-item" @click="copyCell">
         <Icon name="copy" :size="14" />
         复制单元格
@@ -605,5 +716,13 @@ onBeforeUnmount(() => {
         导出结果…
       </button>
     </div>
+
+    <CellValueDialog
+      :open="Boolean(valueViewer)"
+      :column="viewerColumn"
+      :row-label="valueViewer ? `第 ${valueViewer.rowIndex + 1} 行` : ''"
+      :value="viewerValue"
+      @close="closeValueViewer"
+    />
   </div>
 </template>

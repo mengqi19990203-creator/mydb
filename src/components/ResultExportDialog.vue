@@ -26,6 +26,7 @@ const emit = defineEmits<{
 const format = ref<ResultExportFormat>("csv");
 const withHeader = ref(true);
 const tableName = ref("");
+const sheetName = ref("QueryResult");
 const error = ref("");
 const writing = ref(false);
 
@@ -64,12 +65,14 @@ const formatExtensions: Record<ResultExportFormat, string> = {
   json: "JSON",
   markdown: "Markdown",
   sql: "SQL",
+  xlsx: "Excel 工作簿",
 };
 
 function reset() {
   format.value = "csv";
   withHeader.value = true;
   tableName.value = "";
+  sheetName.value = "QueryResult";
   error.value = "";
   writing.value = false;
 }
@@ -92,16 +95,18 @@ async function submit() {
   if (!props.snapshot || !canExport.value) return;
   error.value = "";
 
-  let content: string;
-  try {
-    content = buildExportContent(format.value, props.snapshot, {
-      withHeader: withHeader.value,
-      table: tableName.value.trim(),
-      driver: props.driver,
-    });
-  } catch (reason) {
-    error.value = String(reason);
-    return;
+  let content = "";
+  if (format.value !== "xlsx") {
+    try {
+      content = buildExportContent(format.value, props.snapshot, {
+        withHeader: withHeader.value,
+        table: tableName.value.trim(),
+        driver: props.driver,
+      });
+    } catch (reason) {
+      error.value = String(reason);
+      return;
+    }
   }
 
   let path: string | null;
@@ -124,8 +129,19 @@ async function submit() {
 
   writing.value = true;
   try {
-    await api.writeTextFile(path, content);
-    emit("exported", path, props.snapshot.rows.length);
+    if (format.value === "xlsx") {
+      const summary = await api.exportQueryResultXlsx(
+        props.snapshot.columns,
+        props.snapshot.rows,
+        path,
+        sheetName.value.trim() || "QueryResult",
+        withHeader.value,
+      );
+      emit("exported", summary.path, summary.rows);
+    } else {
+      await api.writeTextFile(path, content);
+      emit("exported", path, props.snapshot.rows.length);
+    }
     emit("close");
   } catch (reason) {
     error.value = String(reason);
@@ -184,15 +200,27 @@ onBeforeUnmount(() => {
           <option value="sql" :disabled="Boolean(columnIssue)">
             SQL INSERT
           </option>
+          <option value="xlsx">Excel 工作簿（XLSX）</option>
         </select>
       </div>
 
-      <div v-if="format === 'csv'" class="export-field">
+      <div v-if="format === 'csv' || format === 'xlsx'" class="export-field">
         <span class="export-label">表头</span>
         <label class="export-check">
           <input v-model="withHeader" type="checkbox" />
-          <span>包含表头行</span>
+          <span>包含表头行（加粗并冻结）</span>
         </label>
+      </div>
+
+      <div v-if="format === 'xlsx'" class="export-field">
+        <span class="export-label">工作表</span>
+        <input
+          v-model="sheetName"
+          type="text"
+          placeholder="QueryResult"
+          spellcheck="false"
+          maxlength="31"
+        />
       </div>
 
       <div v-if="format === 'sql'" class="export-field">
@@ -210,6 +238,9 @@ onBeforeUnmount(() => {
       </p>
       <p v-if="format === 'sql'" class="result-export-hint">
         每行生成一条 INSERT 语句，不包含事务；不填表名或列名重复时不可导出。
+      </p>
+      <p v-if="format === 'xlsx'" class="result-export-hint">
+        数字 / 布尔保留原生类型，NULL 为空单元格；以 =、+、-、@ 开头的文本按文本写入，不会执行公式。工作表名会去掉 []:*?/\ 并截断到 31 字符。
       </p>
       <p v-if="columnIssue" class="result-export-warning">{{ columnIssue }}</p>
 

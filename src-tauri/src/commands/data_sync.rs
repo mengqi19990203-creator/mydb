@@ -164,7 +164,9 @@ pub async fn compare_table_data(
         ));
     }
 
-    let limit = max_rows.unwrap_or(DEFAULT_MAX_ROWS).clamp(100, HARD_MAX_ROWS);
+    let limit = max_rows
+        .unwrap_or(DEFAULT_MAX_ROWS)
+        .clamp(100, HARD_MAX_ROWS);
     let order_by = if key_columns.len() == 1 {
         Some(key_columns[0].as_str())
     } else {
@@ -334,13 +336,12 @@ fn build_data_diff(
         ));
     }
 
-    let target_key_auto_increment = key_columns.iter().any(|key| {
-        target.columns[target_index[key.as_str()]].auto_increment
-    });
+    let target_key_auto_increment = key_columns
+        .iter()
+        .any(|key| target.columns[target_index[key.as_str()]].auto_increment);
     if target_key_auto_increment {
         warnings.push(
-            "目标表主键包含自增字段：脚本会显式写入主键值，可能造成自增值 / 序列不同步"
-                .to_string(),
+            "目标表主键包含自增字段：脚本会显式写入主键值，可能造成自增值 / 序列不同步".to_string(),
         );
     }
 
@@ -385,8 +386,7 @@ fn build_data_diff(
     }
     if truncated {
         warnings.push(
-            "比较范围已被截断，建议调高每侧行数上限，或先通过 WHERE / 视图缩小范围"
-                .to_string(),
+            "比较范围已被截断，建议调高每侧行数上限，或先通过 WHERE / 视图缩小范围".to_string(),
         );
         if key_columns.len() > 1 {
             warnings.push(
@@ -796,6 +796,7 @@ mod tests {
             primary_key,
             auto_increment,
             default_value: None,
+            comment: None,
         }
     }
 
@@ -975,11 +976,7 @@ mod tests {
             column("id", "INTEGER", false, true, false),
             column("name", "TEXT", true, false, false),
         ];
-        let source = snapshot(
-            columns.clone(),
-            vec![vec![json!(1), json!("a")]],
-            10,
-        );
+        let source = snapshot(columns.clone(), vec![vec![json!(1), json!("a")]], 10);
         let target = snapshot(
             columns,
             vec![vec![json!(1), json!("a")], vec![json!(2), json!("b")]],
@@ -991,10 +988,11 @@ mod tests {
         assert!(diff.truncated);
         assert_eq!(diff.delete_count, 0);
         assert!(diff.statements.is_empty());
-        assert!(diff
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("跳过 1 条 DELETE")));
+        assert!(
+            diff.warnings
+                .iter()
+                .any(|warning| warning.contains("跳过 1 条 DELETE"))
+        );
     }
 
     #[test]
@@ -1022,15 +1020,17 @@ mod tests {
         assert_eq!(diff.skipped_columns, vec!["payload".to_string()]);
         assert_eq!(diff.source_only_columns, vec!["note".to_string()]);
         assert_eq!(diff.target_only_columns, vec!["extra".to_string()]);
-        assert!(diff
-            .statements
-            .iter()
-            .all(|statement| !statement.contains("payload")));
+        assert!(
+            diff.statements
+                .iter()
+                .all(|statement| !statement.contains("payload"))
+        );
         assert!(!diff.statements.is_empty());
-        assert!(diff
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("BLOB") || warning.contains("二进制")));
+        assert!(
+            diff.warnings
+                .iter()
+                .any(|warning| warning.contains("BLOB") || warning.contains("二进制"))
+        );
     }
 
     #[test]
@@ -1049,10 +1049,7 @@ mod tests {
         assert_eq!(quote_string("O'Reilly\\x", "mysql"), "'O''Reilly\\\\x'");
         assert_eq!(sql_literal(&json!(true), "sqlite"), "1");
         assert_eq!(sql_literal(&json!(true), "postgres"), "TRUE");
-        assert_eq!(
-            sql_literal(&json!({"a": 1}), "postgres"),
-            "'{\"a\":1}'"
-        );
+        assert_eq!(sql_literal(&json!({"a": 1}), "postgres"), "'{\"a\":1}'");
     }
 
     #[test]

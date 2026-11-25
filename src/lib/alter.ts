@@ -5,6 +5,7 @@ export interface ColumnDraft {
   type: string;
   nullable: boolean;
   defaultValue: string;
+  comment?: string;
 }
 
 export interface IndexDraft {
@@ -22,6 +23,10 @@ function quote(name: string, driver: Driver): string {
 
 function normalizedDefault(value: string | null | undefined): string {
   return (value ?? "").trim();
+}
+
+function sqlCommentLiteral(value: string | null | undefined): string {
+  return `'${(value ?? "").replaceAll("\\", "\\\\").replaceAll("'", "''")}'`;
 }
 
 /**
@@ -79,7 +84,19 @@ export function buildColumnStatements(
     let sql = `ALTER TABLE ${tableRef} ADD COLUMN ${quote(name, driver)} ${type}`;
     if (!draft.nullable) sql += " NOT NULL";
     if (draft.defaultValue.trim()) sql += ` DEFAULT ${draft.defaultValue.trim()}`;
-    return [`${sql};`];
+    const statements = [`${sql};`];
+    if (driver === "mysql" && draft.comment?.trim()) {
+      statements[0] = `${sql} COMMENT ${sqlCommentLiteral(
+        draft.comment,
+      )};`;
+    } else if (driver === "postgres" && draft.comment?.trim()) {
+      statements.push(
+        `COMMENT ON COLUMN ${tableRef}.${quote(name, driver)} IS ${sqlCommentLiteral(
+          draft.comment,
+        )};`,
+      );
+    }
+    return statements;
   }
 
   const renamed = name !== existing.name;
@@ -92,8 +109,17 @@ export function buildColumnStatements(
       ? mysqlDefaultLiteral(newDefaultRaw, type) !==
         mysqlDefaultLiteral(oldDefaultRaw, existing.dataType)
       : newDefaultRaw !== oldDefaultRaw;
+  const newComment = draft.comment?.trim() ?? "";
+  const oldComment = (existing.comment ?? "").trim();
+  const commentChanged = driver !== "sqlite" && newComment !== oldComment;
 
-  if (!renamed && !typeChanged && !nullableChanged && !defaultChanged) {
+  if (
+    !renamed &&
+    !typeChanged &&
+    !nullableChanged &&
+    !defaultChanged &&
+    !commentChanged
+  ) {
     return [];
   }
 
@@ -121,6 +147,9 @@ export function buildColumnStatements(
       sql += ` DEFAULT ${mysqlDefaultLiteral(newDefaultRaw, type)}`;
     }
     if (existing.autoIncrement) sql += " AUTO_INCREMENT";
+    if (newComment || oldComment) {
+      sql += ` COMMENT ${sqlCommentLiteral(newComment)}`;
+    }
     return [`${sql};`];
   }
 
@@ -162,6 +191,14 @@ export function buildColumnStatements(
             current,
             driver,
           )} DROP DEFAULT;`,
+    );
+  }
+  if (commentChanged) {
+    statements.push(
+      `COMMENT ON COLUMN ${tableRef}.${quote(
+        current,
+        driver,
+      )} IS ${sqlCommentLiteral(newComment)};`,
     );
   }
   return statements;

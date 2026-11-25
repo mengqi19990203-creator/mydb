@@ -26,6 +26,7 @@ type IconName =
   | "filter"
   | "code"
   | "bolt"
+  | "pin"
   | "clock"
   | "list"
   | "hash"
@@ -38,7 +39,8 @@ type IconName =
   | "diagram"
   | "sync"
   | "target"
-  | "collapse";
+  | "collapse"
+  | "external";
 
 defineProps<{
   name: IconName;
@@ -72,6 +74,9 @@ defineProps<{
     </template>
     <template v-else-if="name === 'bolt'">
       <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z" />
+    </template>
+    <template v-else-if="name === 'pin'">
+      <path d="M9 3h6l-1 5 3 3v1h-5v6.5L12 21l-1-2.5V12H6v-1l3-3-1-5Z" />
     </template>
     <template v-else-if="name === 'view'">
       <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" />
@@ -208,6 +213,10 @@ defineProps<{
     <template v-else-if="name === 'collapse'">
       <path d="M8 4l4 4 4-4M8 20l4-4 4 4" />
       <path d="M4 12h16" />
+    </template>
+    <template v-else-if="name === 'external'">
+      <path d="M14 4h6v6M20 4l-9 9" />
+      <path d="M18 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5" />
     </template>
   </svg>
 </template>

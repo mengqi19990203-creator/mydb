@@ -6,21 +6,38 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import AppMenuBar from "./components/AppMenuBar.vue";
 import CommandPalette from "./components/CommandPalette.vue";
 import ConnectionDialog from "./components/ConnectionDialog.vue";
+import ConnectionTransferDialog from "./components/ConnectionTransferDialog.vue";
+import BackupSettingsDialog from "./components/BackupSettingsDialog.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import CreateTableDialog from "./components/CreateTableDialog.vue";
+import CreateDatabaseDialog from "./components/CreateDatabaseDialog.vue";
+import CreateObjectDialog from "./components/CreateObjectDialog.vue";
+import DangerousSqlDialog from "./components/DangerousSqlDialog.vue";
 import DataSyncDialog from "./components/DataSyncDialog.vue";
+import DataTransferDialog from "./components/DataTransferDialog.vue";
+import DatabaseDocsDialog from "./components/DatabaseDocsDialog.vue";
+import DatabaseExportDialog from "./components/DatabaseExportDialog.vue";
 import DriverIcon from "./components/DriverIcon.vue";
 import ErDiagram from "./components/ErDiagram.vue";
+import GenerateDataDialog from "./components/GenerateDataDialog.vue";
+import GlobalSearchDialog from "./components/GlobalSearchDialog.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
 import Icon from "./components/Icon.vue";
-import ImportDataDialog from "./components/ImportDataDialog.vue";
+import ImportWizardDialog from "./components/ImportWizardDialog.vue";
 import ObjectBrowser from "./components/ObjectBrowser.vue";
+import ObjectSourceDialog from "./components/ObjectSourceDialog.vue";
 import PromptDialog from "./components/PromptDialog.vue";
+import QueryBuilderDialog from "./components/QueryBuilderDialog.vue";
 import QueryWorkspace from "./components/QueryWorkspace.vue";
 import RedisWorkspace from "./components/RedisWorkspace.vue";
 import ResizeHandle from "./components/ResizeHandle.vue";
 import SchemaSyncDialog from "./components/SchemaSyncDialog.vue";
+import ServerActivityDialog from "./components/ServerActivityDialog.vue";
+import SettingsDialog from "./components/SettingsDialog.vue";
 import ShortcutHelpDialog from "./components/ShortcutHelpDialog.vue";
+import SqlFileExecuteDialog from "./components/SqlFileExecuteDialog.vue";
+import SqlFormatSettingsDialog from "./components/SqlFormatSettingsDialog.vue";
+import SqlSnippetDialog from "./components/SqlSnippetDialog.vue";
 import StatusBar from "./components/StatusBar.vue";
 import TableDataView from "./components/TableDataView.vue";
 import TableStructureView from "./components/TableStructureView.vue";
@@ -33,6 +50,12 @@ import {
   type ClosedTabSnapshot,
 } from "./lib/closed-tabs";
 import {
+  findDangerousSql,
+  loadDangerConfirm,
+  saveDangerConfirm,
+  type DangerFinding,
+} from "./lib/dangerous-sql";
+import {
   clearPaletteRecent,
   loadPaletteRecent,
   recordPaletteRecent,
@@ -41,6 +64,7 @@ import {
   type PaletteRecentEntry,
 } from "./lib/command-palette";
 import { readClipboard, writeClipboard } from "./lib/clipboard";
+import { splitSqlStatements } from "./lib/sql-statements";
 import type {
   AppAction,
   MenuBarItem,
@@ -62,6 +86,7 @@ import type {
   ConnectionConfig,
   ConnectionGroupInfo,
   Driver,
+  ExplainResult,
   HistoryEntry,
   QueryResult,
   ScopeTableColumns,
@@ -72,6 +97,7 @@ interface SavePayload {
   config: ConnectionConfig;
   password?: string;
   sshPassword?: string;
+  sshKeyPassphrase?: string;
 }
 
 interface ConnectionGroup {
@@ -211,6 +237,13 @@ interface QueryTab {
   result: QueryResult | null;
   error: string | null;
   running: boolean;
+  operationId: string | null;
+  stopping: boolean;
+  stopNote: string | null;
+  explainResult: ExplainResult | null;
+  explainError: string | null;
+  explainLoading: boolean;
+  showExplain: boolean;
   inTransaction: boolean;
   transactionBusy: boolean;
 }
@@ -277,11 +310,93 @@ let tableSequence = 0;
 let erSequence = 0;
 const tableTabs = ref<TableTab[]>([]);
 const erTabs = ref<ErTab[]>([]);
+const tableDataRefs = new Map<
+  string,
+  {
+    hasPendingChanges: boolean;
+    submitPendingChanges: () => Promise<boolean>;
+    discardPendingChanges: () => void;
+  }
+>();
+
+function setTableDataRef(tabId: string, instance: unknown) {
+  if (instance) {
+    tableDataRefs.set(
+      tabId,
+      instance as {
+        hasPendingChanges: boolean;
+        submitPendingChanges: () => Promise<boolean>;
+        discardPendingChanges: () => void;
+      },
+    );
+  } else {
+    tableDataRefs.delete(tabId);
+  }
+}
 const tabStrip = ref<HTMLElement | null>(null);
 const tabScrollLeft = ref(false);
 const tabScrollRight = ref(false);
 const syncOpen = ref(false);
 const dataSyncOpen = ref(false);
+const dataTransferOpen = ref(false);
+const createObjectOpen = ref(false);
+const connectionTransferOpen = ref(false);
+const globalSearchOpen = ref(false);
+const createObjectKind = ref<"view" | "procedure" | "function" | "trigger">(
+  "view",
+);
+const databaseExportOpen = ref(false);
+const sqlScriptOpen = ref(false);
+const sqlScriptInitialPath = ref<string | null>(null);
+const snippetOpen = ref(false);
+const snippetInitialBody = ref("");
+const formatSettingsOpen = ref(false);
+const settingsOpen = ref(false);
+const queryBuilderOpen = ref(false);
+const databaseDocsOpen = ref(false);
+const dangerousConfirmEnabled = ref(loadDangerConfirm());
+const dangerousSqlRequest = ref<{
+  tabId: string;
+  sql: string;
+  usingSelection: boolean;
+  finding: DangerFinding;
+} | null>(null);
+const dangerousTab = computed(
+  () =>
+    tabs.value.find(
+      (tab) => tab.id === dangerousSqlRequest.value?.tabId,
+    ) ?? null,
+);
+const dangerousConnectionName = computed(
+  () =>
+    connectionFor(dangerousTab.value?.connectionId ?? "")?.name ?? "",
+);
+const dangerousScope = computed(
+  () =>
+    [dangerousTab.value?.database, dangerousTab.value?.schema]
+      .filter(Boolean)
+      .join(" / ") || "当前库 / 模式",
+);
+const objectSource = ref<{ kind: string; name: string } | null>(null);
+const createNamespaceOpen = ref(false);
+const createNamespaceMode = ref<"database" | "schema">("database");
+const createNamespaceRef = ref<InstanceType<typeof CreateDatabaseDialog> | null>(
+  null,
+);
+const generateTarget = ref<{
+  connectionId: string;
+  table: string;
+  tableKind: string;
+} | null>(null);
+const backupSettingsOpen = ref(false);
+const serverActivityOpen = ref(false);
+const databaseExportScope = ref<{
+  connectionId: string;
+  driver: Driver;
+  scopeLabel: string;
+  database?: string;
+  schema?: string | null;
+} | null>(null);
 
 let querySequence = 0;
 
@@ -311,6 +426,13 @@ function createQueryTab(
     result: null,
     error: null,
     running: false,
+    operationId: null,
+    stopping: false,
+    stopNote: null,
+    explainResult: null,
+    explainError: null,
+    explainLoading: false,
+    showExplain: false,
     inTransaction: false,
     transactionBusy: false,
   };
@@ -321,7 +443,40 @@ let tabsRestored = false;
 let pendingRestoredActiveTabId: string | null = null;
 let tabsSaveTimer = 0;
 
-const firstTab = createQueryTab(null);
+/// Standalone query windows are opened from a query tab ("在新窗口打开").
+/// They load the same app shell but keep their own tabs, skip localStorage
+/// persistence, and hide the connection sidebar / object tree.
+const queryWindowParams = new URLSearchParams(window.location.search);
+const standaloneQueryWindow = queryWindowParams.get("window") === "query";
+const standaloneConnectionId = standaloneQueryWindow
+  ? queryWindowParams.get("connectionId")
+  : null;
+const standaloneDatabase = standaloneQueryWindow
+  ? queryWindowParams.get("database")
+  : null;
+const standaloneSchema = standaloneQueryWindow
+  ? queryWindowParams.get("schema")
+  : null;
+
+const firstTab = createQueryTab(
+  standaloneConnectionId,
+  standaloneDatabase,
+  standaloneSchema,
+);
+if (standaloneQueryWindow) {
+  const initialSql = queryWindowParams.get("sql");
+  const initialTitle = queryWindowParams.get("title");
+  if (initialSql) firstTab.sql = initialSql;
+  if (initialTitle) firstTab.title = initialTitle;
+  if (firstTab.connectionId) {
+    if (firstTab.database) {
+      databaseByConnection[firstTab.connectionId] = firstTab.database;
+    }
+    if (firstTab.schema) {
+      schemaByConnection[firstTab.connectionId] = firstTab.schema;
+    }
+  }
+}
 const tabs = ref<QueryTab[]>([firstTab]);
 const activeTabId = ref(firstTab.id);
 /// Session-only LIFO stack for Shift+Mod+T / 文件 → 重新打开关闭的标签.
@@ -334,6 +489,8 @@ const activeTab = computed(
 const queryWorkspaceRef = ref<InstanceType<typeof QueryWorkspace> | null>(
   null,
 );
+const splitQueryWorkspaceRef =
+  ref<InstanceType<typeof QueryWorkspace> | null>(null);
 
 const completionTables = ref<ScopeTableColumns[]>([]);
 const completionRevision = ref(0);
@@ -398,6 +555,64 @@ watch(
 
 const tabOrder = ref<string[]>([firstTab.id]);
 const activeWorkspaceTabId = ref<string>(firstTab.id);
+const PINNED_TABS_KEY = "mydb.pinnedTabs.v1";
+
+function loadPinnedTabs(): string[] {
+  try {
+    const raw = window.localStorage.getItem(PINNED_TABS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+const pinnedTabIds = ref<string[]>(loadPinnedTabs());
+const orderedTabIds = computed(() => {
+  const present = new Set(tabOrder.value);
+  const pinned = pinnedTabIds.value.filter((id) => present.has(id));
+  const pinnedSet = new Set(pinned);
+  return [
+    ...pinned,
+    ...tabOrder.value.filter((id) => !pinnedSet.has(id)),
+  ];
+});
+const dragTabId = ref("");
+const dragOverTabId = ref("");
+const tabOverflowOpen = ref(false);
+const tabOverflowRef = ref<HTMLElement | null>(null);
+const tabOverflowPosition = ref({ left: 0, top: 0 });
+
+function toggleTabOverflow(event: MouseEvent) {
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+  tabOverflowPosition.value = {
+    left: Math.max(8, Math.min(rect.right - 280, window.innerWidth - 296)),
+    top: rect.bottom + 6,
+  };
+  tabOverflowOpen.value = !tabOverflowOpen.value;
+}
+
+watch(
+  pinnedTabIds,
+  (value) => {
+    try {
+      window.localStorage.setItem(PINNED_TABS_KEY, JSON.stringify(value));
+    } catch {
+      // Pin persistence is best-effort.
+    }
+  },
+);
+
+watch(tabOrder, (order) => {
+  const present = new Set(order);
+  const next = pinnedTabIds.value.filter((id) => present.has(id));
+  if (next.length !== pinnedTabIds.value.length) {
+    pinnedTabIds.value = next;
+  }
+});
 
 const activeTableTab = computed(
   () =>
@@ -408,6 +623,113 @@ const activeErTab = computed(
   () =>
     erTabs.value.find((tab) => tab.id === activeWorkspaceTabId.value) ?? null,
 );
+const splitTabId = ref<string | null>(null);
+const splitWidth = ref(520);
+const splitView = computed(() => {
+  const id = splitTabId.value;
+  if (!id) return null;
+  const query = tabs.value.find((tab) => tab.id === id);
+  if (query) return { kind: "query" as const, query };
+  const table = tableTabs.value.find((tab) => tab.id === id);
+  if (table) return { kind: "table" as const, table };
+  const er = erTabs.value.find((tab) => tab.id === id);
+  if (er) return { kind: "er" as const, er };
+  return null;
+});
+
+function setSplitExplainView(value: boolean) {
+  if (splitView.value?.kind === "query") {
+    splitView.value.query.showExplain = value;
+  }
+}
+
+function runSplitQuery(selectedSql?: string) {
+  const view = splitView.value;
+  if (view?.kind === "query") {
+    void runQueryOnTab(view.query, selectedSql);
+  }
+}
+
+function stopSplitQuery() {
+  const view = splitView.value;
+  if (view?.kind === "query") void stopQueryOnTab(view.query);
+}
+
+function explainSplitQuery() {
+  const view = splitView.value;
+  if (view?.kind === "query") {
+    void explainQueryOnTab(
+      view.query,
+      splitQueryWorkspaceRef.value?.currentStatement() ?? "",
+    );
+  }
+}
+
+function updateSplitSql(value: string) {
+  const view = splitView.value;
+  if (view?.kind === "query") view.query.sql = value;
+}
+
+function updateSplitSelection(value: string) {
+  const view = splitView.value;
+  if (view?.kind === "query") view.query.selectedSql = value;
+}
+
+function beginSplitTransaction() {
+  const view = splitView.value;
+  if (view?.kind === "query") void beginTransaction(view.query);
+}
+
+function commitSplitTransaction() {
+  const view = splitView.value;
+  if (view?.kind === "query") void commitTransaction(view.query);
+}
+
+function rollbackSplitTransaction() {
+  const view = splitView.value;
+  if (view?.kind === "query") void rollbackTransaction(view.query);
+}
+
+watch(
+  () => splitTabId.value,
+  (id) => {
+    if (!id) return;
+    if (
+      !tabs.value.some((tab) => tab.id === id) &&
+      !tableTabs.value.some((tab) => tab.id === id) &&
+      !erTabs.value.some((tab) => tab.id === id)
+    ) {
+      splitTabId.value = null;
+    }
+  },
+);
+
+watch(
+  () => [
+    tabs.value.map((tab) => tab.id).join("|"),
+    tableTabs.value.map((tab) => tab.id).join("|"),
+    erTabs.value.map((tab) => tab.id).join("|"),
+  ],
+  () => {
+    const id = splitTabId.value;
+    if (
+      id &&
+      !tabs.value.some((tab) => tab.id === id) &&
+      !tableTabs.value.some((tab) => tab.id === id) &&
+      !erTabs.value.some((tab) => tab.id === id)
+    ) {
+      splitTabId.value = null;
+    }
+  },
+);
+
+// The left workspace is the active tab; showing that same tab on the right
+// would mirror one editor. Close the split when the user activates it.
+watch(activeWorkspaceTabId, (id) => {
+  if (id && splitTabId.value === id) {
+    splitTabId.value = null;
+  }
+});
 const activeTable = computed(() => activeTableTab.value?.table ?? null);
 const activeTableConnectionId = computed(
   () => activeTableTab.value?.connectionId ?? null,
@@ -1052,11 +1374,12 @@ interface WorkspaceTabView {
   running: boolean;
   dirty: boolean;
   closable: boolean;
+  pinned: boolean;
 }
 
 const workspaceTabViews = computed<WorkspaceTabView[]>(() => {
   const views: WorkspaceTabView[] = [];
-  for (const id of tabOrder.value) {
+  for (const id of orderedTabIds.value) {
     const query = tabs.value.find((tab) => tab.id === id);
     if (query) {
       views.push({
@@ -1069,6 +1392,7 @@ const workspaceTabViews = computed<WorkspaceTabView[]>(() => {
         running: query.running,
         dirty: isQueryTabDirty(query),
         closable: true,
+        pinned: pinnedTabIds.value.includes(id),
       });
       continue;
     }
@@ -1084,6 +1408,7 @@ const workspaceTabViews = computed<WorkspaceTabView[]>(() => {
         running: false,
         dirty: false,
         closable: true,
+        pinned: pinnedTabIds.value.includes(id),
       });
       continue;
     }
@@ -1099,6 +1424,7 @@ const workspaceTabViews = computed<WorkspaceTabView[]>(() => {
         running: false,
         dirty: false,
         closable: true,
+        pinned: pinnedTabIds.value.includes(id),
       });
     }
   }
@@ -1149,6 +1475,10 @@ interface StoredQueryTab {
 
 function restoreQueryTabs(list: ConnectionConfig[]) {
   if (tabsRestored) return;
+  if (standaloneQueryWindow) {
+    tabsRestored = true;
+    return;
+  }
   tabsRestored = true;
   try {
     const raw = window.localStorage.getItem(QUERY_TABS_STORAGE_KEY);
@@ -1208,22 +1538,31 @@ function restoreQueryTabs(list: ConnectionConfig[]) {
   }
 }
 
-const queryTabsSnapshot = computed(() =>
-  JSON.stringify({
-    tabs: tabs.value.map((tab) => ({
-      id: tab.id,
-      title: tab.title,
-      connectionId: tab.connectionId,
-      database: tab.database,
-      schema: tab.schema,
-      sql: tab.sql,
-    })),
+const queryTabsSnapshot = computed(() => {
+  const order = new Map(
+    orderedTabIds.value.map((id, index) => [id, index]),
+  );
+  return JSON.stringify({
+    tabs: [...tabs.value]
+      .sort(
+        (left, right) =>
+          (order.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
+          (order.get(right.id) ?? Number.MAX_SAFE_INTEGER),
+      )
+      .map((tab) => ({
+        id: tab.id,
+        title: tab.title,
+        connectionId: tab.connectionId,
+        database: tab.database,
+        schema: tab.schema,
+        sql: tab.sql,
+      })),
     activeTabId: activeTabId.value,
-  }),
-);
+  });
+});
 
 watch(queryTabsSnapshot, (value) => {
-  if (!tabsRestored) return;
+  if (!tabsRestored || standaloneQueryWindow) return;
   window.clearTimeout(tabsSaveTimer);
   tabsSaveTimer = window.setTimeout(() => {
     try {
@@ -1237,6 +1576,7 @@ watch(queryTabsSnapshot, (value) => {
 watch(
   layout,
   () => {
+    if (standaloneQueryWindow) return;
     window.clearTimeout(layoutSaveTimer);
     layoutSaveTimer = window.setTimeout(() => {
       saveWorkspaceLayout(layout);
@@ -1556,6 +1896,13 @@ async function refreshConnections(selectId?: string) {
   activeDatabase.value = connectionDatabase(selectedId.value);
   if (selectedId.value) {
     await refreshTables();
+    if (standaloneQueryWindow && tabs.value.length === 1) {
+      const tab = tabs.value[0];
+      if (tab.connectionId === selectedId.value) {
+        tab.database = activeDatabase.value;
+        tab.schema = activeSchema.value;
+      }
+    }
     const connection = connectionFor(selectedId.value);
     if (connection && connection.driver !== "redis" && tabs.value.length) {
       ensureTabForSource(true);
@@ -1641,6 +1988,15 @@ async function selectDatabase(database: string) {
     status.value = "该连接有未提交事务，请先提交或回滚后再切换数据库";
     return;
   }
+  try {
+    if (await api.connectionHasQueryWindow(connectionId)) {
+      status.value =
+        "该连接有独立查询窗口，请先关闭查询窗口再切换数据库 / 模式";
+      return;
+    }
+  } catch {
+    // The guard is best-effort; the backend still rejects unsafe switches.
+  }
 
   const previous = activeDatabase.value;
   activeDatabase.value = database;
@@ -1682,6 +2038,15 @@ async function selectSchema(schema: string) {
   if (connectionHasTransaction(connectionId)) {
     status.value = "该连接有未提交事务，请先提交或回滚后再切换模式";
     return;
+  }
+  try {
+    if (await api.connectionHasQueryWindow(connectionId)) {
+      status.value =
+        "该连接有独立查询窗口，请先关闭查询窗口再切换数据库 / 模式";
+      return;
+    }
+  } catch {
+    // The guard is best-effort; the backend still rejects unsafe switches.
   }
 
   const previous = activeSchema.value;
@@ -2111,6 +2476,9 @@ function closeQueryTabNow(id: string) {
   if (index < 0) return;
 
   const closing = tabs.value[index];
+  if (closing.running && closing.operationId) {
+    void api.cancelQuery(closing.operationId);
+  }
   if (closing.inTransaction || closing.transactionBusy) {
     void api.closeTransactionSession(id);
   }
@@ -2158,6 +2526,24 @@ function closeQueryTabNow(id: string) {
 function closeTableTab(id: string) {
   const tab = tableTabs.value.find((item) => item.id === id);
   if (!tab) return;
+  const instance = tableDataRefs.get(id);
+  if (instance?.hasPendingChanges) {
+    askConfirm({
+      title: "存在待提交变更",
+      message: `表「${tab.table.name}」有未提交的行变更，关闭标签前需要处理。`,
+      detail: "提交失败会整体回滚并保留变更；放弃后本次修改不可恢复。",
+      confirmText: "提交并关闭",
+      extraText: "放弃并关闭",
+      action: async () => {
+        if (await instance.submitPendingChanges()) closeTableTab(id);
+      },
+      extraAction: () => {
+        instance.discardPendingChanges();
+        closeTableTab(id);
+      },
+    });
+    return;
+  }
   closedTabs.value = pushClosedTab(closedTabs.value, {
     kind: "table",
     tabId: tab.id,
@@ -2281,6 +2667,7 @@ async function handleSave(payload: SavePayload) {
       payload.config,
       payload.password,
       payload.sshPassword,
+      payload.sshKeyPassphrase,
     );
     resetConnectionTransactions(saved.id);
     dialogOpen.value = false;
@@ -2413,6 +2800,16 @@ function menuConnectionNewQuery() {
 }
 
 async function closeConnectionById(connection: ConnectionConfig) {
+  const running = tabs.value.filter(
+    (tab) =>
+      tab.connectionId === connection.id && tab.running && tab.operationId,
+  );
+  if (running.length) {
+    status.value = `正在取消 ${running.length} 个运行中的查询…`;
+    await Promise.allSettled(
+      running.map((tab) => api.cancelQuery(tab.operationId!)),
+    );
+  }
   try {
     await api.closeConnection(connection.id);
     resetConnectionTransactions(connection.id);
@@ -2756,6 +3153,348 @@ async function openErDiagram() {
   await showErTab(tab);
 }
 
+async function openDatabaseExportAt(scope?: {
+  kind: "database" | "schema";
+  name: string;
+}) {
+  const connection = selected.value;
+  if (!connection || connection.driver === "redis") {
+    status.value = "请选择 SQLite / MySQL / PostgreSQL 连接";
+    return;
+  }
+  if (scope) {
+    if (scope.kind === "database" && scope.name !== activeDatabase.value) {
+      await selectDatabase(scope.name);
+      if (activeDatabase.value !== scope.name) return;
+    }
+    if (scope.kind === "schema" && scope.name !== activeSchema.value) {
+      await selectSchema(scope.name);
+      if (activeSchema.value !== scope.name) return;
+    }
+  }
+  if (connectionStatus.value !== "connected") {
+    status.value = connectionError.value || "连接不可用，请先刷新对象";
+    return;
+  }
+  const database =
+    normalizeScopeValue(activeDatabase.value) ??
+    normalizeScopeValue(connection.database);
+  const schema = normalizeScopeValue(activeSchema.value);
+  databaseExportScope.value = {
+    connectionId: connection.id,
+    driver: connection.driver,
+    scopeLabel:
+      connection.driver === "sqlite"
+        ? "main"
+        : [database, connection.driver === "postgres" ? schema : null]
+            .filter(Boolean)
+            .join(" · ") || connection.database || connection.name,
+    database: database ?? undefined,
+    schema,
+  };
+  databaseExportOpen.value = true;
+}
+
+function handleDatabaseExported(count: number) {
+  status.value = `已导出数据库 SQL · ${count} 个对象`;
+}
+
+async function handleConnectionsImported(count: number) {
+  await refreshConnections();
+  status.value = `已导入 ${count} 个连接；密码需要在连接编辑框中重新填写`;
+}
+
+function handleSchemaSyncApplied() {
+  void refreshTables();
+  status.value = "结构同步已应用到目标，已刷新对象树";
+}
+
+function handleTransferred() {
+  void refreshTables();
+  status.value = "数据传输完成";
+}
+
+function openSqlScriptDialog() {
+  const connection = selected.value;
+  if (!connection || connection.driver === "redis") {
+    status.value = "请选择 SQLite / MySQL / PostgreSQL 连接";
+    return;
+  }
+  sqlScriptInitialPath.value = null;
+  sqlScriptOpen.value = true;
+}
+
+function openSnippetLibrary() {
+  if (!canEditSql.value) {
+    status.value = "请先切换到查询标签";
+    return;
+  }
+  snippetInitialBody.value = "";
+  snippetOpen.value = true;
+}
+
+function openSnippetSave(text: string) {
+  if (!canEditSql.value) return;
+  if (!text.trim()) {
+    status.value = "请先选中 SQL 或把光标放到一条语句中";
+    return;
+  }
+  snippetInitialBody.value = text;
+  snippetOpen.value = true;
+}
+
+function insertSnippetText(text: string) {
+  queryWorkspaceRef.value?.insertSnippet(text);
+  status.value = "已插入 SQL 片段（未执行）";
+}
+
+function openFormatSettings() {
+  formatSettingsOpen.value = true;
+}
+
+function handleFormatSettingsSaved() {
+  status.value = "格式化设置已保存";
+}
+
+async function restoreBackupFile(path: string, connectionId: string) {
+  const connection = connections.value.find((item) => item.id === connectionId);
+  if (!connection) {
+    status.value = "备份对应的连接已删除，无法恢复";
+    return;
+  }
+  backupSettingsOpen.value = false;
+  if (selectedId.value !== connectionId) {
+    await selectConnection(connectionId);
+  }
+  sqlScriptInitialPath.value = path;
+  sqlScriptOpen.value = true;
+}
+
+const serverActivityReason = computed(() => {
+  if (!selected.value) return "请先选择连接";
+  if (selected.value.driver !== "mysql" && selected.value.driver !== "postgres") {
+    return "仅 MySQL / PostgreSQL 支持服务器活动";
+  }
+  return "";
+});
+
+function openServerActivity() {
+  if (serverActivityReason.value) return;
+  serverActivityOpen.value = true;
+}
+
+function openGlobalSearch() {
+  if (!selected.value || isRedisConnection.value) {
+    status.value = "请选择 SQLite / MySQL / PostgreSQL 连接";
+    return;
+  }
+  globalSearchOpen.value = true;
+}
+
+async function chooseGlobalSearchHit(hit: {
+  database: string | null;
+  schema: string | null;
+  name: string;
+  kind: string;
+  column: string | null;
+  owner: string | null;
+}) {
+  globalSearchOpen.value = false;
+  if (hit.database && hit.database !== activeDatabase.value) {
+    await selectDatabase(hit.database);
+    if (activeDatabase.value !== hit.database) return;
+  }
+  if (hit.schema && hit.schema !== activeSchema.value) {
+    await selectSchema(hit.schema);
+    if (activeSchema.value !== hit.schema) return;
+  }
+  if (hit.kind === "column" && hit.owner) {
+    const known = tables.value.find((table) => table.name === hit.owner);
+    await openTableTabAt(
+      { name: hit.owner, kind: known?.kind ?? "table" },
+      "data",
+    );
+    status.value = `已打开字段 ${hit.name} 所属表 ${hit.owner}`;
+    return;
+  }
+  if (["table", "view", "matview"].includes(hit.kind)) {
+    await openTableTabAt(
+      { name: hit.name, kind: hit.kind },
+      hit.kind === "table" ? "data" : "structure",
+    );
+    status.value = `已打开 ${hit.kind}：${hit.name}`;
+    return;
+  }
+  status.value = `已找到 ${hit.kind}：${hit.name}（请在对象树中查看）`;
+}
+
+function openObjectDefinition(table: { kind: string; name: string }) {
+  objectSource.value = { kind: table.kind, name: table.name };
+}
+
+function handleObjectDefinitionSaved() {
+  void refreshTables();
+  status.value = "对象定义已保存";
+}
+
+function openGenerateData(payload: {
+  connectionId: string;
+  table: string;
+  tableKind: string;
+}) {
+  if (!payload.table || payload.tableKind !== "table") {
+    status.value = "只有表支持生成测试数据";
+    return;
+  }
+  generateTarget.value = payload;
+}
+
+function handleGeneratedData(count: number) {
+  void refreshTables();
+  status.value = `已生成并写入 ${count} 行测试数据`;
+}
+
+function openCreateNamespace(kind: "database" | "schema") {
+  if (!selected.value || selected.value.driver === "redis") return;
+  if (selected.value.readOnly) {
+    status.value = "当前连接为只读模式，无法创建数据库或模式";
+    return;
+  }
+  if (kind === "schema" && selected.value.driver !== "postgres") {
+    status.value = "仅 PostgreSQL 支持创建模式";
+    return;
+  }
+  createNamespaceMode.value = kind;
+  createNamespaceOpen.value = true;
+}
+
+async function handleCreateNamespace(payload: {
+  name: string;
+  charset: string | null;
+  collation: string | null;
+  switchAfter: boolean;
+}) {
+  const connection = selected.value;
+  const connectionId = selectedId.value;
+  if (!connection || !connectionId) return;
+  try {
+    if (createNamespaceMode.value === "schema") {
+      await api.createSchema(connectionId, payload.name);
+      createNamespaceOpen.value = false;
+      await refreshTables();
+      await selectSchema(payload.name);
+      status.value = `已创建模式：${payload.name}`;
+      return;
+    }
+    await api.createDatabase(
+      connectionId,
+      payload.name,
+      payload.charset,
+      payload.collation,
+    );
+    createNamespaceOpen.value = false;
+    await refreshTables();
+    if (connection.driver === "mysql") {
+      if (payload.switchAfter) {
+        await selectDatabase(payload.name);
+      }
+      status.value = `已创建数据库：${payload.name}${
+        payload.switchAfter ? "（已切换）" : ""
+      }`;
+    } else {
+      status.value = `已创建数据库：${payload.name}；需要切换或重新连接后才能浏览`;
+    }
+  } catch (reason) {
+    createNamespaceRef.value?.setError(String(reason));
+  }
+}
+
+function dropNamespace(kind: "database" | "schema", name: string) {
+  const connection = selected.value;
+  const connectionId = selectedId.value;
+  if (!connection || !connectionId) return;
+  if (connection.readOnly) {
+    status.value = "当前连接为只读模式，无法删除数据库或模式";
+    return;
+  }
+  const current =
+    kind === "database" ? name === activeDatabase.value : name === activeSchema.value;
+  askConfirm({
+    title: kind === "database" ? "删除数据库" : "删除模式",
+    message: `确定删除${kind === "database" ? "数据库" : "模式"}「${name}」？此操作不可恢复。`,
+    detail: current
+      ? "该对象正在使用；删除后会自动切换到安全默认对象。不会执行 CASCADE。"
+      : "不会删除其中的连接、表或数据文件；非空对象可能被数据库拒绝。",
+    confirmText: "删除",
+    danger: true,
+    action: async () => {
+      try {
+        if (kind === "database") {
+          await api.dropDatabase(connectionId, name);
+        } else {
+          await api.dropSchema(connectionId, name);
+        }
+        await refreshTables();
+        status.value = `已删除${kind === "database" ? "数据库" : "模式"}：${name}`;
+      } catch (reason) {
+        status.value = `删除失败: ${reason}`;
+      }
+    },
+  });
+}
+
+function openCreateObject(
+  kind: "view" | "procedure" | "function" | "trigger",
+) {
+  if (!selected.value || isRedisConnection.value) return;
+  if (selected.value.readOnly) {
+    status.value = "当前连接为只读模式，无法创建对象";
+    return;
+  }
+  if (
+    selected.value.driver === "sqlite" &&
+    (kind === "procedure" || kind === "function")
+  ) {
+    status.value = "SQLite 不支持存储过程或函数";
+    return;
+  }
+  createObjectKind.value = kind;
+  createObjectOpen.value = true;
+}
+
+async function handleObjectCreated(payload: {
+  kind: "view" | "procedure" | "function" | "trigger";
+  name: string;
+}) {
+  createObjectOpen.value = false;
+  await refreshTables();
+  if (payload.kind === "view") {
+    await openTableTabAt(
+      { name: payload.name, kind: "view" },
+      "structure",
+    );
+  }
+  status.value = `已创建${payload.kind === "view" ? "视图" : payload.kind === "procedure" ? "存储过程" : payload.kind === "function" ? "函数" : "触发器"}：${payload.name}`;
+}
+
+async function handleSqlScriptExecuted(summary: {
+  failed: number;
+  cancelled: boolean;
+  rolledBack: boolean;
+}) {
+  await refreshTables();
+  await loadHistory();
+  if (summary.cancelled) {
+    status.value = "SQL 脚本执行已取消";
+  } else if (summary.failed > 0) {
+    status.value = summary.rolledBack
+      ? `SQL 脚本执行失败，已回滚 · ${summary.failed} 条失败`
+      : `SQL 脚本执行完成 · ${summary.failed} 条失败`;
+  } else {
+    status.value = "SQL 脚本执行完成";
+  }
+}
+
 function openTableStructure(table: TableInfo) {
   void openTableTabAt(table, "structure");
 }
@@ -2763,6 +3502,24 @@ function openTableStructure(table: TableInfo) {
 function setTableMode(mode: "data" | "structure") {
   const tab = activeTableTab.value;
   if (!tab) return;
+  const instance = tableDataRefs.get(tab.id);
+  if (mode === "structure" && instance?.hasPendingChanges) {
+    askConfirm({
+      title: "存在待提交变更",
+      message: `表「${tab.table.name}」有未提交的行变更，切换视图前需要处理。`,
+      detail: "提交失败会整体回滚并保留变更；放弃后本次修改不可恢复。",
+      confirmText: "提交并切换",
+      extraText: "放弃并切换",
+      action: async () => {
+        if (await instance.submitPendingChanges()) setTableMode(mode);
+      },
+      extraAction: () => {
+        instance.discardPendingChanges();
+        setTableMode(mode);
+      },
+    });
+    return;
+  }
   tab.mode = mode;
   if (mode !== "structure") {
     tab.focusedIndex = null;
@@ -2886,32 +3643,72 @@ function handleSqlSelection(value: string) {
 
 async function runQuery(selectedSql?: string) {
   const tab = activeTab.value;
+  if (tab) await runQueryOnTab(tab, selectedSql);
+}
+
+async function runQueryOnTab(tab: QueryTab, selectedSql?: string) {
   if (!tab || tab.running) return;
   if (!tab.connectionId) {
     status.value = "请先选择一个数据库连接";
     return;
   }
-  if (connectionStatus.value !== "connected") {
+  if (tab.id === activeTabId.value && connectionStatus.value !== "connected") {
     status.value = connectionError.value || "连接不可用，请先刷新对象";
     return;
   }
 
-  const tabId = tab.id;
-  const connectionId = tab.connectionId;
   const candidate = (selectedSql !== undefined ? selectedSql : tab.selectedSql) ?? "";
   const usingSelection = candidate.trim().length > 0;
   const sqlText = usingSelection ? candidate : tab.sql;
+  if (dangerousConfirmEnabled.value) {
+    const finding = findDangerousSql(sqlText);
+    if (finding) {
+      dangerousSqlRequest.value = {
+        tabId: tab.id,
+        sql: sqlText,
+        usingSelection,
+        finding,
+      };
+      status.value = "危险 SQL：请确认后执行";
+      return;
+    }
+  }
+  await executeSqlOnTab(tab, sqlText, usingSelection);
+}
+
+async function executeSqlOnTab(
+  tab: QueryTab,
+  sqlText: string,
+  usingSelection: boolean,
+) {
+  const tabId = tab.id;
+  const connectionId = tab.connectionId;
+  if (!connectionId) return;
+  const operationId = newOperationId();
   tab.running = true;
+  tab.operationId = operationId;
+  tab.stopping = false;
+  tab.stopNote = null;
   tab.error = null;
+  tab.explainResult = null;
+  tab.explainError = null;
+  tab.explainLoading = false;
+  tab.showExplain = false;
   status.value = usingSelection ? "执行选中 SQL…" : "执行中…";
 
   try {
     const queryResult = tab.inTransaction
-      ? await api.executeTransactionQuery(connectionId, tabId, sqlText)
-      : await api.executeQuery(connectionId, sqlText);
+      ? await api.executeTransactionQuery(
+          connectionId,
+          tabId,
+          sqlText,
+          1000,
+          operationId,
+        )
+      : await api.executeQuery(connectionId, sqlText, 1000, operationId);
     if (!tabs.value.some((item) => item.id === tabId)) return;
     tab.result = queryResult;
-    if (activeTabId.value === tabId) {
+    if (activeTabId.value === tabId || splitTabId.value === tabId) {
       status.value = queryResult.isQuery
         ? `${queryResult.rows.length} 行 · ${queryResult.elapsedMs} ms${
             queryResult.truncated ? " · 已截断" : ""
@@ -2924,26 +3721,153 @@ async function runQuery(selectedSql?: string) {
     if (!tabs.value.some((item) => item.id === tabId)) return;
     tab.result = null;
     tab.error = String(reason);
-    if (activeTabId.value === tabId) {
-      status.value = "查询失败";
+    if (activeTabId.value === tabId || splitTabId.value === tabId) {
+      status.value = tab.error.startsWith("查询超时")
+        ? "查询已超时"
+        : tab.error === "已取消"
+          ? "已取消"
+          : "查询失败";
     }
   } finally {
     tab.running = false;
+    tab.stopping = false;
+    tab.operationId = null;
+    tab.stopNote = null;
   }
 }
 
-async function beginTransaction() {
+function confirmDangerousSql() {
+  const request = dangerousSqlRequest.value;
+  dangerousSqlRequest.value = null;
+  if (!request) return;
+  const tab = tabs.value.find((item) => item.id === request.tabId);
+  if (!tab) return;
+  void executeSqlOnTab(tab, request.sql, request.usingSelection);
+}
+
+function cancelDangerousSql() {
+  dangerousSqlRequest.value = null;
+  status.value = "已取消执行危险 SQL";
+}
+
+function toggleDangerousConfirm() {
+  dangerousConfirmEnabled.value = !dangerousConfirmEnabled.value;
+  saveDangerConfirm(dangerousConfirmEnabled.value);
+  status.value = dangerousConfirmEnabled.value
+    ? "已开启危险 SQL 二次确认"
+    : "已关闭危险 SQL 二次确认";
+}
+
+function newOperationId(): string {
+  return (
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  );
+}
+
+async function stopActiveQuery() {
   const tab = activeTab.value;
+  if (tab) await stopQueryOnTab(tab);
+}
+
+async function stopQueryOnTab(tab: QueryTab) {
+  if (!tab.running || !tab.operationId || tab.stopping) return;
+  const operationId = tab.operationId;
+  tab.stopping = true;
+  tab.stopNote = null;
+  status.value = "停止中…";
+  try {
+    const result = await api.cancelQuery(operationId);
+    if (
+      activeTabId.value === tab.id ||
+      splitTabId.value === tab.id
+    ) {
+      if (result.cancelled) {
+        status.value = result.message;
+      } else {
+        tab.stopNote = result.message;
+        status.value = result.message;
+      }
+    }
+  } catch (reason) {
+    if (
+      activeTabId.value === tab.id ||
+      splitTabId.value === tab.id
+    ) {
+      status.value = `停止失败: ${reason}`;
+    }
+  }
+}
+
+function setExplainView(value: boolean) {
+  if (activeTab.value) activeTab.value.showExplain = value;
+}
+
+async function explainQuery() {
+  const tab = activeTab.value;
+  if (!tab) return;
+  await explainQueryOnTab(
+    tab,
+    queryWorkspaceRef.value?.currentStatement() ?? "",
+  );
+}
+
+async function explainQueryOnTab(tab: QueryTab, rawStatement: string) {
+  if (!tab || tab.running) return;
+  if (!tab.connectionId) {
+    status.value = "请先选择一个数据库连接";
+    return;
+  }
+  if (tab.id === activeTabId.value && connectionStatus.value !== "connected") {
+    status.value = connectionError.value || "连接不可用，请先刷新对象";
+    return;
+  }
+  const statement = rawStatement.trim();
+  if (!statement) {
+    status.value = "请把光标放到要解释的语句，或先选中一条 SQL";
+    return;
+  }
+  if (splitSqlStatements(statement).length > 1) {
+    status.value = "一次只能解释一条语句，请先选中单条 SQL";
+    return;
+  }
+  const driver = driverForConnection(tab.connectionId);
+  if (!driver) return;
+  const tabId = tab.id;
+  tab.explainLoading = true;
+  tab.running = true;
+  tab.explainError = null;
+  tab.showExplain = true;
+  status.value = "正在生成执行计划…";
+  try {
+    const plan = await api.explainQuery(tab.connectionId, statement);
+    if (!tabs.value.some((item) => item.id === tabId)) return;
+    tab.explainResult = plan;
+    status.value = `执行计划 · ${plan.driver} · ${plan.format} · ${plan.result.rows.length} 行`;
+  } catch (reason) {
+    if (!tabs.value.some((item) => item.id === tabId)) return;
+    tab.explainError = String(reason);
+    status.value = "生成执行计划失败";
+  } finally {
+    if (tabs.value.some((item) => item.id === tabId)) {
+      tab.explainLoading = false;
+      tab.running = false;
+    }
+  }
+}
+
+async function beginTransaction(target?: QueryTab) {
+  const tab = target ?? activeTab.value;
   if (!tab || tab.inTransaction || tab.transactionBusy) return;
   if (!tab.connectionId) {
     status.value = "请先选择一个数据库连接";
     return;
   }
-  if (isRedisConnection.value) {
+  if (connectionFor(tab.connectionId)?.driver === "redis") {
     status.value = "Redis 连接不支持事务";
     return;
   }
-  if (connectionStatus.value !== "connected") {
+  if (tab.id === activeTabId.value && connectionStatus.value !== "connected") {
     status.value = connectionError.value || "连接不可用，请先刷新对象";
     return;
   }
@@ -2959,8 +3883,8 @@ async function beginTransaction() {
   }
 }
 
-async function commitTransaction() {
-  const tab = activeTab.value;
+async function commitTransaction(target?: QueryTab) {
+  const tab = target ?? activeTab.value;
   if (!tab || !tab.inTransaction || tab.transactionBusy || !tab.connectionId) {
     return;
   }
@@ -2976,8 +3900,8 @@ async function commitTransaction() {
   }
 }
 
-async function rollbackTransaction() {
-  const tab = activeTab.value;
+async function rollbackTransaction(target?: QueryTab) {
+  const tab = target ?? activeTab.value;
   if (!tab || !tab.inTransaction || tab.transactionBusy || !tab.connectionId) {
     return;
   }
@@ -3160,18 +4084,22 @@ function onWindowMouseDown(event: MouseEvent) {
   if (tabMenu.value && !tabMenuRef.value?.contains(target)) {
     closeTabMenu();
   }
+  if (
+    tabOverflowOpen.value &&
+    !tabOverflowRef.value?.contains(target)
+  ) {
+    tabOverflowOpen.value = false;
+  }
   if (!appContextMenu.value) return;
   if (appMenuRef.value?.contains(target)) return;
   closeAppContextMenu();
 }
 
 function cycleQueryTab(direction: number) {
-  if (tabOrder.value.length < 2) return;
-  const index = tabOrder.value.indexOf(activeWorkspaceTabId.value);
-  const next =
-    tabOrder.value[
-      (index + direction + tabOrder.value.length) % tabOrder.value.length
-    ];
+  const order = orderedTabIds.value;
+  if (order.length < 2) return;
+  const index = order.indexOf(activeWorkspaceTabId.value);
+  const next = order[(index + direction + order.length) % order.length];
   void activateWorkspaceTabById(next);
 }
 
@@ -3224,6 +4152,59 @@ function onWindowKeydown(event: KeyboardEvent) {
   if (event.ctrlKey && !event.metaKey && event.key === "Tab") {
     event.preventDefault();
     cycleQueryTab(event.shiftKey ? -1 : 1);
+    return;
+  }
+  const primaryModifier = isMacPlatform ? event.metaKey : event.ctrlKey;
+  if (
+    primaryModifier &&
+    !event.altKey &&
+    !event.shiftKey &&
+    event.key === "," &&
+    !event.repeat
+  ) {
+    if (!hasOpenModal.value) {
+      event.preventDefault();
+      settingsOpen.value = true;
+    }
+    return;
+  }
+  if (
+    primaryModifier &&
+    event.shiftKey &&
+    !event.altKey &&
+    event.key.toLowerCase() === "f" &&
+    !event.repeat
+  ) {
+    if (!hasOpenModal.value) {
+      event.preventDefault();
+      runSqlEditorCommand("format-sql");
+    }
+    return;
+  }
+  if (
+    primaryModifier &&
+    event.shiftKey &&
+    !event.altKey &&
+    event.key.toLowerCase() === "k" &&
+    !event.repeat
+  ) {
+    if (!hasOpenModal.value) {
+      event.preventDefault();
+      openSnippetLibrary();
+    }
+    return;
+  }
+  if (
+    primaryModifier &&
+    !event.altKey &&
+    !event.shiftKey &&
+    event.key === "." &&
+    !event.repeat
+  ) {
+    if (!hasOpenModal.value) {
+      event.preventDefault();
+      void stopActiveQuery();
+    }
     return;
   }
   const modifier = isMacPlatform ? event.metaKey : event.ctrlKey;
@@ -3322,6 +4303,10 @@ function onWindowKeydown(event: KeyboardEvent) {
   if (event.key === "Escape") {
     if (tabMenu.value) {
       closeTabMenu();
+      return;
+    }
+    if (tabOverflowOpen.value) {
+      tabOverflowOpen.value = false;
       return;
     }
     if (shortcutHelpOpen.value) {
@@ -3595,13 +4580,175 @@ function closeTabMenu() {
   tabMenu.value = null;
 }
 
+function openSplitView(id: string) {
+  closeTabMenu();
+  let query = tabs.value.find((tab) => tab.id === id);
+  let table = tableTabs.value.find((tab) => tab.id === id);
+  let er = erTabs.value.find((tab) => tab.id === id);
+  if (!query && !table && !er) {
+    status.value = "没有可用的分屏标签";
+    return;
+  }
+  const connectionId = query?.connectionId ?? table?.connectionId ?? er?.connectionId;
+  const connection = connectionId ? connectionFor(connectionId) : null;
+  if (connectionId && connectionId !== selectedId.value) {
+    status.value = "分屏标签必须来自当前连接";
+    return;
+  }
+  if (connection && (connection.driver === "mysql" || connection.driver === "postgres")) {
+    const database = normalizeScopeValue(
+      query?.database ?? table?.database ?? er?.database ?? activeDatabase.value,
+    );
+    const schema = normalizeScopeValue(
+      query?.schema ?? table?.schema ?? er?.schema ?? activeSchema.value,
+    );
+    if (
+      database !== normalizeScopeValue(activeDatabase.value) ||
+      schema !== normalizeScopeValue(activeSchema.value)
+    ) {
+      status.value = "分屏标签必须与当前库 / 模式一致";
+      return;
+    }
+  }
+  let created = false;
+  if (query && query.id === activeTabId.value && table === undefined && er === undefined) {
+    // 分屏同一个查询标签只会镜像同一份 SQL 与结果；为右侧复制一个新查询
+    // 标签，让左右两侧可以独立编辑和执行，形成真正的双查询分屏。
+    const tab = createQueryTab(
+      query.connectionId,
+      query.database,
+      query.schema,
+    );
+    tab.sql = query.sql;
+    tabs.value.push(tab);
+    tabOrder.value.push(tab.id);
+    query = tab;
+    id = tab.id;
+    created = true;
+  }
+  splitTabId.value = id;
+  historyOpen.value = false;
+  status.value = created
+    ? "已在右侧新建查询分屏（同一连接与库 / 模式）"
+    : query !== undefined
+      ? "已打开右侧查询分屏（同一连接与库 / 模式）"
+      : "已打开右侧分屏（只读浏览）";
+}
+
+function closeSplitView() {
+  splitTabId.value = null;
+  status.value = "已关闭右侧分屏";
+}
+
+const tabMenuQueryTab = computed(() => {
+  const menu = tabMenu.value;
+  if (!menu) return null;
+  return tabs.value.find((tab) => tab.id === menu.tabId) ?? null;
+});
+
+async function openQueryInNewWindow(tabId: string) {
+  closeTabMenu();
+  const tab = tabs.value.find((item) => item.id === tabId);
+  if (!tab) {
+    status.value = "没有可用的查询标签";
+    return;
+  }
+  if (tab.connectionId !== selectedId.value) {
+    status.value = "请先在主窗口选择该标签的连接，再打开新窗口";
+    return;
+  }
+  const connection = tab.connectionId
+    ? connectionFor(tab.connectionId)
+    : null;
+  if (
+    connection &&
+    (connection.driver === "mysql" || connection.driver === "postgres")
+  ) {
+    const database = normalizeScopeValue(
+      tab.database ?? activeDatabase.value,
+    );
+    const schema = normalizeScopeValue(tab.schema ?? activeSchema.value);
+    if (
+      database !== normalizeScopeValue(activeDatabase.value) ||
+      schema !== normalizeScopeValue(activeSchema.value)
+    ) {
+      status.value = "请先切换到该标签的库 / 模式，再打开独立查询窗口";
+      return;
+    }
+  }
+  try {
+    await api.openQueryWindow({
+      title: tab.title,
+      connectionId: tab.connectionId,
+      database: tab.database,
+      schema: tab.schema,
+      sql: tab.sql,
+    });
+    status.value = `已在新窗口打开 ${tab.title}`;
+  } catch (reason) {
+    status.value = String(reason);
+  }
+}
+
+function startTabDrag(event: DragEvent, id: string) {
+  dragTabId.value = id;
+  dragOverTabId.value = "";
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", id);
+  }
+}
+
+function markTabDragOver(event: DragEvent, id: string) {
+  if (!dragTabId.value || dragTabId.value === id) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+  dragOverTabId.value = id;
+}
+
+function finishTabDrag() {
+  dragTabId.value = "";
+  dragOverTabId.value = "";
+}
+
+function dropTab(event: DragEvent, targetId: string) {
+  event.preventDefault();
+  const sourceId = dragTabId.value;
+  finishTabDrag();
+  if (!sourceId || sourceId === targetId) return;
+  if (isTabPinned(sourceId) !== isTabPinned(targetId)) {
+    status.value = "固定标签与普通标签不能跨组拖动";
+    return;
+  }
+  const order = [...orderedTabIds.value];
+  const from = order.indexOf(sourceId);
+  const to = order.indexOf(targetId);
+  if (from < 0 || to < 0) return;
+  order.splice(from, 1);
+  const insertAt = order.indexOf(targetId);
+  order.splice(insertAt < 0 ? order.length : insertAt, 0, sourceId);
+  const pinned = order.filter((id) => isTabPinned(id));
+  const rest = order.filter((id) => !isTabPinned(id));
+  pinnedTabIds.value = pinned;
+  tabOrder.value = [...pinned, ...rest];
+  status.value = "已调整标签顺序";
+}
+
 const tabMenuCounts = computed(() => {
   if (!tabMenu.value) return { other: 0, right: 0, all: 0 };
   const index = tabOrder.value.indexOf(tabMenu.value.tabId);
+  const pinned = new Set(pinnedTabIds.value);
   return {
-    other: Math.max(0, tabOrder.value.length - 1),
-    right: index >= 0 ? tabOrder.value.length - index - 1 : 0,
-    all: tabOrder.value.length,
+    other: tabOrder.value.filter(
+      (id) => id !== tabMenu.value?.tabId && !pinned.has(id),
+    ).length,
+    right:
+      index >= 0
+        ? tabOrder.value
+            .slice(index + 1)
+            .filter((id) => !pinned.has(id)).length
+        : 0,
+    all: tabOrder.value.filter((id) => !pinned.has(id)).length,
   };
 });
 
@@ -3609,11 +4756,41 @@ function tabIdsForMenu(kind: "other" | "right" | "all"): string[] {
   const menu = tabMenu.value;
   if (!menu) return [];
   const index = tabOrder.value.indexOf(menu.tabId);
-  if (kind === "all") return [...tabOrder.value];
-  if (kind === "other") {
-    return tabOrder.value.filter((id) => id !== menu.tabId);
+  const pinned = new Set(pinnedTabIds.value);
+  if (kind === "all") {
+    return tabOrder.value.filter((id) => !pinned.has(id));
   }
-  return index >= 0 ? tabOrder.value.slice(index + 1) : [];
+  if (kind === "other") {
+    return tabOrder.value.filter(
+      (id) => id !== menu.tabId && !pinned.has(id),
+    );
+  }
+  return index >= 0
+    ? tabOrder.value.slice(index + 1).filter((id) => !pinned.has(id))
+    : [];
+}
+
+function isTabPinned(id: string): boolean {
+  return pinnedTabIds.value.includes(id);
+}
+
+function togglePinnedTab() {
+  const id = tabMenu.value?.tabId;
+  closeTabMenu();
+  if (!id) return;
+  if (isTabPinned(id)) {
+    pinnedTabIds.value = pinnedTabIds.value.filter((item) => item !== id);
+    const rest = tabOrder.value.filter((item) => item !== id);
+    const pinnedCount = pinnedTabIds.value.filter((item) =>
+      rest.includes(item),
+    ).length;
+    rest.splice(pinnedCount, 0, id);
+    tabOrder.value = rest;
+    status.value = "已取消固定标签";
+  } else {
+    pinnedTabIds.value = [...pinnedTabIds.value, id];
+    status.value = "已固定标签到左侧";
+  }
 }
 
 function closeTabsImmediately(ids: string[]) {
@@ -3991,6 +5168,86 @@ const appActions = computed<AppAction[]>(() => {
       },
     },
     {
+      id: "query-builder",
+      group: "tools",
+      label: "查询构建器",
+      icon: "structure",
+      priority: 9,
+      enabled: !connectionReason,
+      disabledReason: connectionReason || undefined,
+      run: () => {
+        queryBuilderOpen.value = true;
+      },
+    },
+    {
+      id: "database-docs",
+      group: "tools",
+      label: "数据库文档",
+      icon: "history",
+      priority: 10,
+      enabled: !connectionReason,
+      disabledReason: connectionReason || undefined,
+      run: () => {
+        databaseDocsOpen.value = true;
+      },
+    },
+    {
+      id: "sql-snippets",
+      group: "query",
+      label: "SQL 片段库",
+      icon: "code",
+      shortcut: `${shift}${modifier}K`,
+      priority: 23,
+      placement: "more",
+      enabled:
+        viewMode.value === "sql" &&
+        Boolean(activeTab.value) &&
+        !isRedisConnection.value,
+      disabledReason: "请先切换到查询标签",
+      run: openSnippetLibrary,
+    },
+    {
+      id: "save-snippet",
+      group: "query",
+      label: "保存选区为片段",
+      icon: "download",
+      priority: 24,
+      placement: "more",
+      enabled:
+        viewMode.value === "sql" &&
+        Boolean(activeTab.value) &&
+        !isRedisConnection.value,
+      disabledReason: "请先切换到查询标签",
+      run: () =>
+        openSnippetSave(
+          queryWorkspaceRef.value?.currentStatement() ?? "",
+        ),
+    },
+    {
+      id: "compress-sql",
+      group: "query",
+      label: "压缩当前 SQL",
+      icon: "code",
+      priority: 25,
+      placement: "more",
+      enabled:
+        viewMode.value === "sql" &&
+        Boolean(activeTab.value) &&
+        !isRedisConnection.value,
+      disabledReason: "请先切换到查询标签",
+      run: () => runSqlEditorCommand("compress-sql"),
+    },
+    {
+      id: "format-settings",
+      group: "query",
+      label: "格式化设置…",
+      icon: "code",
+      priority: 26,
+      placement: "more",
+      enabled: true,
+      run: openFormatSettings,
+    },
+    {
       id: "import-data",
       group: "object",
       label: "导入数据",
@@ -4039,6 +5296,13 @@ const canEditSql = computed(
     !isRedisConnection.value,
 );
 
+const exportDatabaseReason = computed(() => {
+  if (!selected.value) return "请先选择连接";
+  if (selected.value.driver === "redis") return "Redis 不支持 SQL 导出";
+  if (connectionStatus.value !== "connected") return "连接尚未就绪";
+  return "";
+});
+
 const hasOpenModal = computed(
   () =>
     paletteOpen.value ||
@@ -4048,6 +5312,22 @@ const hasOpenModal = computed(
     importOpen.value ||
     syncOpen.value ||
     dataSyncOpen.value ||
+    databaseExportOpen.value ||
+    sqlScriptOpen.value ||
+    snippetOpen.value ||
+    formatSettingsOpen.value ||
+    settingsOpen.value ||
+    queryBuilderOpen.value ||
+    databaseDocsOpen.value ||
+    Boolean(dangerousSqlRequest.value) ||
+    Boolean(objectSource.value) ||
+    createNamespaceOpen.value ||
+    Boolean(generateTarget.value) ||
+    backupSettingsOpen.value ||
+    serverActivityOpen.value ||
+    dataTransferOpen.value ||
+    connectionTransferOpen.value ||
+    globalSearchOpen.value ||
     aboutOpen.value ||
     shortcutHelpOpen.value ||
     duplicateOpen.value ||
@@ -4064,11 +5344,22 @@ const modalBlockedActionIds = new Set([
   "reopen-closed-tab",
   "import-data",
   "export-result",
+  "export-database",
+  "execute-sql-file",
+  "server-activity",
+  "data-transfer",
+  "connection-transfer",
+  "backup-settings",
+  "sql-snippets",
+  "save-snippet",
+  "global-search",
   "close-tab",
   "refresh",
   "er-diagram",
   "structure-sync",
   "data-sync",
+  "query-builder",
+  "database-docs",
   "edit-connection",
   "close-connection",
   "editor-search",
@@ -4076,6 +5367,9 @@ const modalBlockedActionIds = new Set([
   "editor-find-previous",
   "editor-goto-line",
   "editor-toggle-comment",
+  "editor-format-sql",
+  "editor-format-settings",
+  "settings",
   "close-window",
   "quit-app",
   "command-palette",
@@ -4105,7 +5399,9 @@ function runSqlEditorCommand(
     | "find-next"
     | "find-previous"
     | "goto-line"
-    | "toggle-comment",
+    | "toggle-comment"
+    | "format-sql"
+    | "compress-sql",
 ) {
   if (!canEditSql.value) return;
   if (hasOpenModal.value) {
@@ -4156,12 +5452,55 @@ const appMenus = computed<MenuBarMenu[]>(() => {
         fromAction("new-query"),
         { separator: true },
         fromAction("open-sql-file"),
+        {
+          id: "execute-sql-file",
+          label: "执行 SQL 文件…",
+          disabled:
+            !selected.value ||
+            selected.value.driver === "redis" ||
+            blockedByModal("execute-sql-file"),
+          disabledReason: blockedByModal("execute-sql-file")
+            ? "请先关闭当前对话框"
+            : "请选择 SQLite / MySQL / PostgreSQL 连接",
+          action: openSqlScriptDialog,
+        },
         fromAction("save-sql"),
         fromAction("save-sql-as"),
         fromAction("reopen-closed-tab"),
         { separator: true },
         fromAction("import-data"),
         fromAction("export-result"),
+        {
+          id: "export-database",
+          label: "导出数据库 SQL…",
+          disabled: Boolean(exportDatabaseReason.value) || blockedByModal("export-database"),
+          disabledReason: blockedByModal("export-database")
+            ? "请先关闭当前对话框"
+            : exportDatabaseReason.value || undefined,
+          action: () => void openDatabaseExportAt(),
+        },
+        {
+          id: "connection-transfer",
+          label: "导入 / 导出连接…",
+          disabled: blockedByModal("connection-transfer"),
+          disabledReason: blockedByModal("connection-transfer")
+            ? "请先关闭当前对话框"
+            : undefined,
+          action: () => {
+            connectionTransferOpen.value = true;
+          },
+        },
+        {
+          id: "backup-settings",
+          label: "备份计划…",
+          disabled: blockedByModal("backup-settings"),
+          disabledReason: blockedByModal("backup-settings")
+            ? "请先关闭当前对话框"
+            : undefined,
+          action: () => {
+            backupSettingsOpen.value = true;
+          },
+        },
         { separator: true },
         fromAction("close-tab"),
         { separator: true },
@@ -4248,6 +5587,62 @@ const appMenus = computed<MenuBarMenu[]>(() => {
           disabledReason: "请先打开查询标签",
           action: () => runSqlEditorCommand("toggle-comment"),
         },
+        {
+          id: "editor-format-sql",
+          label: "格式化 SQL",
+          shortcut: `${shift}${alt}F`,
+          disabled: !canEditSql.value,
+          disabledReason: "请先打开查询标签",
+          action: () => runSqlEditorCommand("format-sql"),
+        },
+        {
+          id: "editor-compress-sql",
+          label: "压缩 SQL",
+          disabled: !canEditSql.value,
+          disabledReason: "请先打开查询标签",
+          action: () => runSqlEditorCommand("compress-sql"),
+        },
+        {
+          id: "editor-format-settings",
+          label: "格式化设置…",
+          disabled: blockedByModal("editor-format-settings"),
+          disabledReason: blockedByModal("editor-format-settings")
+            ? "请先关闭当前对话框"
+            : undefined,
+          action: openFormatSettings,
+        },
+        { separator: true },
+        {
+          id: "dangerous-confirm",
+          label: "危险 SQL 二次确认",
+          checked: dangerousConfirmEnabled.value,
+          action: toggleDangerousConfirm,
+        },
+        { separator: true },
+        {
+          id: "sql-snippets",
+          label: "SQL 片段库…",
+          shortcut: `${shift}${modifier}K`,
+          disabled:
+            !canEditSql.value || blockedByModal("sql-snippets"),
+          disabledReason: blockedByModal("sql-snippets")
+            ? "请先关闭当前对话框"
+            : "请先打开查询标签",
+          action: openSnippetLibrary,
+        },
+        {
+          id: "save-snippet",
+          label: "保存选区为片段…",
+          disabled:
+            !canEditSql.value || blockedByModal("save-snippet"),
+          disabledReason: blockedByModal("save-snippet")
+            ? "请先关闭当前对话框"
+            : "请先打开查询标签",
+          action: () =>
+            openSnippetSave(
+              queryWorkspaceRef.value?.currentStatement() ?? "",
+            ),
+        },
       ],
     },
     {
@@ -4324,6 +5719,55 @@ const appMenus = computed<MenuBarMenu[]>(() => {
         fromAction("er-diagram"),
         fromAction("structure-sync"),
         fromAction("data-sync"),
+        fromAction("query-builder"),
+        fromAction("database-docs"),
+        {
+          id: "data-transfer",
+          label: "数据传输…",
+          disabled:
+            !selected.value ||
+            selected.value.driver === "redis" ||
+            blockedByModal("data-transfer"),
+          disabledReason: blockedByModal("data-transfer")
+            ? "请先关闭当前对话框"
+            : "请选择 SQLite / MySQL / PostgreSQL 连接",
+          action: () => {
+            dataTransferOpen.value = true;
+          },
+        },
+        {
+          id: "server-activity",
+          label: "服务器活动…",
+          disabled:
+            Boolean(serverActivityReason.value) ||
+            blockedByModal("server-activity"),
+          disabledReason: blockedByModal("server-activity")
+            ? "请先关闭当前对话框"
+            : serverActivityReason.value || undefined,
+          action: openServerActivity,
+        },
+        {
+          id: "global-search",
+          label: "全局对象搜索…",
+          disabled:
+            !selected.value ||
+            selected.value.driver === "redis" ||
+            blockedByModal("global-search"),
+          disabledReason: blockedByModal("global-search")
+            ? "请先关闭当前对话框"
+            : "请选择 SQLite / MySQL / PostgreSQL 连接",
+          action: openGlobalSearch,
+        },
+        {
+          id: "settings",
+          label: "设置…",
+          shortcut: `${modifier},`,
+          disabled: blockedByModal("settings"),
+          disabledReason: "请先关闭当前对话框",
+          action: () => {
+            settingsOpen.value = true;
+          },
+        },
         { separator: true },
         {
           id: "edit-connection",
@@ -4723,6 +6167,9 @@ function onPaletteShortcut(event: KeyboardEvent) {
 async function bindMenuEvents() {
   const handlers: Array<[string, () => void]> = [
     ["menu:new-connection", openNewConnection],
+    ["menu:settings", () => {
+      settingsOpen.value = true;
+    }],
     ["menu:new-query", newQuery],
     ["menu:open-sql-file", () => void openSqlFile()],
     ["menu:save-sql", saveActiveSql],
@@ -4733,6 +6180,14 @@ async function bindMenuEvents() {
       if (table) void openImportData(table);
     }],
     ["menu:export-result", () => queryWorkspaceRef.value?.requestExport()],
+    ["menu:export-database", () => void openDatabaseExportAt()],
+    ["menu:connection-transfer", () => {
+      connectionTransferOpen.value = true;
+    }],
+    ["menu:backup-settings", () => {
+      backupSettingsOpen.value = true;
+    }],
+    ["menu:execute-sql-file", openSqlScriptDialog],
     ["menu:close-tab", closeActiveWorkspaceTab],
     ["menu:close-window", closeWindow],
     [
@@ -4769,6 +6224,26 @@ async function bindMenuEvents() {
       () => {
         if (selectedId.value && !isRedisConnection.value) {
           dataSyncOpen.value = true;
+        }
+      },
+    ],
+    ["menu:server-activity", openServerActivity],
+    ["menu:query-builder", () => {
+      queryBuilderOpen.value = true;
+    }],
+    ["menu:database-docs", () => {
+      databaseDocsOpen.value = true;
+    }],
+    ["menu:global-search", openGlobalSearch],
+    [
+      "menu:data-transfer",
+      () => {
+        if (
+          selectedId.value &&
+          !isRedisConnection.value &&
+          selected.value?.driver !== "redis"
+        ) {
+          dataTransferOpen.value = true;
         }
       },
     ],
@@ -4818,6 +6293,23 @@ async function bindMenuEvents() {
       "menu:editor-toggle-comment",
       () => runSqlEditorCommand("toggle-comment"),
     ],
+    [
+      "menu:editor-format-sql",
+      () => runSqlEditorCommand("format-sql"),
+    ],
+    [
+      "menu:editor-compress-sql",
+      () => runSqlEditorCommand("compress-sql"),
+    ],
+    ["menu:editor-format-settings", openFormatSettings],
+    ["menu:editor-snippets", openSnippetLibrary],
+    [
+      "menu:editor-save-snippet",
+      () =>
+        openSnippetSave(
+          queryWorkspaceRef.value?.currentStatement() ?? "",
+        ),
+    ],
   ];
 
   try {
@@ -4857,7 +6349,13 @@ onMounted(async () => {
   window.addEventListener("resize", updateViewportWidth);
   window.addEventListener("blur", closeAppContextMenu);
   window.addEventListener("blur", closeTabMenu);
+  window.addEventListener("blur", () => {
+    tabOverflowOpen.value = false;
+  });
   window.addEventListener("resize", closeTabMenu);
+  window.addEventListener("resize", () => {
+    tabOverflowOpen.value = false;
+  });
   window.addEventListener("keydown", onPaletteShortcut, true);
   document.addEventListener("focusin", trackEditableFocus);
   modalObserver = new MutationObserver(syncDomModalOpen);
@@ -4897,7 +6395,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
-  if (tabsRestored) {
+  if (tabsRestored && !standaloneQueryWindow) {
     try {
       window.localStorage.setItem(
         QUERY_TABS_STORAGE_KEY,
@@ -4913,7 +6411,7 @@ onBeforeUnmount(() => {
   window.clearTimeout(locatedConnectionTimer);
   modalObserver?.disconnect();
   modalObserver = null;
-  saveWorkspaceLayout(layout);
+  if (!standaloneQueryWindow) saveWorkspaceLayout(layout);
   for (const unlisten of unlisteners) unlisten();
   window.removeEventListener("contextmenu", openAppContextMenu);
   window.removeEventListener("mousedown", onWindowMouseDown);
@@ -4930,7 +6428,11 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app-shell" :style="layoutStyle">
+  <div
+    class="app-shell"
+    :class="{ 'standalone-window': standaloneQueryWindow }"
+    :style="layoutStyle"
+  >
     <header class="titlebar">
       <AppMenuBar :menus="appMenus" />
       <span class="titlebar-spacer" data-tauri-drag-region></span>
@@ -5300,14 +6802,23 @@ onBeforeUnmount(() => {
               'query-tab': view.kind === 'query',
               'table-tab': view.kind !== 'query',
               'er-tab': view.kind === 'er',
+              pinned: view.pinned,
+              dragging: dragTabId === view.id,
+              'drop-target': dragOverTabId === view.id,
             }"
             role="tab"
             tabindex="0"
+            draggable="true"
             :title="view.title"
+            @dragstart="startTabDrag($event, view.id)"
+            @dragover="markTabDragOver($event, view.id)"
+            @dragend="finishTabDrag"
+            @drop="dropTab($event, view.id)"
             @click="activateWorkspaceTabById(view.id)"
             @contextmenu.prevent.stop="openTabMenu($event, view.id)"
             @keydown.enter="activateWorkspaceTabById(view.id)"
           >
+            <Icon v-if="view.pinned" name="pin" :size="11" class="tab-pin" />
             <Icon :name="view.icon" :size="14" />
             <span class="tab-label">{{ view.label }}</span>
             <span
@@ -5350,6 +6861,47 @@ onBeforeUnmount(() => {
           >
             <Icon name="plus" :size="14" />
           </button>
+          <div
+            v-if="workspaceTabViews.length"
+            ref="tabOverflowRef"
+            class="tab-overflow-host"
+            @click.stop
+          >
+            <button
+              class="workspace-tab-add tab-overflow-button"
+              title="全部标签"
+              aria-label="全部标签"
+              @click="toggleTabOverflow"
+            >
+              <Icon name="list" :size="14" />
+            </button>
+            <div
+              v-if="tabOverflowOpen"
+              class="context-menu tab-overflow-menu"
+              :style="{
+                position: 'fixed',
+                left: `${tabOverflowPosition.left}px`,
+                top: `${tabOverflowPosition.top}px`,
+              }"
+            >
+              <button
+                v-for="view in workspaceTabViews"
+                :key="view.id"
+                class="context-menu-item"
+                :class="{ 'tab-overflow-active': view.id === activeWorkspaceTabId }"
+                @click="
+                  activateWorkspaceTabById(view.id);
+                  tabOverflowOpen = false;
+                "
+              >
+                <Icon v-if="view.pinned" name="pin" :size="11" />
+                <Icon v-else :name="view.icon" :size="13" />
+                <span class="tab-overflow-label">{{ view.label }}</span>
+                <span v-if="view.running" class="tab-overflow-running">执行中</span>
+                <span class="tab-overflow-source">{{ view.source }}</span>
+              </button>
+            </div>
+          </div>
         </div>
 
         <div
@@ -5391,6 +6943,7 @@ onBeforeUnmount(() => {
             :connection-id="selectedId"
             :connection-name="selected?.name"
             :database="redisDatabase ?? selected?.database"
+            :read-only="Boolean(selected?.readOnly)"
             @database-change="handleRedisDatabaseChange"
           />
           <WorkspaceStart
@@ -5426,17 +6979,30 @@ onBeforeUnmount(() => {
               :collapsed="layout.objectsCollapsed"
               :locate-reason="objectLocateReason"
               :locate-scope="objectLocateScope"
+              :read-only="Boolean(selected?.readOnly)"
               @toggle="toggleObjects"
               @select="openTable"
               @select-structure="openTableStructure"
               @select-index="openIndex"
               @open-new-tab="openTableInNewTab"
               @import-data="openImportData"
+              @generate-data="
+                openGenerateData({
+                  connectionId: selectedId ?? '',
+                  table: $event.name,
+                  tableKind: $event.kind,
+                })
+              "
+              @view-definition="openObjectDefinition"
+              @create-namespace="openCreateNamespace"
+              @drop-namespace="dropNamespace"
               @select-database="selectDatabase"
               @select-schema="selectSchema"
               @refresh="refreshTables"
               @create="openCreateTable"
               @generate-sql="openGeneratedSql"
+              @export-database="openDatabaseExportAt"
+              @create-object="openCreateObject"
             />
             <ResizeHandle
             v-if="selected && !layout.objectsCollapsed"
@@ -5448,6 +7014,7 @@ onBeforeUnmount(() => {
             @update:value="layout.objectsWidth = $event"
             @reset="layout.objectsWidth = 216"
           />
+          <div class="workspace-primary">
           <WorkspaceStart
             v-if="viewMode === 'empty'"
             :connections-count="connections.length"
@@ -5477,6 +7044,8 @@ onBeforeUnmount(() => {
             :completion-tables="completionTables"
             :result="result"
             :running="running"
+            :stopping="activeTab?.stopping ?? false"
+            :stop-note="activeTab?.stopNote ?? null"
             :error="queryError"
             :in-transaction="activeTab?.inTransaction ?? false"
             :transaction-busy="activeTab?.transactionBusy ?? false"
@@ -5485,9 +7054,18 @@ onBeforeUnmount(() => {
             :can-run="!runDisabledReason"
             :run-disabled-reason="runDisabledReason"
             :run-shortcut-label="runShortcutLabel"
+            :explain-result="activeTab?.explainResult ?? null"
+            :explain-error="activeTab?.explainError ?? null"
+            :explain-loading="activeTab?.explainLoading ?? false"
+            :show-explain="activeTab?.showExplain ?? false"
             @update:sql="sql = $event"
             @selection="handleSqlSelection"
             @run="runQuery"
+            @stop="stopActiveQuery"
+            @open-snippets="openSnippetLibrary"
+            @open-format-settings="openFormatSettings"
+            @explain="explainQuery"
+            @show-explain="setExplainView"
             @begin-transaction="beginTransaction"
             @commit-transaction="commitTransaction"
             @rollback-transaction="rollbackTransaction"
@@ -5531,18 +7109,32 @@ onBeforeUnmount(() => {
             >
               <TableDataView
                 v-if="tab.mode === 'data'"
+                :ref="(element) => setTableDataRef(tab.id, element)"
                 :connection-id="tab.connectionId ?? ''"
                 :table="tab.table.name"
                 :table-kind="tab.table.kind"
+                :read-only="Boolean(connectionFor(tab.connectionId)?.readOnly)"
                 :driver="driverForConnection(tab.connectionId)"
                 :database-label="scopeLabelFor(tab)"
                 :database="tab.database ?? undefined"
                 :schema="tab.schema"
+                @generate-data="
+                  openGenerateData({
+                    connectionId: tab.connectionId ?? '',
+                    table: tab.table.name,
+                    tableKind: tab.table.kind,
+                  })
+                "
+                @import-data="
+                  importTable = tab.table.name;
+                  importOpen = true;
+                "
               />
               <TableStructureView
                 v-else
                 :connection-id="tab.connectionId ?? ''"
                 :driver="driverForConnection(tab.connectionId)"
+                :read-only="Boolean(connectionFor(tab.connectionId)?.readOnly)"
                 :kind="tab.table.kind"
                 :table="tab.table.name"
                 :focus-index="tab.focusedIndex"
@@ -5559,6 +7151,149 @@ onBeforeUnmount(() => {
             :scope-label="scopeLabelFor(tab)"
             @select="openTable"
           />
+          </div>
+          <template v-if="splitView">
+            <ResizeHandle
+              orientation="vertical"
+              invert
+              :value="splitWidth"
+              :min="320"
+              :max="900"
+              label="调整分屏宽度"
+              @update:value="splitWidth = $event"
+              @reset="splitWidth = 520"
+            />
+            <aside
+              class="split-pane"
+              :style="{ width: `${splitWidth}px` }"
+            >
+              <header class="split-pane-header">
+                <Icon
+                  :name="
+                    splitView.kind === 'er'
+                      ? 'diagram'
+                      : splitView.kind === 'query'
+                        ? 'code'
+                        : splitView.table.mode === 'structure'
+                          ? 'structure'
+                          : 'table'
+                  "
+                  :size="14"
+                />
+                <strong>
+                  {{
+                    splitView.kind === "er"
+                      ? "ER 图"
+                      : splitView.kind === "query"
+                        ? splitView.query.title
+                        : splitView.table.table.name
+                  }}
+                </strong>
+                <span class="hint">
+                  {{
+                    splitView.kind === "er"
+                      ? scopeLabelFor(splitView.er)
+                      : splitView.kind === "query"
+                        ? [splitView.query.database, splitView.query.schema]
+                            .filter(Boolean)
+                            .join(" / ") || "当前库 / 模式"
+                        : `${scopeLabelFor(splitView.table)} · ${
+                            splitView.table.mode === "structure"
+                              ? "结构"
+                              : "数据"
+                          }`
+                  }}
+                </span>
+                <span class="split-badge">
+                  {{ splitView.kind === "query" ? "查询分屏" : "只读分屏" }}
+                </span>
+                <button
+                  class="icon-button"
+                  title="关闭分屏"
+                  @click="closeSplitView"
+                >
+                  <Icon name="close" :size="13" />
+                </button>
+              </header>
+              <div class="split-pane-body">
+                <template v-if="splitView.kind === 'query'">
+                  <QueryWorkspace
+                    ref="splitQueryWorkspaceRef"
+                    :sql="splitView.query.sql"
+                    :tab-id="splitView.query.id"
+                    :driver="
+                      driverForConnection(splitView.query.connectionId)
+                    "
+                    :completion-tables="completionTables"
+                    :result="splitView.query.result"
+                    :running="splitView.query.running"
+                    :stopping="splitView.query.stopping"
+                    :stop-note="splitView.query.stopNote"
+                    :error="splitView.query.error"
+                    :in-transaction="splitView.query.inTransaction"
+                    :transaction-busy="splitView.query.transactionBusy"
+                    :editor-ratio="layout.editorRatio"
+                    :result-collapsed="layout.resultCollapsed"
+                    :can-run="Boolean(splitView.query.connectionId)"
+                    :run-disabled-reason="
+                      splitView.query.connectionId ? '' : '请先选择连接'
+                    "
+                    run-shortcut-label="⌘/Ctrl+Enter"
+                    :explain-result="splitView.query.explainResult"
+                    :explain-error="splitView.query.explainError"
+                    :explain-loading="splitView.query.explainLoading"
+                    :show-explain="splitView.query.showExplain"
+                    @update:sql="updateSplitSql"
+                    @selection="updateSplitSelection"
+                    @run="runSplitQuery"
+                    @stop="stopSplitQuery"
+                    @open-snippets="openSnippetLibrary"
+                    @open-format-settings="openFormatSettings"
+                    @explain="explainSplitQuery"
+                    @show-explain="setSplitExplainView"
+                    @begin-transaction="beginSplitTransaction"
+                    @commit-transaction="commitSplitTransaction"
+                    @rollback-transaction="rollbackSplitTransaction"
+                    @update:editor-ratio="layout.editorRatio = $event"
+                    @toggle-result="toggleResultPanel"
+                  />
+                </template>
+                <template v-else-if="splitView.kind === 'er'">
+                  <ErDiagram
+                    :connection-id="splitView.er.connectionId ?? ''"
+                    :scope-label="scopeLabelFor(splitView.er)"
+                    @select="openTable"
+                  />
+                </template>
+                <template v-else>
+                  <TableDataView
+                    v-if="splitView.table.mode === 'data'"
+                    :key="`split-data-${splitView.table.id}`"
+                    :connection-id="splitView.table.connectionId ?? ''"
+                    :table="splitView.table.table.name"
+                    :table-kind="splitView.table.table.kind"
+                    :read-only="true"
+                    :driver="driverForConnection(splitView.table.connectionId)"
+                    :database-label="scopeLabelFor(splitView.table)"
+                    :database="splitView.table.database ?? undefined"
+                    :schema="splitView.table.schema"
+                  />
+                  <TableStructureView
+                    v-else
+                    :key="`split-structure-${splitView.table.id}`"
+                    :connection-id="splitView.table.connectionId ?? ''"
+                    :driver="driverForConnection(splitView.table.connectionId)"
+                    :read-only="true"
+                    :kind="splitView.table.table.kind"
+                    :table="splitView.table.table.name"
+                    :focus-index="splitView.table.focusedIndex"
+                    :database-label="scopeLabelFor(splitView.table)"
+                    @refresh="refreshTables"
+                  />
+                </template>
+              </div>
+            </aside>
+          </template>
           </template>
 
           <ResizeHandle
@@ -5972,9 +7707,40 @@ onBeforeUnmount(() => {
       @created="handleTableCreated"
     />
 
-    <ImportDataDialog
+    <CreateObjectDialog
+      v-if="selected"
+      :open="createObjectOpen"
+      :connection-id="selectedId ?? ''"
+      :driver="selected?.driver ?? 'sqlite'"
+      :kind="createObjectKind"
+      :scope-label="connectionChipScope || selected.name"
+      :tables="tables"
+      @close="createObjectOpen = false"
+      @created="handleObjectCreated"
+    />
+
+    <ConnectionTransferDialog
+      :open="connectionTransferOpen"
+      :connections="connections"
+      :groups="connectionGroups"
+      @close="connectionTransferOpen = false"
+      @imported="handleConnectionsImported"
+    />
+
+    <GlobalSearchDialog
+      v-if="selected"
+      :open="globalSearchOpen"
+      :connection-id="selectedId ?? ''"
+      :driver="selected?.driver ?? 'sqlite'"
+      :scope-label="connectionChipScope || selected.name"
+      @close="globalSearchOpen = false"
+      @choose="chooseGlobalSearchHit"
+    />
+
+    <ImportWizardDialog
       :open="importOpen"
       :connection-id="selectedId ?? ''"
+      :driver="selected?.driver ?? 'sqlite'"
       :tables="tables"
       :initial-table="importTable"
       :read-only="Boolean(selected?.readOnly)"
@@ -5982,11 +7748,164 @@ onBeforeUnmount(() => {
       @imported="handleImportedData"
     />
 
+    <DangerousSqlDialog
+      :open="Boolean(dangerousSqlRequest)"
+      :sql="dangerousSqlRequest?.sql ?? ''"
+      :message="dangerousSqlRequest?.finding.message ?? ''"
+      :high-risk="dangerousSqlRequest?.finding.highRisk ?? false"
+      :connection-name="dangerousConnectionName"
+      :scope="dangerousScope"
+      @confirm="confirmDangerousSql"
+      @cancel="cancelDangerousSql"
+    />
+
     <SchemaSyncDialog
       :open="syncOpen"
       :connections="connections"
       :current-connection-id="selectedId ?? ''"
       @close="syncOpen = false"
+      @applied="handleSchemaSyncApplied"
+    />
+
+    <DatabaseExportDialog
+      v-if="databaseExportScope"
+      :open="databaseExportOpen"
+      :connection-id="databaseExportScope.connectionId"
+      :driver="databaseExportScope.driver"
+      :scope-label="databaseExportScope.scopeLabel"
+      :database="databaseExportScope.database"
+      :schema="databaseExportScope.schema"
+      @close="databaseExportOpen = false"
+      @exported="handleDatabaseExported($event.objectCount)"
+    />
+
+    <SqlFileExecuteDialog
+      v-if="selected"
+      :open="sqlScriptOpen"
+      :connection-id="selectedId ?? ''"
+      :driver="selected?.driver ?? 'sqlite'"
+      :scope-label="connectionChipScope || selected.name"
+      :read-only="Boolean(selected?.readOnly)"
+      :initial-path="sqlScriptInitialPath"
+      @close="
+        sqlScriptOpen = false;
+        sqlScriptInitialPath = null;
+      "
+      @executed="handleSqlScriptExecuted"
+    />
+
+    <BackupSettingsDialog
+      :open="backupSettingsOpen"
+      :connections="connections"
+      :default-connection-id="selectedId"
+      @close="backupSettingsOpen = false"
+      @restore="restoreBackupFile"
+    />
+
+    <SqlSnippetDialog
+      :open="snippetOpen"
+      :driver="selected?.driver ?? 'sqlite'"
+      :initial-body="snippetInitialBody"
+      @close="
+        snippetOpen = false;
+        snippetInitialBody = '';
+      "
+      @insert="insertSnippetText"
+    />
+
+    <SqlFormatSettingsDialog
+      :open="formatSettingsOpen"
+      @close="formatSettingsOpen = false"
+      @saved="handleFormatSettingsSaved"
+    />
+
+    <SettingsDialog
+      :open="settingsOpen"
+      @close="settingsOpen = false"
+      @open-format-settings="
+        settingsOpen = false;
+        formatSettingsOpen = true;
+      "
+    />
+
+    <ObjectSourceDialog
+      v-if="selected && objectSource"
+      :open="Boolean(objectSource)"
+      :connection-id="selectedId ?? ''"
+      :driver="selected?.driver ?? 'sqlite'"
+      :kind="objectSource.kind"
+      :name="objectSource.name"
+      :read-only="Boolean(selected?.readOnly)"
+      @close="objectSource = null"
+      @saved="handleObjectDefinitionSaved"
+    />
+
+    <CreateDatabaseDialog
+      v-if="selected && (selected.driver === 'mysql' || selected.driver === 'postgres')"
+      ref="createNamespaceRef"
+      :open="createNamespaceOpen"
+      :driver="selected.driver === 'mysql' ? 'mysql' : 'postgres'"
+      :mode="createNamespaceMode"
+      @close="createNamespaceOpen = false"
+      @confirm="handleCreateNamespace"
+    />
+
+    <GenerateDataDialog
+      v-if="generateTarget"
+      :open="Boolean(generateTarget)"
+      :connection-id="generateTarget.connectionId"
+      :table="generateTarget.table"
+      :table-kind="generateTarget.tableKind"
+      :driver="driverForConnection(generateTarget.connectionId)"
+      :read-only="Boolean(connectionFor(generateTarget.connectionId)?.readOnly)"
+      @close="generateTarget = null"
+      @generated="handleGeneratedData"
+    />
+
+    <QueryBuilderDialog
+      v-if="selected"
+      :open="queryBuilderOpen"
+      :connection-id="selectedId ?? ''"
+      :driver="selected?.driver ?? 'sqlite'"
+      :scope-label="connectionChipScope || selected.name"
+      @close="queryBuilderOpen = false"
+      @open-sql="
+        openGeneratedSql({ sql: $event, title: '查询构建器' });
+        queryBuilderOpen = false;
+      "
+      @save-snippet="
+        openSnippetSave($event);
+        queryBuilderOpen = false;
+      "
+    />
+
+    <DatabaseDocsDialog
+      v-if="selected"
+      :open="databaseDocsOpen"
+      :connection-id="selectedId ?? ''"
+      :driver="selected?.driver ?? 'sqlite'"
+      :connection-name="selected.name"
+      :database="activeDatabase ?? ''"
+      :schema="activeSchema ?? ''"
+      @close="databaseDocsOpen = false"
+    />
+
+    <ServerActivityDialog
+      v-if="selected"
+      :open="serverActivityOpen"
+      :connection-id="selectedId ?? ''"
+      :driver="selected?.driver ?? 'sqlite'"
+      :scope-label="connectionChipScope || selected.name"
+      :read-only="Boolean(selected?.readOnly)"
+      @close="serverActivityOpen = false"
+    />
+
+    <DataTransferDialog
+      :open="dataTransferOpen"
+      :connections="connections"
+      :current-connection-id="selectedId ?? ''"
+      @close="dataTransferOpen = false"
+      @transferred="handleTransferred"
     />
 
     <DataSyncDialog
@@ -6019,6 +7938,34 @@ onBeforeUnmount(() => {
       <button
         class="context-menu-item"
         role="menuitem"
+        @click="togglePinnedTab"
+      >
+        <Icon name="pin" :size="13" />
+        <span>
+          {{ tabMenu && isTabPinned(tabMenu.tabId) ? "取消固定" : "固定标签" }}
+        </span>
+      </button>
+      <button
+        class="context-menu-item"
+        role="menuitem"
+        @click="tabMenu && openSplitView(tabMenu.tabId)"
+      >
+        <Icon name="structure" :size="13" />
+        <span>在右侧分屏打开</span>
+      </button>
+      <button
+        v-if="tabMenuQueryTab"
+        class="context-menu-item"
+        role="menuitem"
+        @click="tabMenu && openQueryInNewWindow(tabMenu.tabId)"
+      >
+        <Icon name="external" :size="13" />
+        <span>在新窗口打开</span>
+      </button>
+      <div class="context-separator"></div>
+      <button
+        class="context-menu-item"
+        role="menuitem"
         :disabled="!tabMenuCounts.other"
         @click="requestCloseTabs('other')"
       >
@@ -6041,6 +7988,7 @@ onBeforeUnmount(() => {
       <button
         class="context-menu-item"
         role="menuitem"
+        :disabled="!tabMenuCounts.all"
         @click="requestCloseTabs('all')"
       >
         <span>关闭全部标签</span>

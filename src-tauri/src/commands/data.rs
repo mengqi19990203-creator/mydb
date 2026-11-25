@@ -1,5 +1,8 @@
 use super::{AppState, driver_for, ensure_writable};
-use crate::models::{ColumnInfo, ColumnValue, ErDiagram, TableRows, TableStructure};
+use crate::models::{
+    ColumnInfo, ColumnValue, ErDiagram, PendingTableChange, TableChangeResult, TableRows,
+    TableSort, TableStructure,
+};
 use crate::storage;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -53,11 +56,17 @@ pub async fn read_table_rows(
     filter: Option<String>,
     order_by: Option<String>,
     order_dir: Option<String>,
+    sorts: Option<Vec<TableSort>>,
 ) -> Result<TableRows, String> {
     ensure_table(&table)?;
     let driver = driver_for(&app, &state, &connection_id).await?;
     let limit = limit.unwrap_or(100).clamp(1, 1000);
     let offset = offset.unwrap_or(0);
+    if let Some(sorts) = sorts.filter(|items| !items.is_empty()) {
+        return driver
+            .read_rows_sorted(&table, limit, offset, filter.as_deref(), &sorts)
+            .await;
+    }
     driver
         .read_rows(
             &table,
@@ -68,6 +77,24 @@ pub async fn read_table_rows(
             order_dir.as_deref(),
         )
         .await
+}
+
+#[tauri::command]
+pub async fn apply_table_changes(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    table: String,
+    changes: Vec<PendingTableChange>,
+) -> Result<TableChangeResult, String> {
+    ensure_table(&table)?;
+    ensure_writable(&app, &connection_id)?;
+    if changes.is_empty() {
+        return Ok(TableChangeResult { applied: 0 });
+    }
+    let driver = driver_for(&app, &state, &connection_id).await?;
+    let applied = driver.apply_table_changes(&table, &changes).await?;
+    Ok(TableChangeResult { applied })
 }
 
 #[tauri::command]
@@ -165,10 +192,46 @@ pub async fn get_object_ddl(
     connection_id: String,
     kind: String,
     name: String,
+    identity: Option<String>,
 ) -> Result<String, String> {
     ensure_table(&name)?;
     let driver = driver_for(&app, &state, &connection_id).await?;
-    driver.object_ddl(&kind, &name).await
+    driver
+        .object_ddl_with_identity(&kind, &name, identity.as_deref())
+        .await
+}
+
+#[tauri::command]
+pub async fn list_object_variants(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    kind: String,
+    name: String,
+) -> Result<Vec<crate::models::ObjectVariant>, String> {
+    ensure_table(&name)?;
+    let driver = driver_for(&app, &state, &connection_id).await?;
+    driver.object_variants(&kind, &name).await
+}
+
+#[tauri::command]
+pub async fn save_object_definition(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    kind: String,
+    name: String,
+    definition: String,
+) -> Result<(), String> {
+    ensure_table(&name)?;
+    if definition.len() > 2 * 1024 * 1024 {
+        return Err("对象定义不能超过 2 MB".to_string());
+    }
+    ensure_writable(&app, &connection_id)?;
+    let driver = driver_for(&app, &state, &connection_id).await?;
+    driver
+        .save_object_definition(&kind, &name, &definition)
+        .await
 }
 
 #[tauri::command]
@@ -270,10 +333,7 @@ pub async fn export_object(
 }
 
 #[tauri::command]
-pub async fn cancel_export(
-    state: State<'_, AppState>,
-    operation_id: String,
-) -> Result<(), String> {
+pub async fn cancel_export(state: State<'_, AppState>, operation_id: String) -> Result<(), String> {
     if let Some(flag) = state.export_cancels.lock().await.get(&operation_id) {
         flag.store(true, Ordering::Relaxed);
     }
@@ -298,14 +358,16 @@ async fn export_stream(
     } else {
         None
     };
+    let column_names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
 
-    let file = std::fs::File::create(path).map_err(|error| format!("创建文件失败: {error}"))?;
-    let mut out = std::io::BufWriter::new(file);
     let mysql = database_kind == "mysql";
     let cancelled = || cancel.load(Ordering::Relaxed);
 
     match format {
         "csv" => {
+            let file =
+                std::fs::File::create(path).map_err(|error| format!("创建文件失败: {error}"))?;
+            let out = std::io::BufWriter::new(file);
             let mut writer = csv::WriterBuilder::new().from_writer(out);
             if with_header {
                 writer
@@ -329,6 +391,9 @@ async fn export_stream(
             Ok(count)
         }
         "json" => {
+            let file =
+                std::fs::File::create(path).map_err(|error| format!("创建文件失败: {error}"))?;
+            let mut out = std::io::BufWriter::new(file);
             out.write_all(b"{\n  \"table\": ")
                 .map_err(|error| format!("写入 JSON 失败: {error}"))?;
             serde_json::to_writer(&mut out, name)
@@ -365,6 +430,9 @@ async fn export_stream(
             Ok(count)
         }
         "sql" => {
+            let file =
+                std::fs::File::create(path).map_err(|error| format!("创建文件失败: {error}"))?;
+            let mut out = std::io::BufWriter::new(file);
             let table_ident = export_identifier(name, mysql);
             let column_list = columns
                 .iter()
@@ -382,8 +450,7 @@ async fn export_stream(
             }
             if let Some(ddl) = &ddl {
                 let ddl = ddl.trim().trim_end_matches(';');
-                writeln!(out, "{ddl};")
-                    .map_err(|error| format!("写入 SQL 失败: {error}"))?;
+                writeln!(out, "{ddl};").map_err(|error| format!("写入 SQL 失败: {error}"))?;
                 writeln!(out).map_err(|error| format!("写入 SQL 失败: {error}"))?;
             }
             let count = driver
@@ -406,6 +473,94 @@ async fn export_stream(
                 .await?;
             out.flush()
                 .map_err(|error| format!("写入 SQL 失败: {error}"))?;
+            Ok(count)
+        }
+        "xlsx" => {
+            const XLSX_ROW_LIMIT: u64 = 200_000;
+            if let Some(limit) = limit {
+                if limit > XLSX_ROW_LIMIT {
+                    return Err(
+                        "XLSX 单文件最多支持 200,000 行，请改用 CSV 导出全部数据".to_string()
+                    );
+                }
+            }
+            let mut workbook = rust_xlsxwriter::Workbook::new();
+            let count = {
+                let worksheet = workbook.add_worksheet();
+                worksheet
+                    .set_name(&crate::commands::xlsx::safe_sheet_name(name))
+                    .map_err(|error| format!("设置工作表名称失败: {error}"))?;
+                let bold = rust_xlsxwriter::Format::new().set_bold();
+                let data_start = if with_header {
+                    crate::commands::xlsx::write_header(worksheet, &column_names, &bold)
+                        .map_err(|error| format!("写入 XLSX 表头失败: {error}"))?;
+                    1u32
+                } else {
+                    0
+                };
+                let mut widths: Vec<usize> = columns
+                    .iter()
+                    .map(|column| column.name.chars().count())
+                    .collect();
+                let mut count = 0u64;
+                let exported = driver
+                    .export_rows(name, limit, &mut |row| {
+                        if cancelled() {
+                            return Err("导出已取消".to_string());
+                        }
+                        if count >= XLSX_ROW_LIMIT {
+                            return Err("XLSX 单文件最多支持 200,000 行，请改用 CSV 导出全部数据"
+                                .to_string());
+                        }
+                        let row_number = data_start + count as u32;
+                        for (index, value) in row.iter().enumerate() {
+                            if index >= columns.len() {
+                                break;
+                            }
+                            crate::commands::xlsx::write_cell(
+                                worksheet,
+                                row_number,
+                                index as u16,
+                                value,
+                            )
+                            .map_err(|error| format!("写入 XLSX 单元格失败: {error}"))?;
+                            if widths[index] < 60 {
+                                let length = match value {
+                                    Value::Null => 0,
+                                    Value::String(text) => text.chars().count(),
+                                    other => other.to_string().chars().count(),
+                                };
+                                widths[index] = widths[index].max(length.min(60));
+                            }
+                        }
+                        count += 1;
+                        Ok(())
+                    })
+                    .await?;
+                if with_header && exported > 0 {
+                    worksheet
+                        .set_freeze_panes(1, 0)
+                        .map_err(|error| format!("冻结表头失败: {error}"))?;
+                    worksheet
+                        .autofilter(
+                            0,
+                            0,
+                            exported as u32,
+                            (columns.len().saturating_sub(1)) as u16,
+                        )
+                        .map_err(|error| format!("设置筛选失败: {error}"))?;
+                }
+                for (index, width) in widths.iter().enumerate() {
+                    worksheet
+                        .set_column_width(index as u16, (*width as f64 + 2.0).clamp(8.0, 60.0))
+                        .map_err(|error| format!("设置列宽失败: {error}"))?;
+                }
+                exported
+            };
+            let buffer = workbook
+                .save_to_buffer()
+                .map_err(|error| format!("生成 XLSX 失败: {error}"))?;
+            crate::commands::xlsx::write_bytes_atomic(path, &buffer)?;
             Ok(count)
         }
         _ => Err(format!("不支持的导出格式: {format}")),
@@ -494,6 +649,17 @@ pub async fn table_maintenance(
     let driver_kind = connection_driver(&app, &connection_id)?;
     let sql = table_maintenance_sql(&driver_kind, &table, &action)?;
     let driver = driver_for(&app, &state, &connection_id).await?;
+    // MySQL / PostgreSQL TRUNCATE reports 0 affected rows even when it removes
+    // every row. Count first so the UI can show the real number.
+    let before = if action == "truncate" {
+        driver
+            .read_rows(&table, 1, 0, None, None, None)
+            .await
+            .ok()
+            .map(|rows| rows.total)
+    } else {
+        None
+    };
     let result = driver.execute(&sql, 1).await?;
 
     if driver_kind == "sqlite" && action == "truncate" {
@@ -507,7 +673,11 @@ pub async fn table_maintenance(
             )
             .await;
     }
-    Ok(result.rows_affected)
+    Ok(if action == "truncate" {
+        before.unwrap_or(result.rows_affected)
+    } else {
+        result.rows_affected
+    })
 }
 
 fn connection_driver(app: &AppHandle, connection_id: &str) -> Result<String, String> {
@@ -565,9 +735,7 @@ fn write_text_file_atomic(path: &std::path::Path, contents: &str) -> Result<(), 
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| "文件路径无效".to_string())?;
+    let file_name = path.file_name().ok_or_else(|| "文件路径无效".to_string())?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -690,8 +858,8 @@ pub async fn import_json(
     }
 
     ensure_writable(&app, &connection_id)?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| format!("读取 JSON 文件失败: {error}"))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("读取 JSON 文件失败: {error}"))?;
     let parsed: Value =
         serde_json::from_str(&text).map_err(|error| format!("解析 JSON 失败: {error}"))?;
     let rows = match parsed {
@@ -705,10 +873,7 @@ pub async fn import_json(
 
     let driver = driver_for(&app, &state, &connection_id).await?;
     let columns = driver.list_columns(&table).await?;
-    let allowed: HashSet<String> = columns
-        .iter()
-        .map(|column| column.name.clone())
-        .collect();
+    let allowed: HashSet<String> = columns.iter().map(|column| column.name.clone()).collect();
 
     let mut inserted = 0u64;
     for (index, row) in rows.into_iter().enumerate() {
@@ -818,10 +983,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("result.csv");
         write_text_file_atomic(&path, "a,b\n1,2").expect("write");
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read"),
-            "a,b\n1,2"
-        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "a,b\n1,2");
         write_text_file_atomic(&path, "replaced").expect("overwrite");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "replaced");
         assert_eq!(

@@ -89,12 +89,10 @@ fn read_only_message() -> String {
 }
 
 fn tokens(text: &str) -> Vec<String> {
-    text.split(|character: char| {
-        !(character.is_ascii_alphanumeric() || character == '_')
-    })
-    .filter(|token| !token.is_empty())
-    .map(|token| token.to_ascii_lowercase())
-    .collect()
+    text.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
 }
 
 /// Removes comments and the contents of string/identifier quotes so keyword
@@ -121,8 +119,7 @@ fn strip_sql(sql: &str) -> Result<String, String> {
             }
             b'/' if index + 1 < bytes.len() && bytes[index + 1] == b'*' => {
                 index += 2;
-                while index + 1 < bytes.len()
-                    && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
                 {
                     index += 1;
                 }
@@ -191,18 +188,13 @@ mod tests {
     #[test]
     fn allows_read_statements() {
         assert!(ensure_read_only_sql("SELECT 1", "sqlite").is_ok());
-        assert!(ensure_read_only_sql(
-            "-- note\nWITH x AS (SELECT 1) SELECT * FROM x",
-            "postgres"
-        )
-        .is_ok());
+        assert!(
+            ensure_read_only_sql("-- note\nWITH x AS (SELECT 1) SELECT * FROM x", "postgres")
+                .is_ok()
+        );
         assert!(ensure_read_only_sql("PRAGMA table_info(t)", "sqlite").is_ok());
         assert!(ensure_read_only_sql("SHOW CREATE TABLE t", "mysql").is_ok());
-        assert!(ensure_read_only_sql(
-            "SELECT 'delete' AS note FROM t",
-            "postgres"
-        )
-        .is_ok());
+        assert!(ensure_read_only_sql("SELECT 'delete' AS note FROM t", "postgres").is_ok());
     }
 
     #[test]

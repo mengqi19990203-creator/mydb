@@ -13,6 +13,12 @@ pub trait DatabaseSession: Send {
     async fn execute(&mut self, sql: &str, max_rows: usize) -> Result<QueryResult, String>;
     async fn commit(&mut self) -> Result<(), String>;
     async fn rollback(&mut self) -> Result<(), String>;
+    /// Server-side identifier used to cancel the statement running on this
+    /// session (MySQL `CONNECTION_ID()`, PostgreSQL `pg_backend_pid()`).
+    /// Drivers without cancellable statements return `None`.
+    async fn backend_id(&mut self) -> Result<Option<i64>, String> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -54,13 +60,54 @@ pub trait DatabaseDriver: Send + Sync {
     async fn object_ddl(&self, _kind: &str, _name: &str) -> Result<String, String> {
         Err("当前连接不支持读取该对象的 DDL".to_string())
     }
-    /// Renames an object in place.
-    async fn rename_object(
+    /// Overloaded routine signatures (PostgreSQL). Empty when not applicable.
+    async fn object_variants(
         &self,
         _kind: &str,
         _name: &str,
-        _new_name: &str,
+    ) -> Result<Vec<crate::models::ObjectVariant>, String> {
+        Ok(Vec::new())
+    }
+    /// Reads a definition for one overload, selected by the id returned from
+    /// `object_variants`.
+    async fn object_ddl_with_identity(
+        &self,
+        kind: &str,
+        name: &str,
+        _identity: Option<&str>,
+    ) -> Result<String, String> {
+        self.object_ddl(kind, name).await
+    }
+    /// Saves an edited view / routine definition. Restricted by driver.
+    async fn save_object_definition(
+        &self,
+        _kind: &str,
+        _name: &str,
+        _definition: &str,
     ) -> Result<(), String> {
+        Err("当前连接不支持在应用内修改对象定义".to_string())
+    }
+    /// MySQL / PostgreSQL namespace DDL. Names are validated and quoted by
+    /// each driver; no CASCADE is ever issued.
+    async fn create_database(
+        &self,
+        _name: &str,
+        _charset: Option<&str>,
+        _collation: Option<&str>,
+    ) -> Result<(), String> {
+        Err("当前连接不支持创建数据库".to_string())
+    }
+    async fn create_schema(&self, _name: &str) -> Result<(), String> {
+        Err("当前连接不支持创建模式".to_string())
+    }
+    async fn drop_database(&self, _name: &str) -> Result<(), String> {
+        Err("当前连接不支持删除数据库".to_string())
+    }
+    async fn drop_schema(&self, _name: &str) -> Result<(), String> {
+        Err("当前连接不支持删除模式".to_string())
+    }
+    /// Renames an object in place.
+    async fn rename_object(&self, _kind: &str, _name: &str, _new_name: &str) -> Result<(), String> {
         Err("当前连接不支持重命名该对象".to_string())
     }
     /// Drops an object. Callers are responsible for confirming with the user.
@@ -71,6 +118,13 @@ pub trait DatabaseDriver: Send + Sync {
     /// Opens a dedicated connection for an interactive transaction.
     async fn open_session(&self) -> Result<Box<dyn DatabaseSession>, String> {
         Err("当前连接不支持手动事务".to_string())
+    }
+    /// Cancels the statement currently running on `backend_id` without
+    /// terminating the connection. Returns `Ok(false)` when the server
+    /// declined the request (for example PostgreSQL `pg_cancel_backend`
+    /// returning false because the statement already finished).
+    async fn cancel_backend_query(&self, _backend_id: i64) -> Result<bool, String> {
+        Err("当前连接不支持取消查询".to_string())
     }
     /// Executes every statement inside one transaction. A failure rolls the
     /// whole batch back. Used by table data sync so a partial apply cannot
@@ -115,6 +169,71 @@ pub trait DatabaseDriver: Send + Sync {
     ) -> Result<(), String> {
         Err("当前驱动不支持重建表修改字段".to_string())
     }
+
+    /// CREATE TABLE statement used by logical database exports. PostgreSQL
+    /// overrides this to leave foreign keys out of the table body.
+    async fn dump_table_ddl(&self, table: &str) -> Result<String, String> {
+        Ok(self.table_structure(table).await?.ddl)
+    }
+
+    /// When true, the export engine writes `dump_index_statements` after the
+    /// table data instead of relying on the CREATE TABLE statement.
+    fn dump_indexes_separately(&self) -> bool {
+        false
+    }
+
+    async fn dump_index_statements(&self, _table: &str) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    /// When true, foreign keys are emitted as ALTER TABLE statements after the
+    /// table data instead of being part of `dump_table_ddl`.
+    fn dump_foreign_keys_separately(&self) -> bool {
+        false
+    }
+
+    /// Columns to write in INSERT statements (generated columns excluded) and
+    /// an optional clause inserted between the column list and VALUES.
+    async fn dump_insert_plan(&self, table: &str) -> Result<(Vec<String>, String), String> {
+        Ok((
+            self.list_columns(table)
+                .await?
+                .into_iter()
+                .map(|column| column.name)
+                .collect(),
+            String::new(),
+        ))
+    }
+
+    /// Streams every row of `table` as ready-to-append SQL literals. `None`
+    /// means SQL NULL; drivers must preserve binary values without placeholders.
+    async fn stream_sql_literal_rows(
+        &self,
+        _table: &str,
+        _columns: &[String],
+        _sink: &mut (dyn FnMut(Vec<Option<String>>) -> Result<(), String> + Send),
+    ) -> Result<u64, String> {
+        Err("当前驱动不支持 SQL 导出".to_string())
+    }
+
+    /// A DROP statement for one exported object, matching the driver's syntax.
+    async fn dump_object_drop(&self, kind: &str, name: &str) -> Result<String, String> {
+        let keyword = match kind {
+            "table" => "TABLE",
+            "view" => "VIEW",
+            "matview" => "MATERIALIZED VIEW",
+            "sequence" => "SEQUENCE",
+            "procedure" => "PROCEDURE",
+            "function" => "FUNCTION",
+            "trigger" => "TRIGGER",
+            "event" => "EVENT",
+            _ => return Err(format!("不支持删除该对象类型: {kind}")),
+        };
+        Ok(format!(
+            "DROP {keyword} IF EXISTS \"{}\";",
+            name.replace('"', "\"\"")
+        ))
+    }
     async fn read_rows(
         &self,
         table: &str,
@@ -124,6 +243,34 @@ pub trait DatabaseDriver: Send + Sync {
         order_by: Option<&str>,
         order_dir: Option<&str>,
     ) -> Result<TableRows, String>;
+    /// Multi-column sorting with a stable primary-key tiebreaker.
+    async fn read_rows_sorted(
+        &self,
+        table: &str,
+        limit: u64,
+        offset: u64,
+        filter: Option<&str>,
+        sorts: &[crate::models::TableSort],
+    ) -> Result<TableRows, String> {
+        let first = sorts.first();
+        self.read_rows(
+            table,
+            limit,
+            offset,
+            filter,
+            first.map(|sort| sort.column.as_str()),
+            first.map(|sort| sort.direction.as_str()),
+        )
+        .await
+    }
+    /// Applies deletes, updates and inserts in one transaction.
+    async fn apply_table_changes(
+        &self,
+        _table: &str,
+        _changes: &[crate::models::PendingTableChange],
+    ) -> Result<usize, String> {
+        Err("当前驱动不支持批量提交表变更".to_string())
+    }
     async fn update_row(
         &self,
         table: &str,
@@ -188,7 +335,10 @@ pub trait DatabaseDriver: Send + Sync {
             }
         }
 
-        Ok(ErDiagram { tables: nodes, relations })
+        Ok(ErDiagram {
+            tables: nodes,
+            relations,
+        })
     }
     /// Streams every row of `table` (or the first `limit` rows) into `sink`.
     /// The default implementation buffers via `read_rows`; drivers override it
@@ -200,14 +350,7 @@ pub trait DatabaseDriver: Send + Sync {
         sink: &mut (dyn FnMut(Vec<serde_json::Value>) -> Result<(), String> + Send),
     ) -> Result<u64, String> {
         let rows = self
-            .read_rows(
-                table,
-                limit.unwrap_or(i64::MAX as u64),
-                0,
-                None,
-                None,
-                None,
-            )
+            .read_rows(table, limit.unwrap_or(i64::MAX as u64), 0, None, None, None)
             .await?;
         let mut count = 0u64;
         for row in rows.rows {
@@ -267,12 +410,7 @@ pub fn rename_ddl_object(ddl: &str, replacement: &str) -> Result<String, String>
                 if word == "TABLE" || word == "VIEW" {
                     let name_start = skip_words(ddl, index, &["IF", "NOT", "EXISTS"]);
                     let (start, end) = parse_qualified_identifier(ddl, name_start)?;
-                    return Ok(format!(
-                        "{}{}{}",
-                        &ddl[..start],
-                        replacement,
-                        &ddl[end..]
-                    ));
+                    return Ok(format!("{}{}{}", &ddl[..start], replacement, &ddl[end..]));
                 }
             }
             _ => index += 1,
@@ -324,12 +462,7 @@ fn replace_identifier_after_keyword(
                 if ddl[start..index].eq_ignore_ascii_case(keyword) {
                     let name_start = skip_words(ddl, index, &["IF", "NOT", "EXISTS"]);
                     let (start, end) = parse_qualified_identifier(ddl, name_start)?;
-                    return Ok(format!(
-                        "{}{}{}",
-                        &ddl[..start],
-                        replacement,
-                        &ddl[end..]
-                    ));
+                    return Ok(format!("{}{}{}", &ddl[..start], replacement, &ddl[end..]));
                 }
             }
             _ => index += 1,
@@ -389,8 +522,7 @@ fn skip_words(ddl: &str, mut index: usize, words: &[&str]) -> usize {
             index += 1;
         }
         let start = index;
-        while index < bytes.len()
-            && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+        while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
         {
             index += 1;
         }
@@ -430,8 +562,9 @@ fn parse_identifier(ddl: &str, start: usize) -> Result<(usize, usize), String> {
         return Err("DDL 中缺少对象名".to_string());
     }
     let end = match bytes[start] {
-        quote @ (b'"' | b'`') => skip_quoted(ddl, start, quote)
-            .ok_or_else(|| "DDL 中的引号未闭合".to_string())?,
+        quote @ (b'"' | b'`') => {
+            skip_quoted(ddl, start, quote).ok_or_else(|| "DDL 中的引号未闭合".to_string())?
+        }
         b'[' => ddl[start..]
             .find(']')
             .map(|offset| start + offset + 1)
@@ -476,8 +609,7 @@ mod tests {
 
     #[test]
     fn renames_schema_qualified_view() {
-        let ddl =
-            "CREATE VIEW \"public\".\"item_names\" AS\n SELECT id FROM \"public\".\"items\";";
+        let ddl = "CREATE VIEW \"public\".\"item_names\" AS\n SELECT id FROM \"public\".\"items\";";
         assert_eq!(
             rename_ddl_object(ddl, "\"public\".\"item_names_copy\"").expect("rename"),
             "CREATE VIEW \"public\".\"item_names_copy\" AS\n SELECT id FROM \"public\".\"items\";"
@@ -503,12 +635,8 @@ mod tests {
     #[test]
     fn renames_sqlite_index() {
         let ddl = "CREATE UNIQUE INDEX idx_items_name ON items(name)";
-        let renamed = rename_index_ddl(
-            ddl,
-            "\"items_copy_idx_items_name\"",
-            "\"items_copy\"",
-        )
-        .expect("rename index");
+        let renamed = rename_index_ddl(ddl, "\"items_copy_idx_items_name\"", "\"items_copy\"")
+            .expect("rename index");
         assert_eq!(
             renamed,
             "CREATE UNIQUE INDEX \"items_copy_idx_items_name\" ON \"items_copy\"(name)"

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import Icon from "./Icon.vue";
 import * as api from "../lib/api";
@@ -7,6 +8,8 @@ import { writeClipboard } from "../lib/clipboard";
 import { useSyncScope } from "../lib/sync-scope";
 import type {
   ConnectionConfig,
+  SchemaApplyProgress,
+  SchemaApplyResult,
   SchemaDiff,
   SchemaTableDiff,
   TableInfo,
@@ -20,6 +23,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: [];
+  applied: [];
 }>();
 
 const sourceId = ref("");
@@ -37,8 +41,59 @@ const comparing = ref(false);
 const error = ref("");
 const message = ref("");
 const diff = ref<SchemaDiff | null>(null);
+const applyOpen = ref(false);
+const applying = ref(false);
+const applyError = ref("");
+const applyResult = ref<SchemaApplyResult | null>(null);
+const applyProgress = ref<SchemaApplyProgress | null>(null);
+const confirmDrops = ref(false);
+const confirmScope = ref("");
+const cancelRequested = ref(false);
+const operationId = ref("");
+let applyUnlisten: UnlistenFn | undefined;
 let tableLoadToken = 0;
 let targetTableLoadToken = 0;
+
+const targetConnection = computed(
+  () => props.connections.find((item) => item.id === targetId.value) ?? null,
+);
+const targetReadOnly = computed(() => Boolean(targetConnection.value?.readOnly));
+const targetScopeName = computed(
+  () =>
+    targetSchema.value ||
+    targetDatabase.value ||
+    targetConnection.value?.name ||
+    "",
+);
+const diffStatements = computed<string[]>(
+  () => diff.value?.tables.flatMap((table) => table.sql) ?? [],
+);
+const dangerousStatements = computed(() =>
+  diffStatements.value.filter((statement) =>
+    statement.trim().toUpperCase().startsWith("DROP "),
+  ),
+);
+const statementKinds = computed(() => {
+  const counts = { create: 0, alter: 0, drop: 0, other: 0 };
+  for (const statement of diffStatements.value) {
+    const upper = statement.trim().toUpperCase();
+    if (upper.startsWith("CREATE ")) counts.create += 1;
+    else if (upper.startsWith("ALTER ")) counts.alter += 1;
+    else if (upper.startsWith("DROP ")) counts.drop += 1;
+    else counts.other += 1;
+  }
+  return counts;
+});
+const applyReady = computed(() => {
+  if (!diffStatements.value.length || targetReadOnly.value) return false;
+  if (dangerousStatements.value.length) {
+    return (
+      confirmDrops.value &&
+      confirmScope.value.trim() === targetScopeName.value.trim()
+    );
+  }
+  return true;
+});
 
 const available = computed(() =>
   props.connections.filter((connection) => connection.driver !== "redis"),
@@ -234,27 +289,33 @@ watch(
   },
 );
 
+async function fetchDiff(): Promise<SchemaDiff> {
+  const scopedSource = driver.value === "mysql" || driver.value === "postgres";
+  const scopedTarget = scopedSource;
+  return api.compareSchemas(
+    sourceId.value,
+    targetId.value,
+    scopedSource ? sourceDatabase.value || null : null,
+    scopedSource ? sourceSchema.value || null : null,
+    scopedTarget ? targetDatabase.value || null : null,
+    scopedTarget ? targetSchema.value || null : null,
+    syncAllTables.value ? null : selectedTable.value || null,
+    syncAllTables.value ? null : targetTable.value || null,
+    includeIndexes.value,
+    includeForeignKeys.value,
+    includeDrops.value,
+  );
+}
+
 async function compare() {
   if (!canCompare.value || comparing.value) return;
   comparing.value = true;
   error.value = "";
   message.value = "";
-  const scopedSource = driver.value === "mysql" || driver.value === "postgres";
-  const scopedTarget = scopedSource;
+  applyOpen.value = false;
+  applyResult.value = null;
   try {
-    diff.value = await api.compareSchemas(
-      sourceId.value,
-      targetId.value,
-      scopedSource ? sourceDatabase.value || null : null,
-      scopedSource ? sourceSchema.value || null : null,
-      scopedTarget ? targetDatabase.value || null : null,
-      scopedTarget ? targetSchema.value || null : null,
-      syncAllTables.value ? null : selectedTable.value || null,
-      syncAllTables.value ? null : targetTable.value || null,
-      includeIndexes.value,
-      includeForeignKeys.value,
-      includeDrops.value,
-    );
+    diff.value = await fetchDiff();
   } catch (reason) {
     diff.value = null;
     error.value = String(reason);
@@ -323,6 +384,100 @@ async function saveSql() {
     error.value = String(reason);
   }
 }
+
+function openApply() {
+  if (!diffStatements.value.length || targetReadOnly.value) return;
+  applyOpen.value = true;
+  applyResult.value = null;
+  applyError.value = "";
+  applyProgress.value = null;
+  confirmDrops.value = false;
+  confirmScope.value = "";
+}
+
+async function applySchema() {
+  if (!applyReady.value || applying.value) return;
+  if (dangerousStatements.value.length) {
+    if (!confirmDrops.value) {
+      applyError.value = "请先确认执行删除语句";
+      return;
+    }
+    if (confirmScope.value.trim() !== targetScopeName.value.trim()) {
+      applyError.value = `请输入目标名称 ${targetScopeName.value} 以确认`;
+      return;
+    }
+  }
+  applying.value = true;
+  applyError.value = "";
+  applyResult.value = null;
+  applyProgress.value = null;
+  cancelRequested.value = false;
+  const expected = diffStatements.value.slice();
+  try {
+    const fresh = await fetchDiff();
+    const latest = fresh.tables.flatMap((table) => table.sql);
+    if (
+      latest.length !== expected.length ||
+      latest.some((statement, index) => statement !== expected[index])
+    ) {
+      applyError.value = "差异已变化，请重新对比后再应用；未执行任何语句";
+      diff.value = fresh;
+      return;
+    }
+    const id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `schema-${Date.now()}`;
+    operationId.value = id;
+    const result = await api.applySchemaSync(
+      targetId.value,
+      targetDatabase.value || null,
+      targetSchema.value || null,
+      expected,
+      id,
+    );
+    applyResult.value = result;
+    if (!result.error && !result.cancelled) {
+      emit("applied");
+      try {
+        diff.value = await fetchDiff();
+      } catch {
+        // Keep the apply result even if the follow-up comparison fails.
+      }
+    }
+  } catch (reason) {
+    applyError.value = String(reason);
+  } finally {
+    applying.value = false;
+    operationId.value = "";
+    cancelRequested.value = false;
+  }
+}
+
+async function cancelApply() {
+  if (!applying.value || !operationId.value) return;
+  cancelRequested.value = true;
+  try {
+    await api.cancelSchemaSync(operationId.value);
+  } catch (reason) {
+    applyError.value = String(reason);
+  }
+}
+
+onMounted(async () => {
+  applyUnlisten = await listen<SchemaApplyProgress>(
+    "schema-sync:progress",
+    (event) => {
+      if (event.payload.operationId === operationId.value) {
+        applyProgress.value = event.payload;
+      }
+    },
+  );
+});
+
+onBeforeUnmount(() => {
+  applyUnlisten?.();
+});
 </script>
 
 <template>
@@ -628,6 +783,96 @@ async function saveSql() {
               diff.sql || "-- 没有需要执行的变更"
             }}</pre>
           </section>
+
+          <section v-if="applyOpen" class="schema-apply-panel">
+            <div class="schema-apply-head">
+              <strong>应用到目标</strong>
+              <span class="hint">
+                {{ diff.targetLabel }} · {{ diffStatements.length }} 条语句
+              </span>
+            </div>
+            <div class="schema-apply-kinds">
+              <span>CREATE {{ statementKinds.create }}</span>
+              <span>ALTER {{ statementKinds.alter }}</span>
+              <span :class="{ danger: statementKinds.drop }">
+                DROP {{ statementKinds.drop }}
+              </span>
+              <span v-if="statementKinds.other">其他 {{ statementKinds.other }}</span>
+            </div>
+            <p v-if="targetReadOnly" class="message error">
+              目标连接为只读模式，无法应用结构变更。
+            </p>
+            <template v-if="dangerousStatements.length">
+              <p class="schema-apply-danger">
+                包含 {{ dangerousStatements.length }} 条删除语句（DROP），执行后不可自动恢复。
+              </p>
+              <label class="checkbox-row danger">
+                <input v-model="confirmDrops" type="checkbox" />
+                我确认执行删除语句
+              </label>
+              <label>
+                输入目标名称确认
+                <input
+                  v-model="confirmScope"
+                  :placeholder="targetScopeName"
+                  autocomplete="off"
+                />
+              </label>
+            </template>
+            <p class="draft-hint">
+              应用前会重新对比一次；若差异已变化会中止，不执行旧语句。PostgreSQL /
+              SQLite 使用单个事务，MySQL DDL 会隐式提交、失败后无法自动回滚。第一版不生成目标结构快照。
+            </p>
+
+            <div v-if="applying" class="schema-apply-progress">
+              <span>
+                第 {{ applyProgress?.index ?? 0 }} / {{ applyProgress?.total ?? diffStatements.length }} 条
+              </span>
+              <span class="hint">{{ applyProgress?.preview ?? "准备执行…" }}</span>
+              <button
+                class="button ghost compact"
+                :disabled="cancelRequested"
+                @click="cancelApply"
+              >
+                {{ cancelRequested ? "正在取消…" : "取消应用" }}
+              </button>
+            </div>
+
+            <div v-if="applyResult" class="schema-apply-result">
+              <p :class="applyResult.error ? 'message error' : 'message success'">
+                {{
+                  applyResult.cancelled
+                    ? "已取消应用"
+                    : applyResult.error
+                      ? "应用失败"
+                      : "应用成功"
+                }}
+                · 已执行 {{ applyResult.applied }} / {{ applyResult.total }} 条 ·
+                {{ applyResult.elapsedMs }} ms
+                <template v-if="applyResult.rolledBack"> · 已全部回滚</template>
+              </p>
+              <p v-if="applyResult.error" class="schema-apply-error">
+                {{ applyResult.error }}
+              </p>
+            </div>
+
+            <div class="schema-apply-actions">
+              <button
+                class="button ghost compact"
+                :disabled="applying"
+                @click="applyOpen = false"
+              >
+                收起
+              </button>
+              <button
+                class="button primary compact"
+                :disabled="!applyReady || applying"
+                @click="applySchema"
+              >
+                {{ applying ? "应用中…" : "确认应用" }}
+              </button>
+            </div>
+          </section>
         </template>
 
         <p v-else class="draft-hint">
@@ -649,6 +894,23 @@ async function saveSql() {
           @click="saveSql"
         >
           保存 SQL…
+        </button>
+        <button
+          class="button primary"
+          :disabled="
+            !diffStatements.length ||
+            targetReadOnly ||
+            applying ||
+            comparing
+          "
+          :title="
+            targetReadOnly
+              ? '目标连接为只读模式'
+              : '对比后审阅并应用到目标'
+          "
+          @click="openApply"
+        >
+          应用到目标…
         </button>
         <div class="spacer"></div>
         <button class="button ghost" @click="emit('close')">关闭</button>

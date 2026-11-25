@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
 import Icon from "./Icon.vue";
 import * as api from "../lib/api";
 import { writeClipboard } from "../lib/clipboard";
-import type { Driver } from "../lib/types";
+import type { Driver, TableInfo } from "../lib/types";
 
 const props = defineProps<{
   open: boolean;
@@ -25,6 +25,28 @@ interface DraftColumn {
   defaultValue: string;
   comment: string;
 }
+
+interface DraftIndex {
+  name: string;
+  columns: string;
+  unique: boolean;
+}
+
+interface DraftForeignKey {
+  name: string;
+  columns: string;
+  referencedTable: string;
+  referencedColumns: string;
+  onDelete: string;
+  onUpdate: string;
+}
+
+const REFERENTIAL_ACTIONS = [
+  "NO ACTION",
+  "RESTRICT",
+  "CASCADE",
+  "SET NULL",
+] as const;
 
 const sqliteTypes = ["TEXT", "INTEGER", "REAL", "BLOB", "NUMERIC"];
 const mysqlTypes = [
@@ -53,6 +75,10 @@ const postgresTypes = [
 
 const tableName = ref("");
 const columns = ref<DraftColumn[]>([]);
+const indexes = ref<DraftIndex[]>([]);
+const foreignKeys = ref<DraftForeignKey[]>([]);
+const tableComment = ref("");
+const availableTables = ref<TableInfo[]>([]);
 const error = ref("");
 const message = ref("");
 const executing = ref(false);
@@ -102,8 +128,21 @@ function reset() {
   const label = defaultColumn(1);
   label.name = "name";
   columns.value = [primary, label];
+  indexes.value = [];
+  foreignKeys.value = [];
+  tableComment.value = "";
   error.value = "";
   message.value = "";
+}
+
+async function loadReferencedTables() {
+  try {
+    availableTables.value = (await api.listTables(props.connectionId)).filter(
+      (table) => table.kind === "table",
+    );
+  } catch {
+    availableTables.value = [];
+  }
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -117,6 +156,7 @@ watch(
   (open) => {
     if (open) {
       reset();
+      void loadReferencedTables();
       document.addEventListener("keydown", onKeydown);
     } else {
       document.removeEventListener("keydown", onKeydown);
@@ -131,6 +171,29 @@ onBeforeUnmount(() => {
 
 function addColumn() {
   columns.value.push(defaultColumn(columns.value.length));
+}
+
+function addIndex() {
+  indexes.value.push({ name: "", columns: "", unique: false });
+}
+
+function removeIndex(index: number) {
+  indexes.value.splice(index, 1);
+}
+
+function addForeignKey() {
+  foreignKeys.value.push({
+    name: "",
+    columns: "",
+    referencedTable: availableTables.value[0]?.name ?? "",
+    referencedColumns: "",
+    onDelete: "NO ACTION",
+    onUpdate: "NO ACTION",
+  });
+}
+
+function removeForeignKey(index: number) {
+  foreignKeys.value.splice(index, 1);
 }
 
 function removeColumn(index: number) {
@@ -167,6 +230,21 @@ function quote(name: string): string {
 
 function isIntegerType(type: string): boolean {
   return /^(TINYINT|SMALLINT|MEDIUMINT|INT|BIGINT|INTEGER)/i.test(type);
+}
+
+function splitColumns(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function generatedIndexName(columnsList: string[]): string {
+  return `idx_${tableName.value.trim()}_${columnsList.join("_")}`;
+}
+
+function generatedForeignKeyName(columnsList: string[]): string {
+  return `fk_${tableName.value.trim()}_${columnsList.join("_")}`;
 }
 
 function validate(): boolean {
@@ -223,6 +301,67 @@ function validate(): boolean {
     }
   }
 
+  const indexNames = new Set<string>();
+  for (const index of indexes.value) {
+    const indexColumns = splitColumns(index.columns);
+    if (!indexColumns.length) {
+      error.value = "索引列不能为空";
+      return false;
+    }
+    for (const column of indexColumns) {
+      if (!names.has(column)) {
+        error.value = `索引引用了不存在的字段: ${column}`;
+        return false;
+      }
+    }
+    const indexName =
+      index.name.trim() || generatedIndexName(indexColumns);
+    if (indexNames.has(indexName)) {
+      error.value = `索引名重复: ${indexName}`;
+      return false;
+    }
+    indexNames.add(indexName);
+  }
+
+  const foreignKeyNames = new Set<string>();
+  for (const foreignKey of foreignKeys.value) {
+    const localColumns = splitColumns(foreignKey.columns);
+    const referencedColumns = splitColumns(foreignKey.referencedColumns);
+    if (!localColumns.length || !referencedColumns.length) {
+      error.value = "外键本地列和引用列都不能为空";
+      return false;
+    }
+    if (localColumns.length !== referencedColumns.length) {
+      error.value = "外键本地列与引用列数量必须一致";
+      return false;
+    }
+    for (const column of localColumns) {
+      if (!names.has(column)) {
+        error.value = `外键引用了不存在的本地字段: ${column}`;
+        return false;
+      }
+    }
+    if (!foreignKey.referencedTable.trim()) {
+      error.value = "请选择外键引用表";
+      return false;
+    }
+    if (
+      !availableTables.value.some(
+        (table) => table.name === foreignKey.referencedTable,
+      )
+    ) {
+      error.value = `外键引用表不存在: ${foreignKey.referencedTable}`;
+      return false;
+    }
+    const foreignKeyName =
+      foreignKey.name.trim() || generatedForeignKeyName(localColumns);
+    if (foreignKeyNames.has(foreignKeyName)) {
+      error.value = `外键名重复: ${foreignKeyName}`;
+      return false;
+    }
+    foreignKeyNames.add(foreignKeyName);
+  }
+
   return true;
 }
 
@@ -260,9 +399,45 @@ function buildDdl(): string {
     if (primaryKeys.length) {
       definitions.push(`PRIMARY KEY (${primaryColumns})`);
     }
+    for (const index of indexes.value) {
+      const indexColumns = splitColumns(index.columns);
+      if (!indexColumns.length) continue;
+      const indexName =
+        index.name.trim() || generatedIndexName(indexColumns);
+      definitions.push(
+        `${index.unique ? "UNIQUE " : ""}KEY ${quote(indexName)} (${indexColumns
+          .map(quote)
+          .join(", ")})`,
+      );
+    }
+    for (const foreignKey of foreignKeys.value) {
+      const localColumns = splitColumns(foreignKey.columns);
+      const referencedColumns = splitColumns(foreignKey.referencedColumns);
+      if (!localColumns.length || !referencedColumns.length) continue;
+      const foreignKeyName =
+        foreignKey.name.trim() || generatedForeignKeyName(localColumns);
+      let definition = `CONSTRAINT ${quote(foreignKeyName)} FOREIGN KEY (${localColumns
+        .map(quote)
+        .join(", ")}) REFERENCES ${quote(foreignKey.referencedTable)} (${referencedColumns
+        .map(quote)
+        .join(", ")})`;
+      if (foreignKey.onDelete !== "NO ACTION") {
+        definition += ` ON DELETE ${foreignKey.onDelete}`;
+      }
+      if (foreignKey.onUpdate !== "NO ACTION") {
+        definition += ` ON UPDATE ${foreignKey.onUpdate}`;
+      }
+      definitions.push(definition);
+    }
+    const comment = tableComment.value.trim()
+      ? ` COMMENT='${tableComment.value
+          .trim()
+          .replaceAll("\\", "\\\\")
+          .replaceAll("'", "''")}'`
+      : "";
     return `CREATE TABLE ${quote(name)} (\n  ${definitions.join(
       ",\n  ",
-    )}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`;
+    )}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4${comment};`;
   }
 
   if (props.driver === "postgres") {
@@ -299,6 +474,25 @@ function buildDdl(): string {
   if (!sqliteInlinePrimary && primaryKeys.length) {
     definitions.push(`PRIMARY KEY (${primaryColumns})`);
   }
+  for (const foreignKey of foreignKeys.value) {
+    const localColumns = splitColumns(foreignKey.columns);
+    const referencedColumns = splitColumns(foreignKey.referencedColumns);
+    if (!localColumns.length || !referencedColumns.length) continue;
+    const foreignKeyName =
+      foreignKey.name.trim() || generatedForeignKeyName(localColumns);
+    let definition = `CONSTRAINT ${quote(foreignKeyName)} FOREIGN KEY (${localColumns
+      .map(quote)
+      .join(", ")}) REFERENCES ${quote(foreignKey.referencedTable)} (${referencedColumns
+      .map(quote)
+      .join(", ")})`;
+    if (foreignKey.onDelete !== "NO ACTION") {
+      definition += ` ON DELETE ${foreignKey.onDelete}`;
+    }
+    if (foreignKey.onUpdate !== "NO ACTION") {
+      definition += ` ON UPDATE ${foreignKey.onUpdate}`;
+    }
+    definitions.push(definition);
+  }
   return `CREATE TABLE ${quote(name)} (\n  ${definitions.join(
     ",\n  ",
   )}\n);`;
@@ -307,15 +501,84 @@ function buildDdl(): string {
 function buildCommentStatements(): string[] {
   if (props.driver !== "postgres") return [];
   const name = tableName.value.trim();
-  return columns.value
-    .filter((column) => column.name.trim() && column.comment.trim())
-    .map(
-      (column) =>
-        `COMMENT ON COLUMN ${quote(name)}.${quote(column.name.trim())} IS '${column.comment.replaceAll("'", "''")}';`,
+  const statements: string[] = [];
+  if (tableComment.value.trim()) {
+    statements.push(
+      `COMMENT ON TABLE ${quote(name)} IS '${tableComment.value
+        .trim()
+        .replaceAll("'", "''")}';`,
     );
+  }
+  for (const column of columns.value) {
+    if (column.name.trim() && column.comment.trim()) {
+      statements.push(
+        `COMMENT ON COLUMN ${quote(name)}.${quote(
+          column.name.trim(),
+        )} IS '${column.comment.replaceAll("'", "''")}';`,
+      );
+    }
+  }
+  return statements;
 }
 
-const ddl = computed(() => buildDdl());
+function buildIndexStatements(): string[] {
+  if (props.driver === "mysql") return [];
+  const name = tableName.value.trim();
+  return indexes.value.flatMap((index) => {
+    const indexColumns = splitColumns(index.columns);
+    if (!indexColumns.length) return [];
+    const indexName =
+      index.name.trim() || generatedIndexName(indexColumns);
+    return [
+      `CREATE ${index.unique ? "UNIQUE " : ""}INDEX ${quote(
+        indexName,
+      )} ON ${quote(name)} (${indexColumns.map(quote).join(", ")});`,
+    ];
+  });
+}
+
+function buildForeignKeyStatements(): string[] {
+  if (props.driver !== "postgres") return [];
+  const name = tableName.value.trim();
+  return foreignKeys.value.flatMap((foreignKey) => {
+    const localColumns = splitColumns(foreignKey.columns);
+    const referencedColumns = splitColumns(foreignKey.referencedColumns);
+    if (!localColumns.length || !referencedColumns.length) return [];
+    const foreignKeyName =
+      foreignKey.name.trim() || generatedForeignKeyName(localColumns);
+    let statement = `ALTER TABLE ${quote(
+      name,
+    )} ADD CONSTRAINT ${quote(foreignKeyName)} FOREIGN KEY (${localColumns
+      .map(quote)
+      .join(", ")}) REFERENCES ${quote(
+      foreignKey.referencedTable,
+    )} (${referencedColumns.map(quote).join(", ")})`;
+    if (foreignKey.onDelete !== "NO ACTION") {
+      statement += ` ON DELETE ${foreignKey.onDelete}`;
+    }
+    if (foreignKey.onUpdate !== "NO ACTION") {
+      statement += ` ON UPDATE ${foreignKey.onUpdate}`;
+    }
+    return [`${statement};`];
+  });
+}
+
+function buildStatements(): string[] {
+  if (!tableName.value.trim()) return [];
+  return [
+    buildDdl(),
+    ...buildCommentStatements(),
+    ...buildIndexStatements(),
+    ...buildForeignKeyStatements(),
+  ];
+}
+
+const ddl = computed(() => {
+  const statements = buildStatements();
+  return statements.length
+    ? statements.join("\n")
+    : "-- 请输入表名后预览 DDL";
+});
 
 async function copyDdl() {
   try {
@@ -330,25 +593,43 @@ async function execute() {
   if (!validate() || executing.value) return;
 
   executing.value = true;
+  const statements = buildStatements();
   try {
-    await api.executeQuery(props.connectionId, ddl.value, 1);
-    let warning = "";
-    const comments = buildCommentStatements();
-    for (const statement of comments) {
-      try {
+    if (props.driver === "mysql") {
+      for (const statement of statements) {
         await api.executeQuery(props.connectionId, statement, 1);
+      }
+    } else {
+      const sessionId = `create-table-${Date.now()}`;
+      await api.beginTransaction(props.connectionId, sessionId);
+      try {
+        for (const statement of statements) {
+          await api.executeTransactionQuery(
+            props.connectionId,
+            sessionId,
+            statement,
+          );
+        }
+        await api.commitTransaction(props.connectionId, sessionId);
       } catch (reason) {
-        warning = `表已创建，但写入注释失败: ${reason}`;
-        break;
+        try {
+          await api.rollbackTransaction(props.connectionId, sessionId);
+        } catch {
+          // The original error is more useful than a rollback error.
+        }
+        throw reason;
       }
     }
+
+    let warning = "";
     if (
       props.driver === "sqlite" &&
-      columns.value.some(
-        (column) => column.name.trim() && column.comment.trim(),
-      )
+      (tableComment.value.trim() ||
+        columns.value.some(
+          (column) => column.name.trim() && column.comment.trim(),
+        ))
     ) {
-      warning ||= "SQLite 不支持字段注释，已忽略";
+      warning = "SQLite 不支持表 / 字段注释，已忽略";
     }
     emit("created", tableName.value.trim(), warning || undefined);
   } catch (reason) {
@@ -472,6 +753,123 @@ async function execute() {
           注释在 MySQL 写入建表语句，PostgreSQL 建表后执行 COMMENT ON，SQLite 忽略。
         </p>
 
+        <label class="span-2 table-comment-field">
+          表注释
+          <input
+            v-model="tableComment"
+            placeholder="可选；MySQL 写入 COMMENT，PostgreSQL 生成 COMMENT ON TABLE"
+          />
+        </label>
+
+        <div class="draft-columns">
+          <div class="draft-columns-head">
+            <span>索引</span>
+            <button class="button ghost compact" @click="addIndex">
+              <Icon name="plus" :size="14" />
+              添加索引
+            </button>
+          </div>
+          <div v-if="!indexes.length" class="draft-hint">
+            可选；索引名留空时自动生成 idx_表名_列名。
+          </div>
+          <div
+            v-for="(index, indexPosition) in indexes"
+            :key="indexPosition"
+            class="designer-row index-row"
+          >
+            <input v-model="index.name" placeholder="索引名（可留空）" />
+            <input
+              v-model="index.columns"
+              placeholder="列，按顺序逗号分隔"
+            />
+            <label class="inline-check">
+              <input v-model="index.unique" type="checkbox" />
+              唯一
+            </label>
+            <button
+              class="icon-button"
+              title="删除索引"
+              aria-label="删除索引"
+              @click="removeIndex(indexPosition)"
+            >
+              <Icon name="trash" :size="14" />
+            </button>
+          </div>
+        </div>
+
+        <div class="draft-columns">
+          <div class="draft-columns-head">
+            <span>外键</span>
+            <button
+              class="button ghost compact"
+              :disabled="!availableTables.length"
+              @click="addForeignKey"
+            >
+              <Icon name="plus" :size="14" />
+              添加外键
+            </button>
+          </div>
+          <div v-if="!availableTables.length" class="draft-hint">
+            当前范围没有可引用的表，或无法读取表列表。
+          </div>
+          <div v-else-if="!foreignKeys.length" class="draft-hint">
+            可选；SQLite 会写入建表语句，PostgreSQL 建表后 ALTER TABLE 添加。
+          </div>
+          <div
+            v-for="(foreignKey, foreignKeyPosition) in foreignKeys"
+            :key="foreignKeyPosition"
+            class="designer-row foreign-key-row"
+          >
+            <input v-model="foreignKey.name" placeholder="约束名（可留空）" />
+            <input
+              v-model="foreignKey.columns"
+              placeholder="本地列，逗号分隔"
+            />
+            <select v-model="foreignKey.referencedTable">
+              <option
+                v-for="table in availableTables"
+                :key="table.name"
+                :value="table.name"
+              >
+                {{ table.name }}
+              </option>
+            </select>
+            <input
+              v-model="foreignKey.referencedColumns"
+              placeholder="引用列，逗号分隔"
+            />
+            <select v-model="foreignKey.onDelete" title="ON DELETE">
+              <option
+                v-for="action in REFERENTIAL_ACTIONS"
+                :key="`delete-${action}`"
+                :value="action"
+              >
+                DELETE {{ action }}
+              </option>
+            </select>
+            <select v-model="foreignKey.onUpdate" title="ON UPDATE">
+              <option
+                v-for="action in REFERENTIAL_ACTIONS"
+                :key="`update-${action}`"
+                :value="action"
+              >
+                UPDATE {{ action }}
+              </option>
+            </select>
+            <button
+              class="icon-button"
+              title="删除外键"
+              aria-label="删除外键"
+              @click="removeForeignKey(foreignKeyPosition)"
+            >
+              <Icon name="trash" :size="14" />
+            </button>
+          </div>
+          <p v-if="foreignKeys.length && driver === 'sqlite'" class="draft-hint">
+            SQLite 要求被引用列具有唯一约束；这里只提示，不阻断创建。
+          </p>
+        </div>
+
         <section class="ddl-section">
           <h3>DDL 预览</h3>
           <pre class="ddl-preview">{{ ddl }}</pre>
@@ -492,3 +890,31 @@ async function execute() {
     </div>
   </div>
 </template>
+
+<style scoped>
+.table-comment-field {
+  margin-top: 10px;
+}
+
+.designer-row {
+  display: grid;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.index-row {
+  grid-template-columns: minmax(130px, 1fr) minmax(160px, 1.6fr) 70px 32px;
+}
+
+.foreign-key-row {
+  grid-template-columns:
+    minmax(110px, 0.9fr) minmax(100px, 0.8fr) minmax(110px, 0.9fr)
+    minmax(100px, 0.8fr) minmax(110px, 0.8fr) minmax(110px, 0.8fr) 32px;
+}
+
+.designer-row input,
+.designer-row select {
+  min-width: 0;
+}
+</style>

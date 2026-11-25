@@ -1,14 +1,19 @@
 <script setup lang="ts">
 import {
   computed,
+  nextTick,
   onBeforeUnmount,
   onMounted,
   reactive,
   ref,
   watch,
 } from "vue";
-import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import ConfirmDialog from "./ConfirmDialog.vue";
+import BatchSetDialog from "./BatchSetDialog.vue";
+import ChangePreviewDialog from "./ChangePreviewDialog.vue";
+import CellValueDialog from "./CellValueDialog.vue";
+import FilterBuilderDialog from "./FilterBuilderDialog.vue";
 import Icon from "./Icon.vue";
 import * as api from "../lib/api";
 import { writeClipboard } from "../lib/clipboard";
@@ -19,7 +24,14 @@ import {
   buildRowUpdate,
 } from "../lib/row-copy";
 import { quoteIdentifier, sqlLiteral } from "../lib/sql-literal";
-import type { ColumnInfo, ColumnValue, Driver } from "../lib/types";
+import { useVirtualRows } from "../lib/virtual-rows";
+import type {
+  ColumnInfo,
+  ColumnValue,
+  Driver,
+  PendingTableChange,
+  TableSort,
+} from "../lib/types";
 
 const props = defineProps<{
   connectionId: string;
@@ -29,6 +41,12 @@ const props = defineProps<{
   driver?: Driver;
   database?: string;
   schema?: string | null;
+  readOnly?: boolean;
+}>();
+
+const emit = defineEmits<{
+  "generate-data": [];
+  "import-data": [];
 }>();
 
 const vFocus = {
@@ -54,6 +72,25 @@ interface ResizeState {
   startWidth: number;
 }
 
+interface InsertDraft {
+  id: number;
+  values: Array<unknown | undefined>;
+}
+
+interface DisplayRow {
+  values: unknown[];
+  origin: number | null;
+  insertId?: number;
+  state: "clean" | "update" | "delete" | "insert";
+}
+
+interface PendingGuard {
+  reason: string;
+  action: () => void | Promise<void>;
+}
+
+const PAGE_SIZE_KEY = "mydb.tablePageSize.v1";
+
 const columns = ref<ColumnInfo[]>([]);
 const rows = ref<unknown[][]>([]);
 const total = ref(0);
@@ -68,17 +105,32 @@ let messageTimer = 0;
 const editing = ref<EditingCell | null>(null);
 const insertOpen = ref(false);
 const insertValues = reactive<Record<string, string>>({});
-const sortColumn = ref<string | null>(null);
-const sortDirection = ref<"asc" | "desc">("asc");
+const sorts = ref<TableSort[]>([]);
 const filterOpen = ref(false);
 const filterDraft = ref("");
 const appliedFilter = ref("");
 const columnWidths = reactive<Record<string, number>>({});
 const cellMenu = ref<CellMenu | null>(null);
 const copyAsOpen = ref(false);
-const deleteRequest = ref<{ keys: ColumnValue[]; detail: string } | null>(null);
 const importRequest = ref<{ path: string } | null>(null);
 const importHasHeader = ref(true);
+const updates = ref<Record<number, Record<string, unknown>>>({});
+const pendingDeletes = ref<Set<number>>(new Set());
+const pendingInserts = ref<InsertDraft[]>([]);
+const selectedRows = ref<Set<number>>(new Set());
+const pageInput = ref("1");
+const previewOpen = ref(false);
+const batchSetOpen = ref(false);
+const filterBuilderOpen = ref(false);
+const pendingGuard = ref<PendingGuard | null>(null);
+const batchDeleteCount = ref<number | null>(null);
+const valueViewer = ref<{
+  rowIndex: number;
+  colIndex: number;
+} | null>(null);
+const scrollRef = ref<HTMLElement | null>(null);
+let insertDraftSequence = 0;
+let selectionAnchor: number | null = null;
 let resizeState: ResizeState | null = null;
 
 const primaryKeys = computed(() =>
@@ -103,9 +155,94 @@ const matchColumns = computed(() =>
 const singleRowMatch = computed(() => primaryKeys.value.length === 0);
 const canEdit = computed(
   () =>
+    !props.readOnly &&
     columns.value.length > 0 &&
     (primaryKeys.value.length > 0 ||
       (isTable.value && matchColumns.value.length > 0)),
+);
+
+const displayRows = computed<DisplayRow[]>(() => {
+  const list: DisplayRow[] = rows.value.map((row, origin) => {
+    const overlay = updates.value[origin];
+    let values = row;
+    if (overlay) {
+      values = row.slice();
+      for (const [name, value] of Object.entries(overlay)) {
+        const index = columnIndex(name);
+        if (index >= 0) values[index] = value;
+      }
+    }
+    return {
+      values,
+      origin,
+      state: pendingDeletes.value.has(origin)
+        ? "delete"
+        : overlay && Object.keys(overlay).length
+          ? "update"
+          : "clean",
+    };
+  });
+  for (const draft of pendingInserts.value) {
+    list.push({
+      values: draft.values as unknown[],
+      origin: null,
+      insertId: draft.id,
+      state: "insert",
+    });
+  }
+  return list;
+});
+
+const {
+  enabled: virtualEnabled,
+  start: virtualStart,
+  end: virtualEnd,
+  paddingTop: virtualPaddingTop,
+  paddingBottom: virtualPaddingBottom,
+  scrollToTop,
+} = useVirtualRows({
+  container: scrollRef,
+  rowCount: computed(() => displayRows.value.length),
+  rowHeight: 30,
+  overscan: 10,
+});
+
+const virtualRows = computed(() => {
+  const list = displayRows.value.slice(
+    virtualStart.value,
+    virtualEnd.value,
+  );
+  return list.map((row, offset) => ({
+    row,
+    index: virtualStart.value + offset,
+  }));
+});
+
+// Do not recycle the row while a cell editor is open: commit the pending
+// value first, matching the existing blur / Enter behaviour.
+watch([virtualStart, virtualEnd], ([start, end]) => {
+  const current = editing.value;
+  if (current && (current.rowIndex < start || current.rowIndex >= end)) {
+    commitEdit();
+  }
+});
+
+const pendingCount = computed(() => {
+  const updated = Object.keys(updates.value).filter(
+    (key) => !pendingDeletes.value.has(Number(key)),
+  ).length;
+  return updated + pendingDeletes.value.size + pendingInserts.value.length;
+});
+const hasPendingChanges = computed(() => pendingCount.value > 0);
+const selectedCount = computed(() => selectedRows.value.size);
+const allDisplaySelected = computed(
+  () =>
+    displayRows.value.length > 0 &&
+    displayRows.value.every((_, index) => selectedRows.value.has(index)),
+);
+
+const batchSetColumns = computed(() =>
+  columns.value.filter((column) => !isBinaryColumn(column)),
 );
 const updateCopyReason = computed(() => {
   if (loading.value) return "数据加载中";
@@ -127,6 +264,12 @@ const page = computed(() => Math.floor(offset.value / limit.value) + 1);
 const pageCount = computed(() =>
   Math.max(1, Math.ceil(total.value / limit.value)),
 );
+const pendingChanges = computed(() => buildPendingChanges());
+const pendingSql = computed(() => buildPendingSql(pendingChanges.value));
+
+function sortDirectionFor(column: string): "asc" | "desc" | null {
+  return sorts.value.find((sort) => sort.column === column)?.direction ?? null;
+}
 const insertColumns = computed(() =>
   columns.value.filter((column) => !column.autoIncrement),
 );
@@ -252,7 +395,61 @@ function onGlobalKey(event: KeyboardEvent) {
 
 function menuValue(): unknown {
   if (!cellMenu.value) return null;
-  return rows.value[cellMenu.value.rowIndex]?.[cellMenu.value.colIndex];
+  return displayRows.value[cellMenu.value.rowIndex]?.values[
+    cellMenu.value.colIndex
+  ];
+}
+
+const viewerValue = computed<unknown>(() => {
+  const viewer = valueViewer.value;
+  if (!viewer) return null;
+  return displayRows.value[viewer.rowIndex]?.values[viewer.colIndex];
+});
+
+const viewerColumn = computed(() => {
+  const viewer = valueViewer.value;
+  if (!viewer) return "";
+  return columns.value[viewer.colIndex]?.name ?? "";
+});
+
+const viewerType = computed(() => {
+  const viewer = valueViewer.value;
+  if (!viewer) return "";
+  return columns.value[viewer.colIndex]?.dataType ?? "";
+});
+
+const viewerRowLabel = computed(() => {
+  const viewer = valueViewer.value;
+  if (!viewer) return "";
+  const row = displayRows.value[viewer.rowIndex];
+  if (!row) return "";
+  if (row.state === "insert") return "新增行（未提交）";
+  return `第 ${offset.value + viewer.rowIndex + 1} 行`;
+});
+
+function openValueFromMenu() {
+  const menu = cellMenu.value;
+  if (!menu) return;
+  valueViewer.value = {
+    rowIndex: menu.rowIndex,
+    colIndex: menu.colIndex,
+  };
+  closeCellMenu();
+}
+
+function closeValueViewer() {
+  const viewer = valueViewer.value;
+  valueViewer.value = null;
+  if (!viewer) return;
+  const row = viewer.rowIndex;
+  const column = viewer.colIndex;
+  void nextTick(() => {
+    scrollRef.value
+      ?.querySelector<HTMLElement>(
+        `[data-cell="${row}:${column}"]`,
+      )
+      ?.focus();
+  });
 }
 
 async function copyCellValue() {
@@ -268,7 +465,7 @@ async function copyCellValue() {
 
 async function copyRowValues() {
   if (!cellMenu.value) return;
-  const row = rows.value[cellMenu.value.rowIndex];
+  const row = displayRows.value[cellMenu.value.rowIndex]?.values;
   if (!row) return;
   try {
     await writeClipboard(row.map(formatCell).join("\t"));
@@ -282,7 +479,7 @@ async function copyRowValues() {
 function menuRow(): unknown[] | null {
   const menu = cellMenu.value;
   if (!menu) return null;
-  return rows.value[menu.rowIndex] ?? null;
+  return displayRows.value[menu.rowIndex]?.values ?? null;
 }
 
 function tableIdentifier(): string {
@@ -342,21 +539,24 @@ function filterByValue() {
   const column = columns.value[cellMenu.value.colIndex];
   if (!column) return;
   const condition = conditionFor(column, menuValue());
-  filterDraft.value = condition;
-  appliedFilter.value = condition;
-  filterOpen.value = true;
   closeCellMenu();
-  void load(0);
+  ensureClean("筛选", () => {
+    filterDraft.value = condition;
+    appliedFilter.value = condition;
+    filterOpen.value = true;
+    void load(0);
+  });
 }
 
 function sortByValue(direction: "asc" | "desc") {
   if (!cellMenu.value) return;
   const column = columns.value[cellMenu.value.colIndex];
   if (!column) return;
-  sortColumn.value = column.name;
-  sortDirection.value = direction;
   closeCellMenu();
-  void load(0);
+  ensureClean("排序", () => {
+    sorts.value = [{ column: column.name, direction }];
+    void load(0);
+  });
 }
 
 function deleteFromMenu() {
@@ -388,13 +588,20 @@ async function load(nextOffset = offset.value) {
       limit.value,
       Math.max(0, nextOffset),
       appliedFilter.value || undefined,
-      sortColumn.value ?? undefined,
-      sortColumn.value ? sortDirection.value : undefined,
+      undefined,
+      undefined,
+      sorts.value,
     );
     columns.value = pageData.columns;
     rows.value = pageData.rows;
     total.value = pageData.total;
     offset.value = pageData.offset;
+    pageInput.value = String(
+      Math.floor(pageData.offset / limit.value) + 1,
+    );
+    selectedRows.value = new Set();
+    selectionAnchor = null;
+    scrollToTop();
   } catch (reason) {
     rows.value = [];
     total.value = 0;
@@ -408,8 +615,7 @@ watch(
   [() => props.connectionId, () => props.table],
   () => {
     clearMessage();
-    sortColumn.value = null;
-    sortDirection.value = "asc";
+    sorts.value = [];
     filterOpen.value = false;
     filterDraft.value = "";
     appliedFilter.value = "";
@@ -420,41 +626,122 @@ watch(
     columns.value = [];
     rows.value = [];
     total.value = 0;
+    clearPendingState();
+    rows.value = [];
+    const saved = readSavedPageSize();
+    limit.value = saved;
+    pageInput.value = "1";
     void load(0);
   },
   { immediate: true },
 );
 
+function readSavedPageSize(): number {
+  try {
+    const stored = window.localStorage.getItem(PAGE_SIZE_KEY);
+    if (!stored) return 100;
+    const parsed = JSON.parse(stored) as Record<string, number>;
+    const value = parsed[pageSizeKey()];
+    return [50, 100, 200, 500].includes(value) ? value : 100;
+  } catch {
+    return 100;
+  }
+}
+
+function pageSizeKey(): string {
+  return `${driverKind.value}:${props.table}`;
+}
+
+function savePageSize(size: number) {
+  try {
+    const stored = window.localStorage.getItem(PAGE_SIZE_KEY);
+    const parsed = stored ? (JSON.parse(stored) as Record<string, number>) : {};
+    parsed[pageSizeKey()] = size;
+    window.localStorage.setItem(PAGE_SIZE_KEY, JSON.stringify(parsed));
+  } catch {
+    // Page size persistence is best-effort.
+  }
+}
+
 function applyFilter() {
-  appliedFilter.value = filterDraft.value.trim();
-  void load(0);
+  ensureClean("筛选", () => {
+    appliedFilter.value = filterDraft.value.trim();
+    void load(0);
+  });
 }
 
 function clearFilter() {
-  filterDraft.value = "";
-  appliedFilter.value = "";
-  filterOpen.value = false;
-  void load(0);
+  ensureClean("清除筛选", () => {
+    filterDraft.value = "";
+    appliedFilter.value = "";
+    filterOpen.value = false;
+    void load(0);
+  });
 }
 
-function toggleSort(columnName: string) {
-  if (sortColumn.value === columnName) {
-    if (sortDirection.value === "asc") {
-      sortDirection.value = "desc";
+function applyBuilderFilter(filter: string) {
+  filterBuilderOpen.value = false;
+  ensureClean("筛选", () => {
+    filterDraft.value = filter;
+    appliedFilter.value = filter;
+    filterOpen.value = true;
+    void load(0);
+  });
+}
+
+function toggleSort(columnName: string, additive = false) {
+  ensureClean("排序", () => {
+    const existing = sorts.value.find((sort) => sort.column === columnName);
+    if (additive) {
+      if (!existing) {
+        sorts.value = [
+          ...sorts.value,
+          { column: columnName, direction: "asc" },
+        ];
+      } else if (existing.direction === "asc") {
+        sorts.value = sorts.value.map((sort) =>
+          sort.column === columnName ? { ...sort, direction: "desc" } : sort,
+        );
+      } else {
+        sorts.value = sorts.value.filter(
+          (sort) => sort.column !== columnName,
+        );
+      }
+    } else if (existing) {
+      if (sorts.value.length === 1 && existing.direction === "asc") {
+        sorts.value = sorts.value.map((sort) => ({
+          ...sort,
+          direction: "desc",
+        }));
+      } else {
+        sorts.value = [];
+      }
     } else {
-      sortColumn.value = null;
-      sortDirection.value = "asc";
+      sorts.value = [{ column: columnName, direction: "asc" }];
     }
-  } else {
-    sortColumn.value = columnName;
-    sortDirection.value = "asc";
-  }
-  void load(0);
+    void load(0);
+  });
+}
+
+function removeSort(column: string) {
+  ensureClean("排序", () => {
+    sorts.value = sorts.value.filter((sort) => sort.column !== column);
+    void load(0);
+  });
+}
+
+function clearSorts() {
+  ensureClean("清除排序", () => {
+    sorts.value = [];
+    void load(0);
+  });
 }
 
 function startEdit(rowIndex: number, colIndex: number) {
   if (!canEdit.value || saving.value) return;
-  const value = rows.value[rowIndex]?.[colIndex];
+  const row = displayRows.value[rowIndex];
+  if (!row || row.state === "delete") return;
+  const value = row.values[colIndex];
   editing.value = {
     rowIndex,
     colIndex,
@@ -486,86 +773,140 @@ function rowKeys(row: unknown[]): ColumnValue[] {
   }));
 }
 
-async function commitEdit() {
-  if (!editing.value || saving.value) return;
-  const current = editing.value;
+function sameValue(left: unknown, right: unknown): boolean {
+  if (isNull(left) && isNull(right)) return true;
+  return left === right;
+}
 
+function setCellPending(
+  displayIndex: number,
+  colIndex: number,
+  value: unknown,
+) {
+  const row = displayRows.value[displayIndex];
+  const column = columns.value[colIndex];
+  if (!row || !column || row.state === "delete") return;
+  if (row.origin === null) {
+    const draftIndex = pendingInserts.value.findIndex(
+      (draft) => draft.id === row.insertId,
+    );
+    if (draftIndex >= 0) {
+      pendingInserts.value[draftIndex].values[colIndex] = value;
+    }
+    return;
+  }
+  const original = rows.value[row.origin]?.[colIndex];
+  const overlay = { ...(updates.value[row.origin] ?? {}) };
+  if (sameValue(original, value)) {
+    delete overlay[column.name];
+  } else {
+    overlay[column.name] = value;
+  }
+  const next = { ...updates.value };
+  if (Object.keys(overlay).length) {
+    next[row.origin] = overlay;
+  } else {
+    delete next[row.origin];
+  }
+  updates.value = next;
+}
+
+function commitEdit() {
+  if (!editing.value) return;
+  const current = editing.value;
   const column = columns.value[current.colIndex];
-  const row = rows.value[current.rowIndex];
+  const row = displayRows.value[current.rowIndex];
   if (!column || !row) {
     editing.value = null;
     return;
   }
-
-  const original = row[current.colIndex];
+  const original = row.values[current.colIndex];
   if (current.value === (isNull(original) ? "" : String(original))) {
     editing.value = null;
     return;
   }
-
-  saving.value = true;
-  error.value = "";
-  try {
-    await api.updateTableRow(
-      props.connectionId,
-      props.table,
-      rowKeys(row),
-      [{ column: column.name, value: parseInput(current.value, column) }],
-      singleRowMatch.value,
-    );
-    editing.value = null;
-    await load(offset.value);
-    showMessage(`已更新 ${props.table} 的 1 行`);
-  } catch (reason) {
-    error.value = String(reason);
-    // Keep the editor and the user's input so a failed UPDATE is recoverable.
-    editing.value = current;
-  } finally {
-    saving.value = false;
-  }
+  setCellPending(
+    current.rowIndex,
+    current.colIndex,
+    parseInput(current.value, column),
+  );
+  editing.value = null;
+  showMessage("已加入待提交，尚未写入数据库");
 }
 
-async function deleteRow(rowIndex: number) {
+function deleteRow(rowIndex: number) {
   if (!canEdit.value || saving.value) return;
-  const row = rows.value[rowIndex];
+  const row = displayRows.value[rowIndex];
   if (!row) return;
-
-  const keys = rowKeys(row);
-  deleteRequest.value = {
-    keys,
-    detail: singleRowMatch.value
-      ? `匹配整行 ${keys.length} 个字段（无主键，仅删除 1 行）`
-      : keys
-          .map((key) => `${key.column} = ${formatCell(key.value)}`)
-          .join("\n"),
-  };
+  if (row.origin === null) {
+    pendingInserts.value = pendingInserts.value.filter(
+      (draft) => draft.id !== row.insertId,
+    );
+    showMessage("已移除新增草稿");
+    return;
+  }
+  if (pendingDeletes.value.has(row.origin)) {
+    restoreRow(rowIndex);
+    return;
+  }
+  pendingDeletes.value = new Set([
+    ...pendingDeletes.value,
+    row.origin,
+  ]);
+  if (updates.value[row.origin]) {
+    const next = { ...updates.value };
+    delete next[row.origin];
+    updates.value = next;
+  }
+  editing.value = null;
+  showMessage("已标记删除，提交后生效");
 }
 
-async function confirmDeleteRow() {
-  const request = deleteRequest.value;
-  deleteRequest.value = null;
-  if (!request || saving.value) return;
+function restoreRow(rowIndex: number) {
+  const row = displayRows.value[rowIndex];
+  if (!row || row.origin === null) return;
+  const next = new Set(pendingDeletes.value);
+  next.delete(row.origin);
+  pendingDeletes.value = next;
+  showMessage("已撤销删除标记");
+}
 
-  saving.value = true;
-  error.value = "";
-  try {
-    await api.deleteTableRow(
-      props.connectionId,
-      props.table,
-      request.keys,
-      singleRowMatch.value,
-    );
-    const nextOffset =
-      rows.value.length === 1 && offset.value > 0
-        ? Math.max(0, offset.value - limit.value)
-        : offset.value;
-    await load(nextOffset);
-    showMessage("已删除 1 行");
-  } catch (reason) {
-    error.value = String(reason);
-  } finally {
-    saving.value = false;
+function requestBatchDelete() {
+  const targets = [...selectedRows.value].filter(
+    (index) => displayRows.value[index]?.state !== "delete",
+  );
+  if (!targets.length) return;
+  batchDeleteCount.value = targets.length;
+}
+
+function confirmBatchDelete() {
+  const count = batchDeleteCount.value;
+  batchDeleteCount.value = null;
+  if (!count) return;
+  const deletes = new Set(pendingDeletes.value);
+  const insertsToRemove = new Set<number>();
+  for (const index of selectedRows.value) {
+    const row = displayRows.value[index];
+    if (!row || row.state === "delete") continue;
+    if (row.origin === null) {
+      if (row.insertId !== undefined) insertsToRemove.add(row.insertId);
+    } else {
+      deletes.add(row.origin);
+      if (updates.value[row.origin]) {
+        const next = { ...updates.value };
+        delete next[row.origin];
+        updates.value = next;
+      }
+    }
   }
+  pendingDeletes.value = deletes;
+  if (insertsToRemove.size) {
+    pendingInserts.value = pendingInserts.value.filter(
+      (draft) => !insertsToRemove.has(draft.id),
+    );
+  }
+  selectedRows.value = new Set();
+  showMessage(`已标记删除 ${count} 行，提交后生效`);
 }
 
 function openInsert() {
@@ -578,24 +919,327 @@ function openInsert() {
   insertOpen.value = true;
 }
 
-async function submitInsert() {
+function submitInsert() {
   if (saving.value) return;
+  const values: Array<unknown | undefined> = columns.value.map(
+    () => undefined,
+  );
+  for (const column of insertColumns.value) {
+    const index = columnIndex(column.name);
+    if (index >= 0) {
+      values[index] = parseInput(insertValues[column.name] ?? "", column);
+    }
+  }
+  pendingInserts.value = [
+    ...pendingInserts.value,
+    { id: ++insertDraftSequence, values },
+  ];
+  insertOpen.value = false;
+  showMessage("已加入待提交，提交后写入数据库");
+}
+
+function buildPendingChanges(): PendingTableChange[] {
+  const changes: PendingTableChange[] = [];
+  for (const origin of pendingDeletes.value) {
+    const row = rows.value[origin];
+    if (!row) continue;
+    changes.push({
+      kind: "delete",
+      keys: rowKeys(row),
+      changes: [],
+      values: [],
+      singleRow: singleRowMatch.value,
+    });
+  }
+  for (const [key, overlay] of Object.entries(updates.value)) {
+    const origin = Number(key);
+    if (pendingDeletes.value.has(origin)) continue;
+    const row = rows.value[origin];
+    if (!row) continue;
+    const columnChanges = Object.entries(overlay).map(([column, value]) => ({
+      column,
+      value,
+    }));
+    if (!columnChanges.length) continue;
+    changes.push({
+      kind: "update",
+      keys: rowKeys(row),
+      changes: columnChanges,
+      values: [],
+      singleRow: singleRowMatch.value,
+    });
+  }
+  for (const draft of pendingInserts.value) {
+    const values: ColumnValue[] = [];
+    draft.values.forEach((value, index) => {
+      if (value === undefined) return;
+      const column = columns.value[index];
+      if (column) values.push({ column: column.name, value });
+    });
+    changes.push({
+      kind: "insert",
+      keys: [],
+      changes: [],
+      values,
+      singleRow: false,
+    });
+  }
+  return changes;
+}
+
+function buildPendingSql(changes: PendingTableChange[]): string[] {
+  const tableRef = tableIdentifier();
+  return changes.map((change) => {
+    if (change.kind === "delete") {
+      const where = change.keys
+        .map((key) =>
+          isNull(key.value)
+            ? `${quoteIdentifier(key.column, driverKind.value)} IS NULL`
+            : `${quoteIdentifier(key.column, driverKind.value)} = ${sqlLiteral(
+                key.value,
+                driverKind.value,
+              )}`,
+        )
+        .join(" AND ");
+      return `DELETE FROM ${tableRef} WHERE ${where};`;
+    }
+    if (change.kind === "update") {
+      const sets = change.changes
+        .map(
+          (item) =>
+            `${quoteIdentifier(item.column, driverKind.value)} = ${sqlLiteral(
+              item.value,
+              driverKind.value,
+            )}`,
+        )
+        .join(", ");
+      const where = change.keys
+        .map((key) =>
+          isNull(key.value)
+            ? `${quoteIdentifier(key.column, driverKind.value)} IS NULL`
+            : `${quoteIdentifier(key.column, driverKind.value)} = ${sqlLiteral(
+                key.value,
+                driverKind.value,
+              )}`,
+        )
+        .join(" AND ");
+      return `UPDATE ${tableRef} SET ${sets} WHERE ${where};`;
+    }
+    if (!change.values.length) {
+      return driverKind.value === "mysql"
+        ? `INSERT INTO ${tableRef} () VALUES ();`
+        : `INSERT INTO ${tableRef} DEFAULT VALUES;`;
+    }
+    const fields = change.values
+      .map((item) => quoteIdentifier(item.column, driverKind.value))
+      .join(", ");
+    const values = change.values
+      .map((item) => sqlLiteral(item.value, driverKind.value))
+      .join(", ");
+    return `INSERT INTO ${tableRef} (${fields}) VALUES (${values});`;
+  });
+}
+
+function clearPendingState() {
+  updates.value = {};
+  pendingDeletes.value = new Set();
+  pendingInserts.value = [];
+  selectedRows.value = new Set();
+  selectionAnchor = null;
+  editing.value = null;
+}
+
+function discardPendingChanges() {
+  clearPendingState();
+  previewOpen.value = false;
+  showMessage("已放弃待提交变更");
+}
+
+function reopenPageAfterCommit() {
+  const remaining = rows.value.length - pendingDeletes.value.size;
+  const nextOffset =
+    remaining <= 0 && offset.value > 0
+      ? Math.max(0, offset.value - limit.value)
+      : offset.value;
+  return nextOffset;
+}
+
+async function submitPendingChanges(): Promise<boolean> {
+  if (!hasPendingChanges.value || saving.value) return false;
+  const changes = buildPendingChanges();
+  if (!changes.length) return false;
+  const nextOffset = reopenPageAfterCommit();
   saving.value = true;
   error.value = "";
   try {
-    const values = insertColumns.value.map((column) => ({
-      column: column.name,
-      value: parseInput(insertValues[column.name] ?? "", column),
-    }));
-    await api.insertTableRow(props.connectionId, props.table, values);
-    insertOpen.value = false;
-    await load(offset.value);
-    showMessage("已插入 1 行");
+    const result = await api.applyTableChanges(
+      props.connectionId,
+      props.table,
+      changes,
+    );
+    clearPendingState();
+    previewOpen.value = false;
+    await load(nextOffset);
+    showMessage(`已提交 ${result.applied} 项变更`);
+    return true;
   } catch (reason) {
     error.value = String(reason);
+    previewOpen.value = false;
+    return false;
   } finally {
     saving.value = false;
   }
+}
+
+function ensureClean(reason: string, action: () => void | Promise<void>) {
+  if (!hasPendingChanges.value) {
+    void action();
+    return;
+  }
+  pendingGuard.value = { reason, action };
+}
+
+async function guardSubmitAndContinue() {
+  const guard = pendingGuard.value;
+  if (!guard) return;
+  const submitted = await submitPendingChanges();
+  if (!submitted) return;
+  pendingGuard.value = null;
+  await guard.action();
+}
+
+async function guardDiscardAndContinue() {
+  const guard = pendingGuard.value;
+  if (!guard) return;
+  discardPendingChanges();
+  pendingGuard.value = null;
+  await guard.action();
+}
+
+function cancelPendingGuard() {
+  pendingGuard.value = null;
+}
+
+function rowState(index: number): DisplayRow["state"] {
+  return displayRows.value[index]?.state ?? "clean";
+}
+
+function isCellModified(displayIndex: number, colIndex: number): boolean {
+  const row = displayRows.value[displayIndex];
+  if (!row || row.origin === null) return false;
+  const column = columns.value[colIndex];
+  return Boolean(column && updates.value[row.origin]?.[column.name] !== undefined);
+}
+
+function toggleRowSelection(index: number, event: MouseEvent) {
+  const next = new Set(selectedRows.value);
+  if (event.shiftKey && selectionAnchor !== null) {
+    const start = Math.min(selectionAnchor, index);
+    const end = Math.max(selectionAnchor, index);
+    for (let cursor = start; cursor <= end; cursor += 1) next.add(cursor);
+  } else if (next.has(index)) {
+    next.delete(index);
+  } else {
+    next.add(index);
+  }
+  selectionAnchor = index;
+  selectedRows.value = next;
+}
+
+function toggleSelectAll() {
+  selectedRows.value = allDisplaySelected.value
+    ? new Set()
+    : new Set(displayRows.value.map((_, index) => index));
+  selectionAnchor = null;
+}
+
+function clearSelection() {
+  selectedRows.value = new Set();
+  selectionAnchor = null;
+}
+
+function batchSetValue(columnName: string, rawValue: string, useNull: boolean) {
+  const column = columns.value.find((item) => item.name === columnName);
+  if (!column) return;
+  const index = columnIndex(columnName);
+  if (index < 0) return;
+  const value = useNull ? null : parseInput(rawValue, column);
+  for (const rowIndex of selectedRows.value) {
+    if (rowState(rowIndex) === "delete") continue;
+    const row = displayRows.value[rowIndex];
+    if (!row) continue;
+    if (row.origin === null) {
+      const draft = pendingInserts.value.find(
+        (item) => item.id === row.insertId,
+      );
+      if (draft) draft.values[index] = value;
+    } else {
+      setCellPending(rowIndex, index, value);
+    }
+  }
+  batchSetOpen.value = false;
+  showMessage(`已为 ${selectedRows.value.size} 行设置待提交值`);
+}
+
+function cloneSelectedRows() {
+  const clones: InsertDraft[] = [];
+  for (const rowIndex of selectedRows.value) {
+    const row = displayRows.value[rowIndex];
+    if (!row || row.state === "delete") continue;
+    const values = columns.value.map((column, colIndex) =>
+      column.autoIncrement || column.primaryKey
+        ? undefined
+        : row.values[colIndex],
+    );
+    clones.push({ id: ++insertDraftSequence, values });
+  }
+  if (!clones.length) return;
+  pendingInserts.value = [...pendingInserts.value, ...clones];
+  showMessage(`已克隆 ${clones.length} 行到待提交新增`);
+}
+
+async function copySelectedRows(as: "tsv" | "json") {
+  const selected = [...selectedRows.value]
+    .map((index) => displayRows.value[index])
+    .filter((row): row is DisplayRow => Boolean(row));
+  if (!selected.length) return;
+  try {
+    if (as === "tsv") {
+      const header = columns.value
+        .map((column) => column.name)
+        .join("\t");
+      const lines = selected.map((row) =>
+        row.values.map(formatCell).join("\t"),
+      );
+      await writeClipboard([header, ...lines].join("\n"));
+      showMessage(`已复制 ${selected.length} 行为 TSV`);
+    } else {
+      const payload = selected.map((row) =>
+        Object.fromEntries(
+          columns.value.map((column, index) => [
+            column.name,
+            row.values[index] ?? null,
+          ]),
+        ),
+      );
+      await writeClipboard(JSON.stringify(payload, null, 2));
+      showMessage(`已复制 ${selected.length} 行为 JSON`);
+    }
+  } catch (reason) {
+    error.value = `复制失败: ${reason}`;
+  }
+}
+
+function goToPage() {
+  const target = Math.max(
+    1,
+    Math.min(pageCount.value, Number(pageInput.value) || 1),
+  );
+  pageInput.value = String(target);
+  if (target === page.value) return;
+  ensureClean("切换页码", () => {
+    void load((target - 1) * limit.value);
+  });
 }
 
 function csvEscape(value: unknown): string {
@@ -647,52 +1291,79 @@ async function exportJson() {
   }
 }
 
-async function importCsv() {
-  if (importing.value) return;
-  const path = await openDialog({
-    multiple: false,
-    directory: false,
-    filters: [{ name: "CSV", extensions: ["csv"] }],
+async function exportXlsx() {
+  const path = await saveDialog({
+    defaultPath: `${props.table}.xlsx`,
+    filters: [{ name: "Excel 工作簿", extensions: ["xlsx"] }],
   });
   if (typeof path !== "string") return;
 
-  importHasHeader.value = true;
-  importRequest.value = { path };
+  try {
+    const summary = await api.exportQueryResultXlsx(
+      columns.value.map((column) => column.name),
+      rows.value,
+      path,
+      props.table,
+      true,
+    );
+    showMessage(`已导出当前页 ${summary.rows} 行到 ${path}`);
+  } catch (reason) {
+    error.value = String(reason);
+  }
 }
 
-async function confirmImport() {
+function confirmImport() {
   const request = importRequest.value;
   if (!request || importing.value) return;
   importRequest.value = null;
-
-  importing.value = true;
-  error.value = "";
-  try {
-    const count = await api.importCsv(
-      props.connectionId,
-      props.table,
-      request.path,
-      importHasHeader.value,
-    );
-    await load(offset.value);
-    showMessage(`已导入 ${count} 行`);
-  } catch (reason) {
-    error.value = String(reason);
-  } finally {
-    importing.value = false;
-  }
+  ensureClean("导入 CSV", async () => {
+    importing.value = true;
+    error.value = "";
+    try {
+      const count = await api.importCsv(
+        props.connectionId,
+        props.table,
+        request.path,
+        importHasHeader.value,
+      );
+      await load(offset.value);
+      showMessage(`已导入 ${count} 行`);
+    } catch (reason) {
+      error.value = String(reason);
+    } finally {
+      importing.value = false;
+    }
+  });
 }
 
 function changePage(next: number) {
   const target = Math.max(0, Math.min(pageCount.value - 1, next)) * limit.value;
-  void load(target);
+  ensureClean("切换页码", () => {
+    void load(target);
+  });
 }
 
 function changeSize(event: Event) {
   const size = Number((event.target as HTMLSelectElement).value);
-  limit.value = size;
-  void load(0);
+  ensureClean("调整每页行数", () => {
+    limit.value = size;
+    savePageSize(size);
+    pageInput.value = "1";
+    void load(0);
+  });
 }
+
+function requestRefresh() {
+  ensureClean("刷新", () => {
+    void load(offset.value);
+  });
+}
+
+defineExpose({
+  hasPendingChanges,
+  discardPendingChanges,
+  submitPendingChanges,
+});
 </script>
 
 <template>
@@ -715,17 +1386,29 @@ function changeSize(event: Event) {
         </span>
       </div>
       <div class="data-actions">
+        <template v-if="pendingCount">
+          <span class="pending-badge">{{ pendingCount }} 项待提交</span>
+          <button class="button ghost compact" :disabled="saving" @click="previewOpen = true">
+            查看 SQL
+          </button>
+          <button class="button primary compact" :disabled="saving" @click="submitPendingChanges">
+            {{ saving ? "提交中…" : "提交" }}
+          </button>
+          <button class="button ghost compact" :disabled="saving" @click="discardPendingChanges">
+            放弃
+          </button>
+        </template>
         <button
           class="button ghost compact"
           :disabled="loading"
-          @click="load(offset)"
+          @click="requestRefresh"
         >
           <Icon name="refresh" :size="14" />
           刷新
         </button>
         <button
           class="button ghost compact"
-          :disabled="!columns.length"
+          :disabled="!columns.length || readOnly"
           @click="openInsert"
         >
           <Icon name="plus" :size="14" />
@@ -733,11 +1416,24 @@ function changeSize(event: Event) {
         </button>
         <button
           class="button ghost compact"
-          :disabled="importing"
-          @click="importCsv"
+          :disabled="importing || readOnly"
+          @click="emit('import-data')"
         >
           <Icon name="upload" :size="14" />
-          {{ importing ? "导入中…" : "导入 CSV" }}
+          {{ importing ? "导入中…" : "导入数据…" }}
+        </button>
+        <button
+          class="button ghost compact"
+          :disabled="!isTable || readOnly"
+          :title="
+            readOnly
+              ? '当前连接为只读'
+              : '按列生成测试数据，在一个事务中写入'
+          "
+          @click="emit('generate-data')"
+        >
+          <Icon name="bolt" :size="14" />
+          生成数据…
         </button>
         <button
           class="button ghost compact"
@@ -754,6 +1450,14 @@ function changeSize(event: Event) {
         >
           <Icon name="download" :size="14" />
           导出当前页 JSON
+        </button>
+        <button
+          class="button ghost compact"
+          :disabled="!rows.length"
+          @click="exportXlsx"
+        >
+          <Icon name="download" :size="14" />
+          导出当前页 XLSX
         </button>
       </div>
     </header>
@@ -777,6 +1481,13 @@ function changeSize(event: Event) {
       />
       <button
         v-if="filterOpen"
+        class="button ghost compact"
+        @click="filterBuilderOpen = true"
+      >
+        构建筛选…
+      </button>
+      <button
+        v-if="filterOpen"
         class="button primary compact"
         @click="applyFilter"
       >
@@ -798,9 +1509,51 @@ function changeSize(event: Event) {
       </span>
       <span v-else class="filter-meta">全部行</span>
       <div class="spacer"></div>
-      <span v-if="sortColumn" class="filter-meta">
-        ORDER BY {{ sortColumn }} {{ sortDirection.toUpperCase() }}
-      </span>
+      <div v-if="sorts.length" class="sort-chips">
+        <button
+          v-for="sort in sorts"
+          :key="sort.column"
+          class="sort-chip"
+          :title="`移除 ${sort.column} 排序`"
+          @click="removeSort(sort.column)"
+        >
+          {{ sort.column }} {{ sort.direction.toUpperCase() }}
+          <Icon name="close" :size="10" />
+        </button>
+        <button class="sort-chip clear" @click="clearSorts">清除排序</button>
+      </div>
+    </div>
+
+    <div v-if="selectedCount" class="data-selectionbar">
+      <span>已选 {{ selectedCount }} 行</span>
+      <button class="button ghost compact" @click="toggleSelectAll">
+        {{ allDisplaySelected ? "清空选择" : "全选当前页" }}
+      </button>
+      <button class="button ghost compact"
+        @click="batchSetOpen = true"
+        :disabled="readOnly"
+      >
+        批量设置值…
+      </button>
+      <button class="button ghost compact" @click="copySelectedRows('tsv')">
+        复制 TSV
+      </button>
+      <button class="button ghost compact" @click="copySelectedRows('json')">
+        复制 JSON
+      </button>
+      <button class="button ghost compact" @click="cloneSelectedRows" :disabled="readOnly">
+        克隆为新行
+      </button>
+      <button
+        class="button ghost compact danger"
+        @click="requestBatchDelete"
+        :disabled="readOnly"
+      >
+        删除所选
+      </button>
+      <button class="button ghost compact" @click="clearSelection">
+        清空选择
+      </button>
     </div>
 
     <p v-if="message" class="data-message success" role="status">
@@ -826,14 +1579,19 @@ function changeSize(event: Event) {
       </button>
     </p>
 
-    <div class="data-grid-wrap">
+    <div ref="scrollRef" class="data-grid-wrap">
       <div v-if="loading" class="panel-empty">加载中…</div>
       <div v-else-if="error" class="panel-empty">加载失败</div>
       <div v-else-if="!rows.length" class="panel-empty">
         暂无数据
       </div>
-      <table v-else class="result-grid data-grid">
+      <table
+        v-else
+        class="result-grid data-grid"
+        :class="{ virtualized: virtualEnabled }"
+      >
         <colgroup>
+          <col style="width: 32px" />
           <col style="width: 44px" />
           <col
             v-for="column in columns"
@@ -843,6 +1601,14 @@ function changeSize(event: Event) {
         </colgroup>
         <thead>
           <tr>
+            <th class="row-select">
+              <input
+                type="checkbox"
+                :checked="allDisplaySelected"
+                aria-label="全选当前页"
+                @change="toggleSelectAll"
+              />
+            </th>
             <th class="row-index">#</th>
             <th
               v-for="column in columns"
@@ -850,22 +1616,22 @@ function changeSize(event: Event) {
               class="sortable"
               tabindex="0"
               :aria-sort="
-                sortColumn === column.name
-                  ? sortDirection === 'asc'
-                    ? 'ascending'
-                    : 'descending'
-                  : 'none'
+                sortDirectionFor(column.name) === 'asc'
+                  ? 'ascending'
+                  : sortDirectionFor(column.name) === 'desc'
+                    ? 'descending'
+                    : 'none'
               "
-              @click="toggleSort(column.name)"
-              @keydown.enter.prevent="toggleSort(column.name)"
-              @keydown.space.prevent="toggleSort(column.name)"
+              @click="toggleSort(column.name, $event.shiftKey)"
+              @keydown.enter.prevent="toggleSort(column.name, $event.shiftKey)"
+              @keydown.space.prevent="toggleSort(column.name, $event.shiftKey)"
             >
               <span class="column-head">
                 <span>{{ column.name }}</span>
                 <span v-if="column.primaryKey" class="pk-badge">PK</span>
                 <Icon
-                  v-if="sortColumn === column.name"
-                  :name="sortDirection === 'asc' ? 'chevron-up' : 'chevron-down'"
+                  v-if="sortDirectionFor(column.name)"
+                  :name="sortDirectionFor(column.name) === 'asc' ? 'chevron-up' : 'chevron-down'"
                   :size="12"
                   class="sort-icon"
                 />
@@ -881,24 +1647,55 @@ function changeSize(event: Event) {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(row, rowIndex) in rows" :key="rowIndex">
-            <td class="row-index">{{ offset + rowIndex + 1 }}</td>
+          <tr
+            v-if="virtualEnabled && virtualPaddingTop > 0"
+            class="virtual-spacer"
+            aria-hidden="true"
+          >
             <td
-              v-for="(cell, colIndex) in row"
+              :colspan="columns.length + 2"
+              :style="{ height: `${virtualPaddingTop}px` }"
+            ></td>
+          </tr>
+          <tr
+            v-for="entry in virtualRows"
+            :key="entry.row.origin ?? `new-${entry.row.insertId}`"
+            class="data-row"
+            :class="{
+              'row-deleted': entry.row.state === 'delete',
+              'row-inserted': entry.row.state === 'insert',
+            }"
+          >
+            <td class="row-select">
+              <input
+                type="checkbox"
+                :checked="selectedRows.has(entry.index)"
+                :aria-label="`选择第 ${entry.index + 1} 行`"
+                @click="toggleRowSelection(entry.index, $event)"
+              />
+            </td>
+            <td class="row-index">{{ offset + entry.index + 1 }}</td>
+            <td
+              v-for="(cell, colIndex) in entry.row.values"
               :key="colIndex"
               :class="{
                 null: isNull(cell),
                 num: typeof cell === 'number',
                 editable: canEdit,
+                modified: isCellModified(entry.index, colIndex),
               }"
               :title="formatCell(cell)"
-              @dblclick="startEdit(rowIndex, colIndex)"
-              @contextmenu.prevent="openCellMenu($event, rowIndex, colIndex)"
+              tabindex="-1"
+              :data-cell="`${entry.index}:${colIndex}`"
+              @dblclick="startEdit(entry.index, colIndex)"
+              @contextmenu.prevent="
+                openCellMenu($event, entry.index, colIndex)
+              "
             >
               <input
                 v-if="
                   editing &&
-                  editing.rowIndex === rowIndex &&
+                  editing.rowIndex === entry.index &&
                   editing.colIndex === colIndex
                 "
                 v-model="editing.value"
@@ -910,6 +1707,16 @@ function changeSize(event: Event) {
               />
               <template v-else>{{ formatCell(cell) }}</template>
             </td>
+          </tr>
+          <tr
+            v-if="virtualEnabled && virtualPaddingBottom > 0"
+            class="virtual-spacer"
+            aria-hidden="true"
+          >
+            <td
+              :colspan="columns.length + 2"
+              :style="{ height: `${virtualPaddingBottom}px` }"
+            ></td>
           </tr>
         </tbody>
       </table>
@@ -924,6 +1731,17 @@ function changeSize(event: Event) {
           <option :value="200">200 行/页</option>
           <option :value="500">500 行/页</option>
         </select>
+        <label class="page-jump">
+          跳到
+          <input
+            v-model="pageInput"
+            inputmode="numeric"
+            aria-label="页码"
+            @keydown.enter.prevent="goToPage"
+            @blur="goToPage"
+          />
+          页
+        </label>
         <button
           class="button ghost compact icon-only"
           title="上一页"
@@ -1058,13 +1876,54 @@ function changeSize(event: Event) {
     </div>
 
     <ConfirmDialog
-      :open="!!deleteRequest"
-      title="删除行"
-      :message="`确定从「${table}」删除这一行？`"
-      :detail="deleteRequest?.detail ?? null"
-      confirm-text="删除行"
-      @confirm="confirmDeleteRow"
-      @cancel="deleteRequest = null"
+      :open="batchDeleteCount !== null"
+      title="标记删除行"
+      :message="`将选中的 ${batchDeleteCount ?? 0} 行标记为待删除？`"
+      detail="只有点击「提交」后才会写入数据库；提交前可撤销。"
+      confirm-text="标记删除"
+      @confirm="confirmBatchDelete"
+      @cancel="batchDeleteCount = null"
+    />
+
+    <ConfirmDialog
+      :open="!!pendingGuard"
+      title="存在待提交变更"
+      :message="`当前有 ${pendingCount} 项待提交变更。${
+        pendingGuard?.reason ?? '继续操作'
+      }前需要提交或放弃。`"
+      detail="提交失败时会保留全部变更并整体回滚。"
+      cancel-text="取消"
+      extra-text="放弃并继续"
+      confirm-text="提交并继续"
+      :danger="false"
+      @confirm="guardSubmitAndContinue"
+      @extra="guardDiscardAndContinue"
+      @cancel="cancelPendingGuard"
+    />
+
+    <BatchSetDialog
+      :open="batchSetOpen"
+      :columns="batchSetColumns"
+      :selected-count="selectedCount"
+      @close="batchSetOpen = false"
+      @apply="batchSetValue"
+    />
+
+    <ChangePreviewDialog
+      :open="previewOpen"
+      :table="table"
+      :statements="pendingSql"
+      :saving="saving"
+      @close="previewOpen = false"
+      @submit="submitPendingChanges"
+    />
+
+    <FilterBuilderDialog
+      :open="filterBuilderOpen"
+      :columns="columns"
+      :driver="driverKind"
+      @close="filterBuilderOpen = false"
+      @apply="applyBuilderFilter"
     />
 
     <div
@@ -1074,6 +1933,11 @@ function changeSize(event: Event) {
       :style="{ left: cellMenu.x + 'px', top: cellMenu.y + 'px' }"
       @click.stop
     >
+      <button class="context-menu-item" @click="openValueFromMenu">
+        <Icon name="view" :size="14" />
+        查看值…
+      </button>
+      <div class="context-separator"></div>
       <button class="context-menu-item" @click="copyCellValue">
         <Icon name="copy" :size="14" />
         复制单元格
@@ -1143,9 +2007,22 @@ function changeSize(event: Event) {
         <div class="context-separator"></div>
         <button class="context-menu-item danger" @click="deleteFromMenu">
           <Icon name="trash" :size="14" />
-          删除此行
+          {{
+            cellMenu && rowState(cellMenu.rowIndex) === "delete"
+              ? "撤销删除标记"
+              : "标记删除此行"
+          }}
         </button>
       </template>
     </div>
+
+    <CellValueDialog
+      :open="Boolean(valueViewer)"
+      :column="viewerColumn"
+      :row-label="viewerRowLabel"
+      :data-type="viewerType"
+      :value="viewerValue"
+      @close="closeValueViewer"
+    />
   </section>
 </template>

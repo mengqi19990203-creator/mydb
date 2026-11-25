@@ -1,5 +1,5 @@
-use crate::db::{DatabaseDriver, DatabaseSession};
 use crate::db::query::is_read_query;
+use crate::db::{DatabaseDriver, DatabaseSession};
 use crate::models::{
     ColumnInfo, ColumnValue, ConnectionConfig, ForeignKeyInfo, IndexInfo, QueryResult,
     ScopeTableColumns, TableInfo, TableRows, TableStructure,
@@ -43,15 +43,36 @@ impl PostgresDriver {
         let ssl_mode = match config.ssl_mode.as_str() {
             "preferred" => PgSslMode::Prefer,
             "required" => PgSslMode::Require,
+            "verify-ca" => PgSslMode::VerifyCa,
+            "verify-full" => PgSslMode::VerifyFull,
             _ => PgSslMode::Disable,
         };
+        let needs_ca = matches!(config.ssl_mode.as_str(), "verify-ca" | "verify-full");
+        if needs_ca && config.ssl_ca_path.trim().is_empty() {
+            return Err("verify-ca / verify-full 必须选择 CA 证书文件".to_string());
+        }
+        let ca_path = config.ssl_ca_path.trim();
+        if !ca_path.is_empty() && !std::path::Path::new(ca_path).is_file() {
+            return Err(format!("CA 证书文件不存在: {ca_path}"));
+        }
+        let client_cert = config.ssl_client_cert_path.trim();
+        let client_key = config.ssl_client_key_path.trim();
+        if client_cert.is_empty() != client_key.is_empty() {
+            return Err("客户端证书与私钥必须同时选择".to_string());
+        }
+        if !client_cert.is_empty() && !std::path::Path::new(client_cert).is_file() {
+            return Err(format!("客户端证书文件不存在: {client_cert}"));
+        }
+        if !client_key.is_empty() && !std::path::Path::new(client_key).is_file() {
+            return Err(format!("客户端私钥文件不存在: {client_key}"));
+        }
         let database = if config.database.trim().is_empty() {
             "postgres"
         } else {
             config.database.trim()
         };
 
-        let options = PgConnectOptions::new()
+        let mut options = PgConnectOptions::new()
             .host(host)
             .port(if port == 0 { 5432 } else { port })
             .username(&config.username)
@@ -59,6 +80,14 @@ impl PostgresDriver {
             .database(database)
             .ssl_mode(ssl_mode)
             .application_name("mydb");
+        if !ca_path.is_empty() {
+            options = options.ssl_root_cert(ca_path);
+        }
+        if !client_cert.is_empty() {
+            options = options
+                .ssl_client_cert(client_cert)
+                .ssl_client_key(client_key);
+        }
 
         let pool = PgPoolOptions::new()
             .max_connections(5)
@@ -173,6 +202,14 @@ impl DatabaseSession for PgSession {
             .await
             .map_err(|error| format!("回滚事务失败: {error}"))?;
         Ok(())
+    }
+
+    async fn backend_id(&mut self) -> Result<Option<i64>, String> {
+        let id: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *self.connection)
+            .await
+            .map_err(|error| format!("读取后端进程 ID 失败: {error}"))?;
+        Ok(Some(id as i64))
     }
 }
 
@@ -372,6 +409,16 @@ impl DatabaseDriver for PostgresDriver {
         Ok(Box::new(PgSession { connection }))
     }
 
+    async fn cancel_backend_query(&self, backend_id: i64) -> Result<bool, String> {
+        let pid =
+            i32::try_from(backend_id).map_err(|_| format!("无效的后端进程 ID: {backend_id}"))?;
+        sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
+            .bind(pid)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| format!("取消查询失败（可能需要同角色或超级用户权限）: {error}"))
+    }
+
     async fn list_columns(&self, table: &str) -> Result<Vec<ColumnInfo>, String> {
         let schema = self.current_schema().await;
         let rows = sqlx::query(
@@ -379,6 +426,7 @@ impl DatabaseDriver for PostgresDriver {
                     pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type, \
                     NOT a.attnotnull AS nullable, \
                     pg_get_expr(d.adbin, d.adrelid) AS default_value, \
+                    col_description(a.attrelid, a.attnum) AS comment, \
                     (a.attidentity IN ('a', 'd') \
                      OR COALESCE(pg_get_expr(d.adbin, d.adrelid), '') LIKE 'nextval(%') \
                       AS auto_increment \
@@ -409,7 +457,12 @@ impl DatabaseDriver for PostgresDriver {
                     data_type: row.try_get(1).unwrap_or_default(),
                     nullable: row.try_get(2).unwrap_or(true),
                     default_value: row.try_get(3).ok().flatten(),
-                    auto_increment: row.try_get(4).unwrap_or(false),
+                    auto_increment: row.try_get(5).unwrap_or(false),
+                    comment: row
+                        .try_get::<Option<String>, _>(4)
+                        .ok()
+                        .flatten()
+                        .filter(|value| !value.trim().is_empty()),
                 }
             })
             .collect())
@@ -462,6 +515,7 @@ impl DatabaseDriver for PostgresDriver {
                 default_value: row.try_get(5).ok().flatten(),
                 auto_increment: row.try_get(6).unwrap_or(false),
                 primary_key: row.try_get(7).unwrap_or(false),
+                comment: None,
             };
             grouped
                 .entry(table_name)
@@ -561,10 +615,7 @@ impl DatabaseDriver for PostgresDriver {
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| {
-                    format!(
-                        "第 {} 条语句执行失败（事务已回滚）: {error}",
-                        index + 1
-                    )
+                    format!("第 {} 条语句执行失败（事务已回滚）: {error}", index + 1)
                 })?;
             count += 1;
         }
@@ -672,6 +723,444 @@ impl DatabaseDriver for PostgresDriver {
         Ok(count)
     }
 
+    async fn read_rows_sorted(
+        &self,
+        table: &str,
+        limit: u64,
+        offset: u64,
+        filter: Option<&str>,
+        sorts: &[crate::models::TableSort],
+    ) -> Result<TableRows, String> {
+        let schema = self.current_schema().await;
+        let columns = self.list_columns(table).await?;
+        let identifier = qualified_identifier(&schema, table);
+        let filter = filter.map(str::trim).filter(|value| !value.is_empty());
+        if filter.is_some_and(|value| value.contains(';')) {
+            return Err("WHERE 条件不能包含分号".to_string());
+        }
+        let where_clause = filter
+            .map(|value| format!(" WHERE {value}"))
+            .unwrap_or_default();
+        let count_sql = format!("SELECT COUNT(*) FROM {identifier}{where_clause}");
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| format!("读取总行数失败: {error}"))?;
+
+        let mut order_columns: Vec<(String, String)> = Vec::new();
+        for sort in sorts {
+            if !columns.iter().any(|column| column.name == sort.column) {
+                return Err(format!("排序字段不存在: {}", sort.column));
+            }
+            if order_columns
+                .iter()
+                .any(|(column, _)| column == &sort.column)
+            {
+                continue;
+            }
+            order_columns.push((
+                sort.column.clone(),
+                if sort.direction.eq_ignore_ascii_case("desc") {
+                    "DESC".to_string()
+                } else {
+                    "ASC".to_string()
+                },
+            ));
+        }
+        if !order_columns.is_empty() {
+            for column in columns.iter().filter(|column| column.primary_key) {
+                if !order_columns.iter().any(|(name, _)| name == &column.name) {
+                    order_columns.push((column.name.clone(), "ASC".to_string()));
+                }
+            }
+        }
+        let order_clause = if order_columns.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ORDER BY {}",
+                order_columns
+                    .iter()
+                    .map(|(column, direction)| {
+                        format!("{} {direction}", quote_identifier(column))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let sql =
+            format!("SELECT * FROM {identifier}{where_clause}{order_clause} LIMIT $1 OFFSET $2");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| format!("读取表数据失败: {error}"))?;
+        let values = rows
+            .iter()
+            .map(|row| {
+                (0..row.len())
+                    .map(|index| value_to_json(row, index))
+                    .collect()
+            })
+            .collect();
+        Ok(TableRows {
+            columns,
+            rows: values,
+            total: total.max(0) as u64,
+            offset,
+            limit,
+        })
+    }
+
+    async fn apply_table_changes(
+        &self,
+        table: &str,
+        changes: &[crate::models::PendingTableChange],
+    ) -> Result<usize, String> {
+        let schema = self.current_schema().await;
+        let columns = self.list_columns(table).await?;
+        let table_ref = qualified_identifier(&schema, table);
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| format!("开启批量事务失败: {error}"))?;
+        let mut applied = 0usize;
+        for (index, change) in changes.iter().enumerate() {
+            let label = format!("第 {} 项（{}）", index + 1, change.kind);
+            let result: Result<u64, String> = match change.kind.as_str() {
+                "delete" => {
+                    if change.keys.is_empty() {
+                        Err("删除缺少主键条件".to_string())
+                    } else {
+                        let mut parameter = 0usize;
+                        let mut where_parts = Vec::new();
+                        for key in &change.keys {
+                            if key.value.is_null() {
+                                where_parts
+                                    .push(format!("{} IS NULL", quote_identifier(&key.column)));
+                            } else {
+                                parameter += 1;
+                                where_parts.push(format!(
+                                    "{} = ${}{}",
+                                    quote_identifier(&key.column),
+                                    parameter,
+                                    cast_for(&columns, &key.column)
+                                ));
+                            }
+                        }
+                        let key_clause = where_parts.join(" AND ");
+                        let where_clause = if change.single_row {
+                            format!(
+                                "ctid = (SELECT ctid FROM {table_ref} WHERE {key_clause} LIMIT 1)"
+                            )
+                        } else {
+                            key_clause
+                        };
+                        let sql = format!("DELETE FROM {table_ref} WHERE {where_clause}");
+                        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+                        for key in &change.keys {
+                            if !key.value.is_null() {
+                                query = bind_json_postgres(query, &key.value);
+                            }
+                        }
+                        query
+                            .execute(&mut *transaction)
+                            .await
+                            .map(|result| result.rows_affected())
+                            .map_err(|error| format!("删除失败: {error}"))
+                    }
+                }
+                "update" => {
+                    if change.keys.is_empty() {
+                        Err("更新缺少主键条件".to_string())
+                    } else if change.changes.is_empty() {
+                        Err("更新没有字段变更".to_string())
+                    } else {
+                        let mut parameter = 0usize;
+                        let mut set_parts = Vec::new();
+                        for item in &change.changes {
+                            parameter += 1;
+                            set_parts.push(format!(
+                                "{} = ${}{}",
+                                quote_identifier(&item.column),
+                                parameter,
+                                cast_for(&columns, &item.column)
+                            ));
+                        }
+                        let mut where_parts = Vec::new();
+                        for key in &change.keys {
+                            if key.value.is_null() {
+                                where_parts
+                                    .push(format!("{} IS NULL", quote_identifier(&key.column)));
+                            } else {
+                                parameter += 1;
+                                where_parts.push(format!(
+                                    "{} = ${}{}",
+                                    quote_identifier(&key.column),
+                                    parameter,
+                                    cast_for(&columns, &key.column)
+                                ));
+                            }
+                        }
+                        let key_clause = where_parts.join(" AND ");
+                        let where_clause = if change.single_row {
+                            format!(
+                                "ctid = (SELECT ctid FROM {table_ref} WHERE {key_clause} LIMIT 1)"
+                            )
+                        } else {
+                            key_clause
+                        };
+                        let sql = format!(
+                            "UPDATE {table_ref} SET {} WHERE {where_clause}",
+                            set_parts.join(", ")
+                        );
+                        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+                        for item in &change.changes {
+                            query = bind_json_postgres(query, &item.value);
+                        }
+                        for key in &change.keys {
+                            if !key.value.is_null() {
+                                query = bind_json_postgres(query, &key.value);
+                            }
+                        }
+                        query
+                            .execute(&mut *transaction)
+                            .await
+                            .map(|result| result.rows_affected())
+                            .map_err(|error| format!("更新失败: {error}"))
+                    }
+                }
+                "insert" => {
+                    let sql = if change.values.is_empty() {
+                        format!("INSERT INTO {table_ref} DEFAULT VALUES")
+                    } else {
+                        let fields = change
+                            .values
+                            .iter()
+                            .map(|item| quote_identifier(&item.column))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let placeholders = change
+                            .values
+                            .iter()
+                            .enumerate()
+                            .map(|(index, item)| {
+                                format!("${}{}", index + 1, cast_for(&columns, &item.column))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("INSERT INTO {table_ref} ({fields}) VALUES ({placeholders})")
+                    };
+                    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+                    for item in &change.values {
+                        query = bind_json_postgres(query, &item.value);
+                    }
+                    query
+                        .execute(&mut *transaction)
+                        .await
+                        .map(|result| result.rows_affected())
+                        .map_err(|error| format!("新增失败: {error}"))
+                }
+                other => Err(format!("未知变更类型: {other}")),
+            };
+            match result {
+                Ok(rows) => {
+                    let needs_one = matches!(change.kind.as_str(), "delete" | "update");
+                    if needs_one && rows != 1 {
+                        let _ = transaction.rollback().await;
+                        return Err(format!(
+                            "{label} 目标行已不存在或已变化（影响 {rows} 行），已回滚"
+                        ));
+                    }
+                    applied += 1;
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(format!("{label} {error}，已回滚"));
+                }
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| format!("提交批量事务失败: {error}"))?;
+        Ok(applied)
+    }
+
+    async fn dump_table_ddl(&self, table: &str) -> Result<String, String> {
+        let schema = self.current_schema().await;
+        let columns = self.list_columns(table).await?;
+        let indexes = pg_indexes(&self.pool, &schema, table).await?;
+        Ok(build_table_ddl(&schema, table, &columns, &indexes, &[]))
+    }
+
+    fn dump_indexes_separately(&self) -> bool {
+        true
+    }
+
+    async fn dump_index_statements(&self, table: &str) -> Result<Vec<String>, String> {
+        let schema = self.current_schema().await;
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT pg_get_indexdef(i.indexrelid) \
+             FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 AND NOT i.indisprimary \
+             ORDER BY i.indexrelid",
+        )
+        .bind(&schema)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("读取索引定义失败: {error}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|sql| {
+                let trimmed = sql.trim().trim_end_matches(';').to_string();
+                format!("{trimmed};")
+            })
+            .collect())
+    }
+
+    fn dump_foreign_keys_separately(&self) -> bool {
+        true
+    }
+
+    async fn dump_insert_plan(&self, table: &str) -> Result<(Vec<String>, String), String> {
+        let schema = self.current_schema().await;
+        let rows = sqlx::query(
+            "SELECT column_name, is_generated, identity_generation \
+             FROM information_schema.columns \
+             WHERE table_schema = $1 AND table_name = $2",
+        )
+        .bind(&schema)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("读取字段生成信息失败: {error}"))?;
+        let mut generated = HashSet::new();
+        let mut identity_always = false;
+        for row in rows {
+            let name: String = row.try_get(0).unwrap_or_default();
+            let is_generated: String = row.try_get(1).unwrap_or_default();
+            let identity: Option<String> = row.try_get(2).ok().flatten();
+            if is_generated.eq_ignore_ascii_case("ALWAYS") {
+                generated.insert(name);
+            }
+            if identity
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("ALWAYS"))
+            {
+                identity_always = true;
+            }
+        }
+        let columns = self
+            .list_columns(table)
+            .await?
+            .into_iter()
+            .filter(|column| !generated.contains(&column.name))
+            .map(|column| column.name)
+            .collect();
+        let clause = if identity_always {
+            " OVERRIDING SYSTEM VALUE".to_string()
+        } else {
+            String::new()
+        };
+        Ok((columns, clause))
+    }
+
+    async fn stream_sql_literal_rows(
+        &self,
+        table: &str,
+        columns: &[String],
+        sink: &mut (dyn FnMut(Vec<Option<String>>) -> Result<(), String> + Send),
+    ) -> Result<u64, String> {
+        if columns.is_empty() {
+            return Ok(0);
+        }
+        let schema = self.current_schema().await;
+        let metadata = self.list_columns(table).await?;
+        let expressions = columns
+            .iter()
+            .map(|name| {
+                let identifier = quote_identifier(name);
+                let is_bytea = metadata
+                    .iter()
+                    .find(|column| &column.name == name)
+                    .map(|column| column.data_type.to_ascii_lowercase().contains("bytea"))
+                    .unwrap_or(false);
+                if is_bytea {
+                    format!(
+                        "CASE WHEN {identifier} IS NULL THEN NULL ELSE 'decode(' || \
+                         quote_literal(encode({identifier}, 'hex')) || ', ''hex'')' END"
+                    )
+                } else {
+                    format!("quote_literal({identifier}::text)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {expressions} FROM {}",
+            qualified_identifier(&schema, table)
+        );
+        let mut stream = sqlx::query(sqlx::AssertSqlSafe(sql)).fetch(&self.pool);
+        let mut count = 0u64;
+        while let Some(row) = stream
+            .try_next()
+            .await
+            .map_err(|error| format!("读取表数据失败: {error}"))?
+        {
+            let values = (0..columns.len())
+                .map(|index| row.try_get::<Option<String>, _>(index).ok().flatten())
+                .collect::<Vec<_>>();
+            sink(values)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn dump_object_drop(&self, kind: &str, name: &str) -> Result<String, String> {
+        let schema = self.current_schema().await;
+        if kind == "trigger" {
+            let tables: Vec<String> = sqlx::query_scalar(
+                "SELECT c.relname \
+                 FROM pg_trigger t \
+                 JOIN pg_class c ON c.oid = t.tgrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND t.tgname = $2 AND NOT t.tgisinternal",
+            )
+            .bind(&schema)
+            .bind(name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| format!("查找触发器失败: {error}"))?;
+            return match tables.as_slice() {
+                [table] => Ok(format!(
+                    "DROP TRIGGER IF EXISTS {} ON {};",
+                    quote_identifier(name),
+                    qualified_identifier(&schema, table)
+                )),
+                [] => Err(format!("触发器不存在: {name}")),
+                _ => Err("同名触发器存在于多张表，无法生成删除语句".to_string()),
+            };
+        }
+        let keyword = match kind {
+            "table" => "TABLE",
+            "view" => "VIEW",
+            "matview" => "MATERIALIZED VIEW",
+            "sequence" => "SEQUENCE",
+            "function" | "procedure" => "ROUTINE",
+            _ => return Err(format!("PostgreSQL 不支持删除该对象类型: {kind}")),
+        };
+        Ok(format!(
+            "DROP {keyword} IF EXISTS {};",
+            qualified_identifier(&schema, name)
+        ))
+    }
+
     async fn update_row(
         &self,
         table: &str,
@@ -726,9 +1215,7 @@ impl DatabaseDriver for PostgresDriver {
         } else {
             key_clause
         };
-        let sql = format!(
-            "UPDATE {table_ref} SET {set_clause} WHERE {where_clause}"
-        );
+        let sql = format!("UPDATE {table_ref} SET {set_clause} WHERE {where_clause}");
 
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for change in changes {
@@ -764,9 +1251,7 @@ impl DatabaseDriver for PostgresDriver {
             let placeholders = values
                 .iter()
                 .enumerate()
-                .map(|(index, item)| {
-                    format!("${}{}", index + 1, cast_for(&columns, &item.column))
-                })
+                .map(|(index, item)| format!("${}{}", index + 1, cast_for(&columns, &item.column)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("INSERT INTO {identifier} ({fields}) VALUES ({placeholders})")
@@ -919,6 +1404,175 @@ impl DatabaseDriver for PostgresDriver {
         }
     }
 
+    async fn object_variants(
+        &self,
+        kind: &str,
+        name: &str,
+    ) -> Result<Vec<crate::models::ObjectVariant>, String> {
+        if !matches!(kind, "function" | "procedure") {
+            return Ok(Vec::new());
+        }
+        let schema = self.current_schema().await;
+        let prokind = if kind == "function" { "f" } else { "p" };
+        let rows = sqlx::query(
+            "SELECT p.oid::text, \
+                    COALESCE(pg_get_function_arguments(p.oid), ''), \
+                    COALESCE(pg_get_function_result(p.oid), '') \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind::text = $3 \
+             ORDER BY p.oid",
+        )
+        .bind(&schema)
+        .bind(name)
+        .bind(prokind)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("读取重载签名失败: {error}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let id: String = row.try_get(0).unwrap_or_default();
+                let args: String = row.try_get(1).unwrap_or_default();
+                let result: String = row.try_get(2).unwrap_or_default();
+                let label = if result.is_empty() {
+                    format!("{name}({args})")
+                } else {
+                    format!("{name}({args}) → {result}")
+                };
+                crate::models::ObjectVariant { id, label }
+            })
+            .collect())
+    }
+
+    async fn object_ddl_with_identity(
+        &self,
+        kind: &str,
+        name: &str,
+        identity: Option<&str>,
+    ) -> Result<String, String> {
+        let Some(identity) = identity else {
+            return self.object_ddl(kind, name).await;
+        };
+        if !matches!(kind, "function" | "procedure") {
+            return self.object_ddl(kind, name).await;
+        }
+        let oid: i64 = identity
+            .parse()
+            .map_err(|_| "函数签名标识无效".to_string())?;
+        let ddl: Option<String> = sqlx::query_scalar("SELECT pg_get_functiondef($1::oid)")
+            .bind(oid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| format!("读取定义失败: {error}"))?;
+        ddl.ok_or_else(|| format!("没有可用的 DDL: {name}"))
+    }
+
+    async fn create_database(
+        &self,
+        name: &str,
+        _charset: Option<&str>,
+        _collation: Option<&str>,
+    ) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("数据库名称不能为空".to_string());
+        }
+        let sql = format!("CREATE DATABASE {}", quote_identifier(name));
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await
+            .map_err(|error| format!("创建数据库失败: {error}"))?;
+        Ok(())
+    }
+
+    async fn create_schema(&self, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("模式名称不能为空".to_string());
+        }
+        let sql = format!("CREATE SCHEMA {}", quote_identifier(name));
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await
+            .map_err(|error| format!("创建模式失败: {error}"))?;
+        Ok(())
+    }
+
+    async fn drop_database(&self, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("数据库名称不能为空".to_string());
+        }
+        if matches!(name, "postgres" | "template0" | "template1") {
+            return Err("不能删除系统数据库".to_string());
+        }
+        let current: Option<String> = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&self.pool)
+            .await
+            .ok();
+        if current.as_deref() == Some(name) {
+            return Err("不能删除当前正在连接的数据库，请先切换到其他数据库".to_string());
+        }
+        let sql = format!("DROP DATABASE {}", quote_identifier(name));
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await
+            .map_err(|error| format!("删除数据库失败: {error}"))?;
+        Ok(())
+    }
+
+    async fn drop_schema(&self, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("模式名称不能为空".to_string());
+        }
+        let lower = name.to_ascii_lowercase();
+        if lower == "pg_catalog"
+            || lower == "information_schema"
+            || lower == "pg_toast"
+            || lower.starts_with("pg_temp_")
+            || lower.starts_with("pg_toast_temp_")
+        {
+            return Err("不能删除系统模式".to_string());
+        }
+        if self.current_schema().await == name && name != "public" {
+            self.switch_schema("public").await?;
+        }
+        let sql = format!("DROP SCHEMA {}", quote_identifier(name));
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await
+            .map_err(|error| format!("删除模式失败: {error}"))?;
+        Ok(())
+    }
+
+    async fn save_object_definition(
+        &self,
+        kind: &str,
+        name: &str,
+        definition: &str,
+    ) -> Result<(), String> {
+        if !matches!(kind, "view" | "function" | "procedure") {
+            return Err("PostgreSQL 仅支持在应用内修改视图、函数和存储过程".to_string());
+        }
+        let _ = self.object_ddl(kind, name).await?;
+        let definition = definition.trim().trim_end_matches(';').trim();
+        let upper = definition.to_ascii_uppercase();
+        if !upper.starts_with("CREATE ") {
+            return Err("定义必须以 CREATE 开头".to_string());
+        }
+        let sql = if upper.starts_with("CREATE OR REPLACE ") {
+            definition.to_string()
+        } else {
+            format!(
+                "CREATE OR REPLACE {}",
+                definition["CREATE ".len()..].trim_start()
+            )
+        };
+        self.execute(&sql, 1).await.map(|_| ())
+    }
+
     async fn duplicate_table(&self, source: &str, target: &str) -> Result<(), String> {
         let schema = self.current_schema().await;
         let source = qualified_identifier(&schema, source);
@@ -975,12 +1629,7 @@ impl DatabaseDriver for PostgresDriver {
         Ok(())
     }
 
-    async fn rename_object(
-        &self,
-        kind: &str,
-        name: &str,
-        new_name: &str,
-    ) -> Result<(), String> {
+    async fn rename_object(&self, kind: &str, name: &str, new_name: &str) -> Result<(), String> {
         let schema = self.current_schema().await;
         let old = qualified_identifier(&schema, name);
         let new = quote_identifier(new_name);
@@ -1045,10 +1694,7 @@ impl DatabaseDriver for PostgresDriver {
             "function" | "procedure" => "ROUTINE",
             _ => return Err("PostgreSQL 不支持删除该对象类型".to_string()),
         };
-        let sql = format!(
-            "DROP {keyword} {}",
-            qualified_identifier(&schema, name)
-        );
+        let sql = format!("DROP {keyword} {}", qualified_identifier(&schema, name));
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(&self.pool)
             .await
@@ -1062,11 +1708,7 @@ fn quote_identifier(name: &str) -> String {
 }
 
 fn qualified_identifier(schema: &str, name: &str) -> String {
-    format!(
-        "{}.{}",
-        quote_identifier(schema),
-        quote_identifier(name)
-    )
+    format!("{}.{}", quote_identifier(schema), quote_identifier(name))
 }
 
 /// PostgreSQL does not implicitly cast text parameters to column types, so
@@ -1102,11 +1744,7 @@ async fn pg_primary_key_columns(
     Ok(rows.into_iter().collect())
 }
 
-async fn pg_indexes(
-    pool: &PgPool,
-    schema: &str,
-    table: &str,
-) -> Result<Vec<IndexInfo>, String> {
+async fn pg_indexes(pool: &PgPool, schema: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
     let rows = sqlx::query(
         "SELECT i.relname, ix.indisunique, ix.indisprimary, a.attname, u.ord \
          FROM pg_index ix \
@@ -1218,11 +1856,7 @@ fn build_table_ddl(
     let mut definitions: Vec<String> = Vec::new();
 
     for column in columns {
-        let mut definition = format!(
-            "  {} {}",
-            quote_identifier(&column.name),
-            column.data_type
-        );
+        let mut definition = format!("  {} {}", quote_identifier(&column.name), column.data_type);
         if column.auto_increment && column.default_value.is_none() {
             definition.push_str(" GENERATED BY DEFAULT AS IDENTITY");
         }
@@ -1443,7 +2077,11 @@ fn array_to_json(row: &PgRow, index: usize, type_name: &str) -> Value {
         return Value::Array(
             values
                 .into_iter()
-                .map(|value| value.map(|value| Value::String(value.to_string())).unwrap_or(Value::Null))
+                .map(|value| {
+                    value
+                        .map(|value| Value::String(value.to_string()))
+                        .unwrap_or(Value::Null)
+                })
                 .collect(),
         );
     }
@@ -1471,9 +2109,7 @@ fn value_to_json(row: &PgRow, index: usize) -> Value {
             .unwrap_or(Value::Null),
         "INT2" | "INT4" | "INT8" | "OID" => try_opt::<i64>(row, index)
             .map(Value::from)
-            .or_else(|| {
-                try_opt::<Oid>(row, index).map(|value| Value::from(i64::from(value.0)))
-            })
+            .or_else(|| try_opt::<Oid>(row, index).map(|value| Value::from(i64::from(value.0))))
             .unwrap_or(Value::Null),
         "FLOAT4" | "FLOAT8" => try_opt::<f64>(row, index)
             .map(Value::from)
@@ -1613,7 +2249,10 @@ mod tests {
         let schemas = driver.list_schemas().await.expect("schemas");
         assert!(schemas.contains(&"mydb_test".to_string()));
 
-        driver.switch_schema("mydb_test").await.expect("switch schema");
+        driver
+            .switch_schema("mydb_test")
+            .await
+            .expect("switch schema");
         assert!(driver.switch_schema("missing_schema").await.is_err());
 
         driver
@@ -1666,10 +2305,7 @@ mod tests {
             .iter()
             .map(|item| (item.name.as_str(), item.kind.as_str()))
             .collect();
-        assert!(
-            names.contains(&("children", "table")),
-            "objects: {names:?}"
-        );
+        assert!(names.contains(&("children", "table")), "objects: {names:?}");
         assert!(
             names.contains(&("child_labels", "view")),
             "objects: {names:?}"
@@ -1696,13 +2332,17 @@ mod tests {
             .find(|column| column.name == "label")
             .expect("label column");
         assert!(!nullable.nullable);
-        assert_eq!(nullable.default_value.as_deref(), Some("'x'::character varying"));
+        assert_eq!(
+            nullable.default_value.as_deref(),
+            Some("'x'::character varying")
+        );
 
-        let structure = driver
-            .table_structure("children")
-            .await
-            .expect("structure");
-        assert!(structure.ddl.contains("CREATE TABLE \"mydb_test\".\"children\""));
+        let structure = driver.table_structure("children").await.expect("structure");
+        assert!(
+            structure
+                .ddl
+                .contains("CREATE TABLE \"mydb_test\".\"children\"")
+        );
         assert!(structure.ddl.contains("PRIMARY KEY"));
         assert!(structure.indexes.iter().any(|index| {
             index.name == "idx_children_label" && index.columns == vec!["label".to_string()]
@@ -1789,7 +2429,14 @@ mod tests {
         assert_eq!(inserted, 1);
 
         let page = driver
-            .read_rows("children", 10, 0, Some("label = 'a'"), Some("id"), Some("desc"))
+            .read_rows(
+                "children",
+                10,
+                0,
+                Some("label = 'a'"),
+                Some("id"),
+                Some("desc"),
+            )
             .await
             .expect("page");
         assert_eq!(page.total, 1);

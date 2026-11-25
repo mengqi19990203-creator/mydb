@@ -19,6 +19,7 @@ const props = defineProps<{
   collapsed?: boolean;
   locateReason?: string;
   locateScope?: boolean;
+  readOnly?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -28,11 +29,17 @@ const emit = defineEmits<{
   "select-index": [table: TableInfo];
   "open-new-tab": [table: TableInfo];
   "import-data": [table: TableInfo];
+  "generate-data": [table: TableInfo];
+  "view-definition": [table: TableInfo];
+  "create-namespace": [kind: "database" | "schema"];
+  "drop-namespace": [kind: "database" | "schema", name: string];
   "select-database": [database: string];
   "select-schema": [schema: string];
   refresh: [];
   create: [];
   "generate-sql": [payload: { sql: string; title: string }];
+  "export-database": [payload?: { kind: "database" | "schema"; name: string }];
+  "create-object": [kind: "view" | "procedure" | "function" | "trigger"];
 }>();
 
 const search = ref("");
@@ -158,7 +165,7 @@ function openNodeMenu(
   event.stopPropagation();
   nodeMenu.value = {
     x: Math.max(8, Math.min(event.clientX, window.innerWidth - 220)),
-    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 230)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 430)),
     kind,
     name,
   };
@@ -184,9 +191,86 @@ function nodeMenuCreate() {
   emit("create");
 }
 
+function nodeMenuCreateObject(
+  kind: "view" | "procedure" | "function" | "trigger",
+) {
+  closeNodeMenu();
+  emit("create-object", kind);
+}
+
 function nodeMenuRefresh() {
   closeNodeMenu();
   emit("refresh");
+}
+
+function nodeMenuCreateNamespace() {
+  const menu = nodeMenu.value;
+  closeNodeMenu();
+  if (!menu) return;
+  emit("create-namespace", menu.kind);
+}
+
+function nodeMenuDropNamespace() {
+  const menu = nodeMenu.value;
+  closeNodeMenu();
+  if (!menu) return;
+  emit("drop-namespace", menu.kind, menu.name);
+}
+
+function systemNamespace(menu: { kind: "database" | "schema"; name: string }): boolean {
+  if (menu.kind === "database") {
+    return (
+      props.driver === "mysql" &&
+      ["information_schema", "mysql", "performance_schema", "sys"].includes(
+        menu.name.toLowerCase(),
+      )
+    );
+  }
+  if (props.driver !== "postgres") return true;
+  const lower = menu.name.toLowerCase();
+  return (
+    lower === "pg_catalog" ||
+    lower === "information_schema" ||
+    lower === "pg_toast" ||
+    lower.startsWith("pg_temp_") ||
+    lower.startsWith("pg_toast_temp_")
+  );
+}
+
+function canDropNamespace(menu: { kind: "database" | "schema"; name: string }): boolean {
+  if (props.readOnly) return false;
+  if (systemNamespace(menu)) return false;
+  if (
+    menu.kind === "database" &&
+    props.driver === "postgres" &&
+    menu.name === props.activeDatabase
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function nodeMenuExportDatabase() {
+  const menu = nodeMenu.value;
+  closeNodeMenu();
+  if (!menu) return;
+  emit("export-database", { kind: menu.kind, name: menu.name });
+}
+
+function exportCurrentScope() {
+  if (isPostgres.value && props.activeSchema) {
+    emit("export-database", {
+      kind: "schema",
+      name: props.activeSchema,
+    });
+  } else if (props.activeDatabase) {
+    emit("export-database", {
+      kind: "database",
+      name: props.activeDatabase,
+    });
+  } else {
+    emit("export-database");
+  }
 }
 
 async function nodeMenuCopyName() {
@@ -354,6 +438,14 @@ watch(
         </button>
         <button
           class="icon-button"
+          title="导出数据库 SQL"
+          aria-label="导出数据库 SQL"
+          @click="exportCurrentScope"
+        >
+          <Icon name="download" />
+        </button>
+        <button
+          class="icon-button"
           title="新建表"
           aria-label="新建表"
           @click="emit('create')"
@@ -512,6 +604,7 @@ watch(
                     <ObjectCategoryGroups
                       :key="categoryKey"
                       :connection-id="connectionId"
+                      :read-only="readOnly"
                       :driver="driver"
                       :tables="tables"
                       :search="search"
@@ -526,6 +619,8 @@ watch(
                       @select-index="emit('select-index', $event)"
                       @open-new-tab="emit('open-new-tab', $event)"
                       @import-data="emit('import-data', $event)"
+                      @generate-data="emit('generate-data', $event)"
+                      @view-definition="emit('view-definition', $event)"
                       @create="emit('create')"
                       @refresh="emit('refresh')"
                       @generate-sql="emit('generate-sql', $event)"
@@ -539,6 +634,7 @@ watch(
               v-else
               :key="categoryKey"
               :connection-id="connectionId"
+                      :read-only="readOnly"
               :driver="driver"
               :tables="tables"
               :search="search"
@@ -552,6 +648,8 @@ watch(
               @select-index="emit('select-index', $event)"
               @open-new-tab="emit('open-new-tab', $event)"
               @import-data="emit('import-data', $event)"
+                      @generate-data="emit('generate-data', $event)"
+                      @view-definition="emit('view-definition', $event)"
               @create="emit('create')"
               @refresh="emit('refresh')"
               @generate-sql="emit('generate-sql', $event)"
@@ -564,6 +662,7 @@ watch(
         <ObjectCategoryGroups
           :key="categoryKey"
           :connection-id="connectionId"
+                      :read-only="readOnly"
           :driver="driver"
           :tables="tables"
           :search="search"
@@ -577,6 +676,8 @@ watch(
           @select-index="emit('select-index', $event)"
           @open-new-tab="emit('open-new-tab', $event)"
           @import-data="emit('import-data', $event)"
+                      @generate-data="emit('generate-data', $event)"
+                      @view-definition="emit('view-definition', $event)"
           @create="emit('create')"
           @refresh="emit('refresh')"
           @generate-sql="emit('generate-sql', $event)"
@@ -615,6 +716,51 @@ watch(
       </span>
     </button>
     <button
+      v-if="nodeMenu.kind === 'database'"
+      class="context-menu-item"
+      role="menuitem"
+      :disabled="readOnly"
+      :title="readOnly ? '当前连接为只读' : undefined"
+      @click="nodeMenuCreateNamespace"
+    >
+      <Icon name="plus" :size="14" />
+      <span>新建数据库…</span>
+    </button>
+    <button
+      v-if="nodeMenu.kind === 'schema' && driver === 'postgres'"
+      class="context-menu-item"
+      role="menuitem"
+      :disabled="readOnly"
+      :title="readOnly ? '当前连接为只读' : undefined"
+      @click="nodeMenuCreateNamespace"
+    >
+      <Icon name="plus" :size="14" />
+      <span>新建模式…</span>
+    </button>
+    <button
+      class="context-menu-item danger"
+      role="menuitem"
+      :disabled="!canDropNamespace(nodeMenu)"
+      :title="
+        readOnly
+          ? '当前连接为只读'
+          : systemNamespace(nodeMenu)
+            ? '系统对象不能删除'
+            : nodeMenu.kind === 'database' && driver === 'postgres' && nodeMenu.name === activeDatabase
+              ? '不能删除当前正在连接的数据库'
+              : undefined
+      "
+      @click="nodeMenuDropNamespace"
+    >
+      <Icon name="trash" :size="14" />
+      <span>
+        {{
+          nodeMenu.kind === "database" ? "删除数据库…" : "删除模式…"
+        }}
+      </span>
+    </button>
+    <div class="context-separator"></div>
+    <button
       class="context-menu-item"
       role="menuitem"
       @click="nodeMenuCreate"
@@ -622,7 +768,49 @@ watch(
       <Icon name="plus" :size="14" />
       <span>新建表</span>
     </button>
+    <button
+      class="context-menu-item"
+      role="menuitem"
+      @click="nodeMenuCreateObject('view')"
+    >
+      <Icon name="view" :size="14" />
+      <span>新建视图…</span>
+    </button>
+    <button
+      v-if="driver === 'mysql' || driver === 'postgres'"
+      class="context-menu-item"
+      role="menuitem"
+      @click="nodeMenuCreateObject('procedure')"
+    >
+      <Icon name="code" :size="14" />
+      <span>新建存储过程…</span>
+    </button>
+    <button
+      v-if="driver === 'mysql' || driver === 'postgres'"
+      class="context-menu-item"
+      role="menuitem"
+      @click="nodeMenuCreateObject('function')"
+    >
+      <Icon name="code" :size="14" />
+      <span>新建函数…</span>
+    </button>
+    <button
+      class="context-menu-item"
+      role="menuitem"
+      @click="nodeMenuCreateObject('trigger')"
+    >
+      <Icon name="bolt" :size="14" />
+      <span>新建触发器…</span>
+    </button>
     <div class="context-separator"></div>
+    <button
+      class="context-menu-item"
+      role="menuitem"
+      @click="nodeMenuExportDatabase"
+    >
+      <Icon name="download" :size="14" />
+      <span>导出 SQL…</span>
+    </button>
     <button
       class="context-menu-item"
       role="menuitem"

@@ -13,6 +13,13 @@ import { toggleComment } from "@codemirror/commands";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { tags } from "@lezer/highlight";
+import { statementAtCursor, statementRangeAtCursor } from "../lib/sql-statements";
+import {
+  compressSql,
+  formatGuard,
+  loadFormatOptions,
+  stripComments,
+} from "../lib/sql-format";
 import type { Driver, ScopeTableColumns } from "../lib/types";
 
 const props = defineProps<{
@@ -25,6 +32,8 @@ const emit = defineEmits<{
   "update:modelValue": [value: string];
   selection: [value: string];
   run: [sql?: string];
+  notice: [message: string, kind: "info" | "error"];
+  busy: [value: boolean];
 }>();
 
 const host = ref<HTMLElement>();
@@ -36,7 +45,102 @@ export type EditorCommand =
   | "find-next"
   | "find-previous"
   | "goto-line"
-  | "toggle-comment";
+  | "toggle-comment"
+  | "format-sql"
+  | "compress-sql";
+
+function sqlFormatterLanguage() {
+  switch (props.driver) {
+    case "mysql":
+      return "mysql";
+    case "postgres":
+      return "postgresql";
+    default:
+      return "sqlite";
+  }
+}
+
+function replaceTarget(
+  from: number,
+  to: number,
+  text: string,
+  select: boolean,
+) {
+  if (!view) return;
+  view.dispatch({
+    changes: { from, to, insert: text },
+    selection: select
+      ? { anchor: from, head: from + text.length }
+      : { anchor: Math.min(from, view.state.doc.length) },
+    scrollIntoView: true,
+  });
+  view.focus();
+}
+
+/** Selection, else the exact statement under the cursor, else the whole doc. */
+function formatTarget(): { from: number; to: number; selected: boolean } | null {
+  if (!view) return null;
+  const { from, to } = view.state.selection.main;
+  if (from !== to) return { from, to, selected: true };
+  const statement = statementRangeAtCursor(view.state.doc.toString(), from);
+  if (statement) {
+    return { from: statement.start, to: statement.end, selected: false };
+  }
+  return { from: 0, to: view.state.doc.length, selected: false };
+}
+
+async function formatSql() {
+  const target = formatTarget();
+  if (!view || !target) return;
+  const text = view.state.sliceDoc(target.from, target.to);
+  if (!text.trim()) {
+    emit("notice", "没有可格式化的 SQL", "error");
+    return;
+  }
+  const guard = formatGuard(text);
+  if (guard) {
+    emit("notice", guard, "error");
+    return;
+  }
+
+  emit("busy", true);
+  try {
+    const { format: formatSqlText } = await import("sql-formatter");
+    const options = loadFormatOptions();
+    const input = options.preserveComments ? text : stripComments(text);
+    const formatted = formatSqlText(input, {
+      language: sqlFormatterLanguage(),
+      keywordCase: options.keywordCase,
+      tabWidth: options.tabWidth,
+      linesBetweenQueries: options.linesBetweenQueries,
+    });
+    if (!view) return;
+    replaceTarget(target.from, target.to, formatted, target.selected);
+    emit("notice", "已格式化 SQL", "info");
+  } catch {
+    emit("notice", "格式化失败，已保留原文", "error");
+  } finally {
+    emit("busy", false);
+  }
+}
+
+function compressSelectedSql() {
+  const target = formatTarget();
+  if (!view || !target) return;
+  const text = view.state.sliceDoc(target.from, target.to);
+  if (!text.trim()) {
+    emit("notice", "没有可压缩的 SQL", "error");
+    return;
+  }
+  const guard = formatGuard(text);
+  if (guard) {
+    emit("notice", guard, "error");
+    return;
+  }
+  const compressed = compressSql(text);
+  replaceTarget(target.from, target.to, compressed, target.selected);
+  emit("notice", "已压缩 SQL（普通注释已移除）", "info");
+}
 
 function runCommand(command: EditorCommand) {
   if (!view) return;
@@ -57,10 +161,39 @@ function runCommand(command: EditorCommand) {
     case "toggle-comment":
       toggleComment(view);
       break;
+    case "format-sql":
+      formatSql();
+      break;
+    case "compress-sql":
+      compressSelectedSql();
+      break;
   }
 }
 
-defineExpose({ runCommand });
+function insertSnippet(text: string) {
+  if (!view) return;
+  const { from, to } = view.state.selection.main;
+  const marker = text.indexOf("${cursor}");
+  const insert = marker >= 0 ? text.replace("${cursor}", "") : text;
+  const cursor = marker >= 0 ? from + marker : from + insert.length;
+  view.dispatch({
+    changes: { from, to, insert },
+    selection: { anchor: cursor },
+  });
+  view.focus();
+}
+
+defineExpose({
+  runCommand,
+  formatSql,
+  insertSnippet,
+  currentStatement(): string {
+    if (!view) return "";
+    const { from, to } = view.state.selection.main;
+    if (from !== to) return view.state.sliceDoc(from, to);
+    return statementAtCursor(view.state.doc.toString(), from);
+  },
+});
 
 function dialectFor(driver: Driver) {
   switch (driver) {
@@ -93,7 +226,7 @@ function selectedText(state: EditorState): string {
 const editorTheme = EditorView.theme({
   "&": {
     height: "100%",
-    fontSize: "13px",
+    fontSize: "var(--editor-font-size, 13px)",
     backgroundColor: "var(--surface-well)",
     color: "var(--text)",
   },
@@ -125,13 +258,19 @@ const editorTheme = EditorView.theme({
 });
 
 const dbxHighlight = HighlightStyle.define([
-  { tag: tags.keyword, color: "#8ab4f8" },
-  { tag: [tags.string, tags.special(tags.string)], color: "#81c995" },
-  { tag: [tags.number, tags.bool, tags.null], color: "#fdd663" },
-  { tag: tags.comment, color: "#78787c", fontStyle: "italic" },
-  { tag: tags.operator, color: "#a3a3a7" },
-  { tag: tags.propertyName, color: "#dcdce0" },
-  { tag: tags.typeName, color: "#8ab4f8" },
+  { tag: tags.keyword, color: "var(--syntax-keyword, #8ab4f8)" },
+  {
+    tag: [tags.string, tags.special(tags.string)],
+    color: "var(--syntax-string, #81c995)",
+  },
+  {
+    tag: [tags.number, tags.bool, tags.null],
+    color: "var(--syntax-number, #fdd663)",
+  },
+  { tag: tags.comment, color: "var(--syntax-comment, #78787c)", fontStyle: "italic" },
+  { tag: tags.operator, color: "var(--syntax-operator, #a3a3a7)" },
+  { tag: tags.propertyName, color: "var(--syntax-property, #dcdce0)" },
+  { tag: tags.typeName, color: "var(--syntax-type, #8ab4f8)" },
 ]);
 
 onMounted(() => {

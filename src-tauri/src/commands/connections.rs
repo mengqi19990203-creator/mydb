@@ -1,5 +1,6 @@
 use super::AppState;
 use super::close_connection_transactions;
+use super::query_window_uses_connection;
 use crate::db::{DatabaseDriver, MySqlDriver, PostgresDriver, SqliteDriver};
 use crate::keychain;
 use crate::models::{ConnectionConfig, ConnectionGroup, DatabaseObjects};
@@ -18,11 +19,14 @@ pub async fn list_connections(
     let mut connections = storage::load_connections(&app)?;
     let passwords = state.passwords.lock().await;
     let ssh_passwords = state.ssh_passwords.lock().await;
+    let ssh_key_passphrases = state.ssh_key_passphrases.lock().await;
 
     for config in &mut connections {
         config.has_password = config.save_password || passwords.contains_key(&config.id);
         config.has_ssh_password =
             config.save_ssh_password || ssh_passwords.contains_key(&config.id);
+        config.has_ssh_key_passphrase =
+            config.save_ssh_key_passphrase || ssh_key_passphrases.contains_key(&config.id);
     }
 
     Ok(connections)
@@ -35,6 +39,7 @@ pub async fn save_connection(
     mut config: ConnectionConfig,
     password: Option<String>,
     ssh_password: Option<String>,
+    ssh_key_passphrase: Option<String>,
 ) -> Result<ConnectionConfig, String> {
     validate_config(&mut config)?;
 
@@ -72,6 +77,19 @@ pub async fn save_connection(
     )
     .await?;
 
+    apply_password(
+        &state,
+        &config.id,
+        "ssh-key",
+        ssh_key_passphrase.as_deref(),
+        config.save_ssh_key_passphrase,
+        existing
+            .as_ref()
+            .map(|item| item.save_ssh_key_passphrase)
+            .unwrap_or(false),
+    )
+    .await?;
+
     let mut connections = storage::load_connections(&app)?;
     if let Some(current) = connections.iter_mut().find(|item| item.id == config.id) {
         *current = config.clone();
@@ -84,6 +102,12 @@ pub async fn save_connection(
         config.save_password || state.passwords.lock().await.contains_key(&config.id);
     config.has_ssh_password =
         config.save_ssh_password || state.ssh_passwords.lock().await.contains_key(&config.id);
+    config.has_ssh_key_passphrase = config.save_ssh_key_passphrase
+        || state
+            .ssh_key_passphrases
+            .lock()
+            .await
+            .contains_key(&config.id);
 
     // Drop the cached pool/tunnel/Redis connection so the next request reconnects.
     state.drivers.lock().await.remove(&config.id);
@@ -93,6 +117,31 @@ pub async fn save_connection(
     close_connection_transactions(&state, &config.id).await;
 
     Ok(config)
+}
+
+#[tauri::command]
+pub async fn clear_connection_secret(
+    state: State<'_, AppState>,
+    id: String,
+    kind: String,
+) -> Result<(), String> {
+    if !matches!(kind.as_str(), "db" | "ssh" | "ssh-key") {
+        return Err("未知的凭据类型".to_string());
+    }
+    match kind.as_str() {
+        "db" => {
+            state.passwords.lock().await.remove(&id);
+        }
+        "ssh" => {
+            state.ssh_passwords.lock().await.remove(&id);
+        }
+        "ssh-key" => {
+            state.ssh_key_passphrases.lock().await.remove(&id);
+        }
+        _ => {}
+    }
+    keychain::delete(&id, &kind);
+    Ok(())
 }
 
 #[tauri::command]
@@ -111,17 +160,16 @@ pub async fn delete_connection(
     state.redis_databases.lock().await.remove(&id);
     state.passwords.lock().await.remove(&id);
     state.ssh_passwords.lock().await.remove(&id);
+    state.ssh_key_passphrases.lock().await.remove(&id);
     close_connection_transactions(&state, &id).await;
     keychain::delete(&id, "db");
     keychain::delete(&id, "ssh");
+    keychain::delete(&id, "ssh-key");
 
     Ok(())
 }
 
-pub(crate) fn connection_read_only(
-    app: &AppHandle,
-    connection_id: &str,
-) -> Result<bool, String> {
+pub(crate) fn connection_read_only(app: &AppHandle, connection_id: &str) -> Result<bool, String> {
     Ok(storage::load_connections(app)?
         .into_iter()
         .find(|item| item.id == connection_id)
@@ -138,10 +186,7 @@ pub(crate) fn ensure_writable(app: &AppHandle, connection_id: &str) -> Result<()
 }
 
 #[tauri::command]
-pub async fn close_connection(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub async fn close_connection(state: State<'_, AppState>, id: String) -> Result<(), String> {
     state.drivers.lock().await.remove(&id);
     state.redis_clients.lock().await.remove(&id);
     state.redis_tunnels.lock().await.remove(&id);
@@ -194,6 +239,7 @@ pub async fn duplicate_connection(
         .unwrap_or_else(|| format!("{} 副本", source.name));
     config.has_password = false;
     config.has_ssh_password = false;
+    config.has_ssh_key_passphrase = false;
     if connections.iter().any(|item| item.name == config.name) {
         return Err("连接名称已存在".to_string());
     }
@@ -201,8 +247,15 @@ pub async fn duplicate_connection(
     if copy_secrets.unwrap_or(false) {
         copy_secret(&state, &source, &config.id, "db").await?;
         copy_secret(&state, &source, &config.id, "ssh").await?;
+        copy_secret(&state, &source, &config.id, "ssh-key").await?;
         let session_db = state.passwords.lock().await.get(&source.id).cloned();
         let session_ssh = state.ssh_passwords.lock().await.get(&source.id).cloned();
+        let session_key = state
+            .ssh_key_passphrases
+            .lock()
+            .await
+            .get(&source.id)
+            .cloned();
         if let Some(password) = session_db {
             state
                 .passwords
@@ -217,12 +270,26 @@ pub async fn duplicate_connection(
                 .await
                 .insert(config.id.clone(), password);
         }
-        config.save_password = source.save_password && keychain::load(&source.id, "db").ok().flatten().is_some();
-        config.save_ssh_password = source.save_ssh_password
-            && keychain::load(&source.id, "ssh").ok().flatten().is_some();
+        if let Some(passphrase) = session_key {
+            state
+                .ssh_key_passphrases
+                .lock()
+                .await
+                .insert(config.id.clone(), passphrase);
+        }
+        config.save_password =
+            source.save_password && keychain::load(&source.id, "db").ok().flatten().is_some();
+        config.save_ssh_password =
+            source.save_ssh_password && keychain::load(&source.id, "ssh").ok().flatten().is_some();
+        config.save_ssh_key_passphrase = source.save_ssh_key_passphrase
+            && keychain::load(&source.id, "ssh-key")
+                .ok()
+                .flatten()
+                .is_some();
     } else {
         config.save_password = false;
         config.save_ssh_password = false;
+        config.save_ssh_key_passphrase = false;
     }
 
     let mut connections = storage::load_connections(&app)?;
@@ -241,6 +308,12 @@ async fn copy_secret(
     let session = match kind {
         "db" => state.passwords.lock().await.get(&source.id).cloned(),
         "ssh" => state.ssh_passwords.lock().await.get(&source.id).cloned(),
+        "ssh-key" => state
+            .ssh_key_passphrases
+            .lock()
+            .await
+            .get(&source.id)
+            .cloned(),
         _ => None,
     };
     if let Some(password) = saved.or(session) {
@@ -255,6 +328,13 @@ async fn copy_secret(
             "ssh" => {
                 state
                     .ssh_passwords
+                    .lock()
+                    .await
+                    .insert(target_id.to_string(), password.clone());
+            }
+            "ssh-key" => {
+                state
+                    .ssh_key_passphrases
                     .lock()
                     .await
                     .insert(target_id.to_string(), password.clone());
@@ -556,15 +636,22 @@ pub async fn switch_database(
         .ok_or_else(|| format!("连接不存在: {connection_id}"))?
         .clone();
 
+    let driver = driver_for(&app, &state, &connection_id).await?;
+    let (current_database, _) = driver.context().await;
+    if current_database.as_deref() != Some(database.as_str())
+        && query_window_uses_connection(&state, &connection_id)
+    {
+        return Err("独立查询窗口正在使用该连接，请先关闭查询窗口再切换数据库 / 模式".to_string());
+    }
+
     config.database = database.clone();
     // MySQL keeps the existing pool and only changes the active schema.
     if config.driver == "mysql" {
-        let driver = driver_for(&app, &state, &connection_id).await?;
         return driver.switch_database(&database).await;
     }
 
     let password = password_for(&state, &config, "db").await?;
-    let (host, port, tunnel) = connection_target(&state, &config, None).await?;
+    let (host, port, tunnel) = connection_target(&state, &config, None, None).await?;
 
     let driver: Arc<dyn DatabaseDriver> = match config.driver.as_str() {
         "postgres" => {
@@ -609,6 +696,12 @@ pub async fn switch_schema(
     schema: String,
 ) -> Result<(), String> {
     let driver = driver_for(&app, &state, &connection_id).await?;
+    let (_, current_schema) = driver.context().await;
+    if current_schema.as_deref() != Some(schema.as_str())
+        && query_window_uses_connection(&state, &connection_id)
+    {
+        return Err("独立查询窗口正在使用该连接，请先关闭查询窗口再切换数据库 / 模式".to_string());
+    }
     driver.switch_schema(&schema).await
 }
 
@@ -618,6 +711,7 @@ pub async fn test_connection(
     mut config: ConnectionConfig,
     password: Option<String>,
     ssh_password: Option<String>,
+    ssh_key_passphrase: Option<String>,
 ) -> Result<(), String> {
     validate_config(&mut config)?;
 
@@ -634,7 +728,8 @@ pub async fn test_connection(
             Some(value) if !value.is_empty() => Some(value),
             _ => password_for(&state, &config, "db").await?,
         };
-        let (host, port, tunnel) = connection_target(&state, &config, ssh_password).await?;
+        let (host, port, tunnel) =
+            connection_target(&state, &config, ssh_password, ssh_key_passphrase).await?;
         let result =
             crate::redis_client::test_connection(&config, &host, port, password.as_deref()).await;
         drop(tunnel);
@@ -645,7 +740,8 @@ pub async fn test_connection(
         Some(value) if !value.is_empty() => Some(value),
         _ => password_for(&state, &config, "db").await?,
     };
-    let (host, port, tunnel) = connection_target(&state, &config, ssh_password).await?;
+    let (host, port, tunnel) =
+        connection_target(&state, &config, ssh_password, ssh_key_passphrase).await?;
 
     if config.driver == "postgres" {
         let driver =
@@ -680,12 +776,12 @@ pub(crate) async fn driver_for(
         "sqlite" => Arc::new(SqliteDriver::connect(&config.file).await?),
         "mysql" => {
             let password = password_for(state, &config, "db").await?;
-            let (host, port, tunnel) = connection_target(state, &config, None).await?;
+            let (host, port, tunnel) = connection_target(state, &config, None, None).await?;
             Arc::new(MySqlDriver::connect(&config, &host, port, password.as_deref(), tunnel).await?)
         }
         "postgres" => {
             let password = password_for(state, &config, "db").await?;
-            let (host, port, tunnel) = connection_target(state, &config, None).await?;
+            let (host, port, tunnel) = connection_target(state, &config, None, None).await?;
             Arc::new(
                 PostgresDriver::connect(&config, &host, port, password.as_deref(), tunnel).await?,
             )
@@ -711,6 +807,31 @@ fn validate_config(config: &mut ConnectionConfig) -> Result<(), String> {
     config.ssh_host = config.ssh_host.trim().to_string();
     config.ssh_username = config.ssh_username.trim().to_string();
     config.ssh_key_path = config.ssh_key_path.trim().to_string();
+    config.ssl_ca_path = config.ssl_ca_path.trim().to_string();
+    config.ssl_client_cert_path = config.ssl_client_cert_path.trim().to_string();
+    config.ssl_client_key_path = config.ssl_client_key_path.trim().to_string();
+    for path in [
+        &mut config.ssl_ca_path,
+        &mut config.ssl_client_cert_path,
+        &mut config.ssl_client_key_path,
+    ] {
+        if let Some(relative) = path.strip_prefix("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                *path = std::path::PathBuf::from(home)
+                    .join(relative)
+                    .to_string_lossy()
+                    .to_string();
+            }
+        }
+    }
+    if matches!(config.ssl_mode.as_str(), "verify-ca" | "verify-full")
+        && config.ssl_ca_path.is_empty()
+    {
+        return Err("verify-ca / verify-full 必须选择 CA 证书文件".to_string());
+    }
+    if config.ssl_client_cert_path.is_empty() != config.ssl_client_key_path.is_empty() {
+        return Err("客户端证书与私钥必须同时选择".to_string());
+    }
 
     if let Some(relative) = config.ssh_key_path.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
@@ -821,17 +942,24 @@ pub(crate) async fn connection_target(
     state: &AppState,
     config: &ConnectionConfig,
     ssh_password_override: Option<String>,
+    ssh_key_passphrase_override: Option<String>,
 ) -> Result<(String, u16, Option<SshTunnel>), String> {
     if !config.ssh_enabled {
         return Ok((config.host.clone(), config.port, None));
     }
 
-    let ssh_password = match ssh_password_override {
-        Some(value) if !value.is_empty() => Some(value),
-        _ => password_for(state, config, "ssh").await?,
+    let credential = if config.ssh_auth == "key" {
+        match ssh_key_passphrase_override {
+            Some(value) if !value.is_empty() => Some(value),
+            _ => password_for(state, config, "ssh-key").await?,
+        }
+    } else {
+        match ssh_password_override {
+            Some(value) if !value.is_empty() => Some(value),
+            _ => password_for(state, config, "ssh").await?,
+        }
     };
-    let tunnel =
-        SshTunnel::open(config, &config.host, config.port, ssh_password.as_deref()).await?;
+    let tunnel = SshTunnel::open(config, &config.host, config.port, credential.as_deref()).await?;
     let local_port = tunnel.local_port;
 
     Ok(("127.0.0.1".to_string(), local_port, Some(tunnel)))
@@ -845,6 +973,12 @@ pub(crate) async fn password_for(
     let session_password = match kind {
         "db" => state.passwords.lock().await.get(&config.id).cloned(),
         "ssh" => state.ssh_passwords.lock().await.get(&config.id).cloned(),
+        "ssh-key" => state
+            .ssh_key_passphrases
+            .lock()
+            .await
+            .get(&config.id)
+            .cloned(),
         _ => None,
     };
     if session_password.is_some() {
@@ -854,6 +988,7 @@ pub(crate) async fn password_for(
     let save_flag = match kind {
         "db" => config.save_password,
         "ssh" => config.save_ssh_password,
+        "ssh-key" => config.save_ssh_key_passphrase,
         _ => false,
     };
     if save_flag && !config.id.is_empty() {
@@ -884,6 +1019,13 @@ async fn apply_password(
                 "ssh" => {
                     state
                         .ssh_passwords
+                        .lock()
+                        .await
+                        .insert(connection_id.to_string(), value.to_string());
+                }
+                "ssh-key" => {
+                    state
+                        .ssh_key_passphrases
                         .lock()
                         .await
                         .insert(connection_id.to_string(), value.to_string());

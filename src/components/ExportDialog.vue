@@ -84,6 +84,7 @@ onBeforeUnmount(() => {
           <option value="json">JSON</option>
           <option value="sql">SQL INSERT</option>
           <option value="ddl">结构 DDL</option>
+          <option value="xlsx">Excel 工作簿（XLSX）</option>
         </select>
       </div>
 
@@ -110,7 +111,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <div v-if="format === 'csv'" class="export-field">
+      <div v-if="format === 'csv' || format === 'xlsx'" class="export-field">
         <span class="export-label">表头</span>
         <label class="export-check">
           <input v-model="withHeader" type="checkbox" />

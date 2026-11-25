@@ -2,6 +2,9 @@
 import { computed, nextTick, ref, watch } from "vue";
 import ColumnEditorDialog from "./ColumnEditorDialog.vue";
 import ConfirmDialog from "./ConfirmDialog.vue";
+import ForeignKeyEditorDialog, {
+  type ForeignKeyDraft,
+} from "./ForeignKeyEditorDialog.vue";
 import Icon from "./Icon.vue";
 import IndexEditorDialog from "./IndexEditorDialog.vue";
 import * as api from "../lib/api";
@@ -10,10 +13,12 @@ import {
   buildDropIndexStatement,
 } from "../lib/alter";
 import { writeClipboard } from "../lib/clipboard";
+import { quoteIdentifier } from "../lib/sql-literal";
 import type {
   ColumnInfo,
   Driver,
   IndexInfo,
+  TableInfo,
   TableStructure,
 } from "../lib/types";
 
@@ -24,6 +29,7 @@ const props = defineProps<{
   driver: Driver;
   kind?: string;
   focusIndex?: string | null;
+  readOnly?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -38,13 +44,18 @@ const actionError = ref("");
 const columnDialogOpen = ref(false);
 const editingColumn = ref<ColumnInfo | null>(null);
 const indexDialogOpen = ref(false);
-const dropTarget = ref<{ kind: "column" | "index"; name: string } | null>(
-  null,
-);
+const dropTarget = ref<{
+  kind: "column" | "index" | "foreignKey";
+  name: string;
+} | null>(null);
 const dropOpen = ref(false);
 const indexSection = ref<HTMLElement | null>(null);
+const foreignKeyOpen = ref(false);
+const availableTables = ref<TableInfo[]>([]);
 
-const canAlter = computed(() => (props.kind ?? "table") === "table");
+const canAlter = computed(
+  () => (props.kind ?? "table") === "table" && !props.readOnly,
+);
 
 async function load() {
   loading.value = true;
@@ -54,6 +65,9 @@ async function load() {
     structure.value = await api.getTableStructure(
       props.connectionId,
       props.table,
+    );
+    availableTables.value = (await api.listTables(props.connectionId)).filter(
+      (table) => table.kind === "table",
     );
   } catch (reason) {
     structure.value = null;
@@ -147,6 +161,64 @@ async function onStructureChanged(text: string) {
   await reloadWithMessage(text);
 }
 
+function askDropForeignKey(name: string) {
+  if (props.driver === "sqlite") {
+    actionError.value = "SQLite 需重建表，暂不支持在结构页删除外键";
+    return;
+  }
+  dropTarget.value = { kind: "foreignKey", name };
+  dropOpen.value = true;
+}
+
+function openAddForeignKey() {
+  if (props.driver === "sqlite") {
+    actionError.value = "SQLite 需重建表，暂不支持在结构页添加外键";
+    return;
+  }
+  foreignKeyOpen.value = true;
+}
+
+async function applyForeignKey(draft: ForeignKeyDraft) {
+  if (!canAlter.value) return;
+  const tableRef = quoteIdentifier(props.table, props.driver);
+  const localColumns = draft.columns
+    .map((column) => quoteIdentifier(column, props.driver))
+    .join(", ");
+  const referencedColumns = draft.referencedColumns
+    .map((column) => quoteIdentifier(column, props.driver))
+    .join(", ");
+  let sql = `ALTER TABLE ${tableRef} ADD CONSTRAINT ${quoteIdentifier(
+    draft.name,
+    props.driver,
+  )} FOREIGN KEY (${localColumns}) REFERENCES ${quoteIdentifier(
+    draft.referencedTable,
+    props.driver,
+  )} (${referencedColumns})`;
+  if (draft.onDelete !== "NO ACTION") {
+    sql += ` ON DELETE ${draft.onDelete}`;
+  }
+  if (draft.onUpdate !== "NO ACTION") {
+    sql += ` ON UPDATE ${draft.onUpdate}`;
+  }
+  actionError.value = "";
+  try {
+    await api.executeQuery(props.connectionId, `${sql};`, 1);
+    foreignKeyOpen.value = false;
+    await reloadWithMessage("已添加外键");
+  } catch (reason) {
+    actionError.value = String(reason);
+  }
+}
+
+function buildDropForeignKeyStatement(name: string): string {
+  const tableRef = quoteIdentifier(props.table, props.driver);
+  const keyRef = quoteIdentifier(name, props.driver);
+  if (props.driver === "mysql") {
+    return `ALTER TABLE ${tableRef} DROP FOREIGN KEY ${keyRef};`;
+  }
+  return `ALTER TABLE ${tableRef} DROP CONSTRAINT ${keyRef};`;
+}
+
 async function confirmDrop() {
   const target = dropTarget.value;
   dropOpen.value = false;
@@ -157,13 +229,17 @@ async function confirmDrop() {
   const sql =
     target.kind === "column"
       ? buildDropColumnStatement(props.driver, props.table, target.name)
-      : buildDropIndexStatement(props.driver, props.table, target.name);
+      : target.kind === "index"
+        ? buildDropIndexStatement(props.driver, props.table, target.name)
+        : buildDropForeignKeyStatement(target.name);
   try {
     await api.executeQuery(props.connectionId, sql, 1);
     await reloadWithMessage(
       target.kind === "column"
         ? `已删除字段 ${target.name}`
-        : `已删除索引 ${target.name}`,
+        : target.kind === "index"
+          ? `已删除索引 ${target.name}`
+          : `已删除外键 ${target.name}`,
     );
   } catch (reason) {
     actionError.value = String(reason);
@@ -242,6 +318,7 @@ async function confirmDrop() {
                 <th>主键</th>
                 <th>自增</th>
                 <th>默认值</th>
+                <th>注释</th>
                 <th v-if="canAlter">操作</th>
               </tr>
             </thead>
@@ -253,6 +330,7 @@ async function confirmDrop() {
                 <td>{{ column.primaryKey ? "是" : "否" }}</td>
                 <td>{{ column.autoIncrement ? "是" : "否" }}</td>
                 <td class="mono">{{ column.defaultValue ?? "—" }}</td>
+                <td>{{ column.comment || "—" }}</td>
                 <td v-if="canAlter">
                   <div class="structure-actions">
                     <button
@@ -323,7 +401,23 @@ async function confirmDrop() {
         </section>
 
         <section class="structure-section">
-          <h3>外键 <span>{{ structure.foreignKeys.length }}</span></h3>
+          <div class="structure-section-head">
+            <h3>外键 <span>{{ structure.foreignKeys.length }}</span></h3>
+            <button
+              v-if="canAlter"
+              class="button ghost compact"
+              :disabled="driver === 'sqlite'"
+              :title="
+                driver === 'sqlite'
+                  ? 'SQLite 需重建表，暂不支持'
+                  : '添加外键'
+              "
+              @click="openAddForeignKey"
+            >
+              <Icon name="plus" :size="14" />
+              添加外键
+            </button>
+          </div>
           <table v-if="structure.foreignKeys.length" class="structure-table">
             <thead>
               <tr>
@@ -333,6 +427,7 @@ async function confirmDrop() {
                 <th>引用列</th>
                 <th>ON DELETE</th>
                 <th>ON UPDATE</th>
+                <th v-if="canAlter">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -345,6 +440,21 @@ async function confirmDrop() {
                 </td>
                 <td>{{ key.onDelete || "—" }}</td>
                 <td>{{ key.onUpdate || "—" }}</td>
+                <td v-if="canAlter">
+                  <button
+                    class="icon-button"
+                    :disabled="driver === 'sqlite'"
+                    :title="
+                      driver === 'sqlite'
+                        ? 'SQLite 需重建表，暂不支持'
+                        : '删除外键'
+                    "
+                    aria-label="删除外键"
+                    @click="askDropForeignKey(key.name)"
+                  >
+                    <Icon name="trash" :size="14" />
+                  </button>
+                </td>
               </tr>
             </tbody>
           </table>
@@ -381,14 +491,38 @@ async function confirmDrop() {
     @done="onStructureChanged"
   />
 
+  <ForeignKeyEditorDialog
+    :open="foreignKeyOpen"
+    :table="table"
+    :driver="driver"
+    :columns="structure?.columns ?? []"
+    :tables="availableTables"
+    @close="foreignKeyOpen = false"
+    @apply="applyForeignKey"
+  />
+
   <ConfirmDialog
     :open="dropOpen"
-    :title="dropTarget?.kind === 'index' ? '删除索引' : '删除字段'"
-    :message="`确定删除${dropTarget?.kind === 'index' ? '索引' : '字段'}「${dropTarget?.name ?? ''}」？`"
+    :title="
+      dropTarget?.kind === 'index'
+        ? '删除索引'
+        : dropTarget?.kind === 'foreignKey'
+          ? '删除外键'
+          : '删除字段'
+    "
+    :message="`确定删除${
+      dropTarget?.kind === 'index'
+        ? '索引'
+        : dropTarget?.kind === 'foreignKey'
+          ? '外键'
+          : '字段'
+    }「${dropTarget?.name ?? ''}」？`"
     :detail="
       dropTarget?.kind === 'index'
         ? '删除后依赖该索引的查询可能变慢。'
-        : '字段及其数据会被删除，此操作不可撤销。'
+        : dropTarget?.kind === 'foreignKey'
+          ? '删除后该列不再受引用完整性约束。'
+          : '字段及其数据会被删除，此操作不可撤销。'
     "
     confirm-text="删除"
     @confirm="confirmDrop"

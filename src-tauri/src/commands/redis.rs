@@ -7,12 +7,48 @@ use ::redis::aio::MultiplexedConnection;
 use tauri::{AppHandle, State};
 
 const READ_COMMANDS: &[&str] = &[
-    "GET", "MGET", "STRLEN", "EXISTS", "TYPE", "TTL", "PTTL", "KEYS", "SCAN", "HGET",
-    "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS", "LRANGE", "LLEN", "LINDEX",
-    "SMEMBERS", "SCARD", "SISMEMBER", "SRANDMEMBER", "ZRANGE", "ZREVRANGE",
-    "ZRANGEBYSCORE", "ZCARD", "ZSCORE", "ZRANK", "ZCOUNT", "XLEN", "XRANGE",
-    "XREVRANGE", "XINFO", "PING", "ECHO", "DBSIZE", "INFO", "TIME", "COMMAND",
-    "MEMORY", "OBJECT",
+    "GET",
+    "MGET",
+    "STRLEN",
+    "EXISTS",
+    "TYPE",
+    "TTL",
+    "PTTL",
+    "KEYS",
+    "SCAN",
+    "HGET",
+    "HMGET",
+    "HGETALL",
+    "HKEYS",
+    "HVALS",
+    "HLEN",
+    "HEXISTS",
+    "LRANGE",
+    "LLEN",
+    "LINDEX",
+    "SMEMBERS",
+    "SCARD",
+    "SISMEMBER",
+    "SRANDMEMBER",
+    "ZRANGE",
+    "ZREVRANGE",
+    "ZRANGEBYSCORE",
+    "ZCARD",
+    "ZSCORE",
+    "ZRANK",
+    "ZCOUNT",
+    "XLEN",
+    "XRANGE",
+    "XREVRANGE",
+    "XINFO",
+    "PING",
+    "ECHO",
+    "DBSIZE",
+    "INFO",
+    "TIME",
+    "COMMAND",
+    "MEMORY",
+    "OBJECT",
 ];
 
 fn ensure_read_only_redis(command: &str) -> Result<(), String> {
@@ -53,8 +89,7 @@ async fn redis_connection(
     }
 
     let password = super::password_for(state, config, "db").await?;
-    let ssh_password = super::password_for(state, config, "ssh").await?;
-    let (host, port, tunnel) = super::connection_target(state, config, ssh_password).await?;
+    let (host, port, tunnel) = super::connection_target(state, config, None, None).await?;
     let desired = match state
         .redis_databases
         .lock()
@@ -131,9 +166,10 @@ pub async fn redis_scan_keys(
     connection_id: String,
     pattern: Option<String>,
     limit: Option<u32>,
+    cursor: Option<u64>,
 ) -> Result<RedisScanResult, String> {
     let mut connection = redis_connection(&app, &state, &connection_id).await?;
-    redis_client::scan_keys(&mut connection, pattern.as_deref(), limit).await
+    redis_client::scan_keys(&mut connection, pattern.as_deref(), limit, cursor).await
 }
 
 #[tauri::command]
@@ -159,6 +195,191 @@ pub async fn redis_delete_key(
     }
     let mut connection = redis_connection(&app, &state, &connection_id).await?;
     redis_client::delete_key(&mut connection, &key).await
+}
+
+#[tauri::command]
+pub async fn redis_set_ttl(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    ttl_seconds: Option<i64>,
+) -> Result<i64, String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::set_ttl(&mut connection, &key, ttl_seconds).await
+}
+
+#[tauri::command]
+pub async fn redis_rename_key(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    new_key: String,
+    overwrite: bool,
+) -> Result<(), String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::rename_key(&mut connection, &key, &new_key, overwrite).await
+}
+
+#[tauri::command]
+pub async fn redis_set_string(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::set_string(&mut connection, &key, &value).await
+}
+
+#[tauri::command]
+pub async fn redis_hash_set(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    field: String,
+    value: String,
+) -> Result<u64, String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::hash_set(&mut connection, &key, &field, &value).await
+}
+
+#[tauri::command]
+pub async fn redis_hash_delete_field(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    field: String,
+) -> Result<u64, String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::hash_delete_field(&mut connection, &key, &field).await
+}
+
+#[tauri::command]
+pub async fn redis_list_push(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    value: String,
+    left: bool,
+) -> Result<u64, String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::list_push(&mut connection, &key, &value, left).await
+}
+
+#[tauri::command]
+pub async fn redis_list_set(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    index: i64,
+    value: String,
+) -> Result<(), String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::list_set(&mut connection, &key, index, &value).await
+}
+
+#[tauri::command]
+pub async fn redis_list_remove(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    value: String,
+) -> Result<u64, String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::list_remove(&mut connection, &key, &value).await
+}
+
+#[tauri::command]
+pub async fn redis_set_add(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    member: String,
+) -> Result<u64, String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::set_add(&mut connection, &key, &member).await
+}
+
+#[tauri::command]
+pub async fn redis_set_remove(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    member: String,
+) -> Result<u64, String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::set_remove(&mut connection, &key, &member).await
+}
+
+#[tauri::command]
+pub async fn redis_zset_set(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    member: String,
+    score: f64,
+) -> Result<u64, String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::zset_set(&mut connection, &key, &member, score).await
+}
+
+#[tauri::command]
+pub async fn redis_zset_remove(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    key: String,
+    member: String,
+) -> Result<u64, String> {
+    if connection_read_only(&app, &connection_id)? {
+        return Err("当前连接为只读模式，已阻止写入".to_string());
+    }
+    let mut connection = redis_connection(&app, &state, &connection_id).await?;
+    redis_client::zset_remove(&mut connection, &key, &member).await
 }
 
 #[tauri::command]

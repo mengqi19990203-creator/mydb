@@ -31,6 +31,7 @@ const props = defineProps<{
   activeTable: string | null;
   database?: string;
   schema?: string | null;
+  readOnly?: boolean;
   locateTarget?: string | null;
   locateNonce?: number;
   collapseNonce?: number;
@@ -42,6 +43,8 @@ const emit = defineEmits<{
   "select-index": [table: TableInfo];
   "open-new-tab": [table: TableInfo];
   "import-data": [table: TableInfo];
+  "generate-data": [table: TableInfo];
+  "view-definition": [table: TableInfo];
   create: [];
   refresh: [];
   "generate-sql": [payload: { sql: string; title: string }];
@@ -78,6 +81,18 @@ const menuHasPrimaryKey = computed(
 const maintenanceTarget = ref<TableInfo | null>(null);
 const maintenanceAction = ref<"empty" | "truncate" | null>(null);
 const maintenanceOpen = ref(false);
+const selectedKeys = ref<Set<string>>(new Set());
+const lastSelectedKey = ref<string | null>(null);
+const batchConfirm = ref<{
+  kind: "delete" | "empty" | "truncate";
+  tables: TableInfo[];
+} | null>(null);
+const batchContinue = ref<{
+  kind: "delete" | "empty" | "truncate";
+  remaining: TableInfo[];
+  lastError: string;
+} | null>(null);
+const batchWorking = ref(false);
 const exporting = ref(false);
 const exportVisible = ref(false);
 const exportOperationId = ref<string | null>(null);
@@ -195,6 +210,173 @@ const groups = computed(() =>
 
 function kindLabel(kind: string): string {
   return KIND_LABELS[kind] ?? "对象";
+}
+
+const visibleObjects = computed(() =>
+  groups.value.flatMap((group) => group.items),
+);
+
+const selectedItems = computed(() =>
+  visibleObjects.value.filter((table) =>
+    selectedKeys.value.has(tableKey(table)),
+  ),
+);
+
+const selectedTables = computed(() =>
+  selectedItems.value.filter((table) => table.kind === "table"),
+);
+
+function toggleSelection(table: TableInfo) {
+  const key = tableKey(table);
+  const next = new Set(selectedKeys.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  selectedKeys.value = next;
+  lastSelectedKey.value = key;
+}
+
+function selectRange(table: TableInfo) {
+  const order = visibleObjects.value.map(tableKey);
+  const current = tableKey(table);
+  const last = lastSelectedKey.value;
+  const from = last ? order.indexOf(last) : -1;
+  const to = order.indexOf(current);
+  if (from < 0 || to < 0) {
+    toggleSelection(table);
+    return;
+  }
+  const [start, end] = from <= to ? [from, to] : [to, from];
+  const next = new Set(selectedKeys.value);
+  for (let index = start; index <= end; index += 1) {
+    next.add(order[index]);
+  }
+  selectedKeys.value = next;
+}
+
+function handleRowClick(event: MouseEvent, table: TableInfo) {
+  if (event.metaKey || event.ctrlKey) {
+    event.preventDefault();
+    toggleSelection(table);
+    return;
+  }
+  if (event.shiftKey) {
+    event.preventDefault();
+    selectRange(table);
+    return;
+  }
+  onTableClick(table);
+}
+
+function clearSelection() {
+  selectedKeys.value = new Set();
+  lastSelectedKey.value = null;
+}
+
+function requestBatch(kind: "delete" | "empty" | "truncate") {
+  const items =
+    kind === "delete" ? selectedItems.value : selectedTables.value;
+  if (!items.length) {
+    flashToast(kind === "delete" ? "请选择对象" : "请选择表");
+    return;
+  }
+  batchConfirm.value = { kind, tables: [...items] };
+}
+
+async function runBatch(
+  kind: "delete" | "empty" | "truncate",
+  tables: TableInfo[],
+) {
+  batchWorking.value = true;
+  for (let index = 0; index < tables.length; index += 1) {
+    const table = tables[index];
+    try {
+      if (kind === "delete") {
+        await api.dropObject(props.connectionId, table.kind, table.name);
+      } else {
+        await api.maintainTable(props.connectionId, table.name, kind);
+      }
+    } catch (reason) {
+      batchWorking.value = false;
+      batchContinue.value = {
+        kind,
+        remaining: tables.slice(index + 1),
+        lastError: `${table.name}: ${reason}`,
+      };
+      emit("refresh");
+      flashToast(`批量操作已停止：${table.name} 失败`);
+      return;
+    }
+  }
+  batchWorking.value = false;
+  const label =
+    kind === "delete" ? "删除" : kind === "empty" ? "清空" : "截断";
+  flashToast(`已${label} ${tables.length} 个对象`);
+  clearSelection();
+  emit("refresh");
+}
+
+async function confirmBatch() {
+  const request = batchConfirm.value;
+  batchConfirm.value = null;
+  if (!request) return;
+  await runBatch(request.kind, request.tables);
+}
+
+async function continueBatch() {
+  const request = batchContinue.value;
+  batchContinue.value = null;
+  if (!request) return;
+  await runBatch(request.kind, request.remaining);
+}
+
+async function exportSelectedDdl() {
+  const items = selectedItems.value;
+  if (!items.length) return;
+  const path = await saveDialog({
+    defaultPath: `objects-${Date.now()}.sql`,
+    filters: [{ name: "SQL", extensions: ["sql"] }],
+  });
+  if (typeof path !== "string") return;
+  const parts: string[] = [
+    `-- mydb object definitions (${items.length})`,
+    "",
+  ];
+  let failed = 0;
+  for (const table of items) {
+    try {
+      const ddl = await api.getObjectDdl(
+        props.connectionId,
+        table.kind,
+        table.name,
+      );
+      parts.push(
+        `-- ${kindLabel(table.kind)}: ${table.name}`,
+        ddl.trim().replace(/;?$/, ";"),
+        "",
+      );
+    } catch (reason) {
+      failed += 1;
+      parts.push(
+        `-- 读取失败: ${table.name}`,
+        `-- ${String(reason).replaceAll("\n", " ")}`,
+        "",
+      );
+    }
+  }
+  try {
+    await api.writeTextFile(path, parts.join("\n"));
+    flashToast(
+      failed
+        ? `已导出 ${items.length - failed} 个对象，${failed} 个失败`
+        : `已导出 ${items.length} 个对象 DDL`,
+    );
+  } catch (reason) {
+    flashToast(String(reason));
+  }
+}
+
+function batchLabel(kind: "delete" | "empty" | "truncate"): string {
+  return kind === "delete" ? "删除" : kind === "empty" ? "清空" : "截断";
 }
 
 function isExpandable(table: TableInfo): boolean {
@@ -468,6 +650,18 @@ function menuCopyName() {
   if (table) void copyText(table.name, "已复制名称");
 }
 
+function menuViewDefinition() {
+  const table = objectMenu.value?.table;
+  closeObjectMenu();
+  if (table) emit("view-definition", table);
+}
+
+function menuGenerateData() {
+  const table = objectMenu.value?.table;
+  closeObjectMenu();
+  if (table) emit("generate-data", table);
+}
+
 async function menuCopyDdl() {
   const table = objectMenu.value?.table;
   closeObjectMenu();
@@ -668,7 +862,7 @@ async function confirmMaintenance() {
     flashToast(
       action === "empty"
         ? `已清空 ${affected} 行`
-        : `已截断表 ${table.name}`,
+        : `已截断表 ${table.name}（删除 ${affected} 行）`,
     );
     emit("refresh");
   } catch (reason) {
@@ -703,12 +897,14 @@ async function confirmExport(
     json: "json",
     sql: "sql",
     ddl: "sql",
+    xlsx: "xlsx",
   };
   const labels: Record<ExportFormat, string> = {
     csv: "CSV",
     json: "JSON",
     sql: "SQL",
     ddl: "DDL",
+    xlsx: "Excel 工作簿",
   };
   const extension = extensions[format];
   const path = await saveDialog({
@@ -895,11 +1091,49 @@ onBeforeUnmount(() => {
 
 watch(
   () => [props.connectionId, props.driver],
-  () => resetColumns(),
+  () => {
+    resetColumns();
+    clearSelection();
+  },
 );
 </script>
 
 <template>
+  <div v-if="selectedItems.length" class="object-batch-bar">
+    <strong>已选 {{ selectedItems.length }} 项</strong>
+    <button class="button ghost compact" @click="exportSelectedDdl">
+      导出 DDL
+    </button>
+    <button class="button ghost compact" @click="emit('refresh'); clearSelection()">
+      刷新
+    </button>
+    <button class="button ghost compact" @click="clearSelection">清除</button>
+    <span class="spacer"></span>
+    <button
+      class="button ghost compact"
+      :disabled="readOnly || !selectedTables.length || batchWorking"
+      :title="readOnly ? '当前连接为只读' : '清空选中的表（DELETE）'"
+      @click="requestBatch('empty')"
+    >
+      清空
+    </button>
+    <button
+      class="button ghost compact"
+      :disabled="readOnly || !selectedTables.length || batchWorking"
+      :title="readOnly ? '当前连接为只读' : '截断选中的表'"
+      @click="requestBatch('truncate')"
+    >
+      截断
+    </button>
+    <button
+      class="button ghost compact danger"
+      :disabled="readOnly || batchWorking"
+      :title="readOnly ? '当前连接为只读' : '删除选中的对象'"
+      @click="requestBatch('delete')"
+    >
+      删除
+    </button>
+  </div>
   <div
     v-for="group in groups"
     :key="group.kind"
@@ -945,16 +1179,24 @@ watch(
           :class="{
             active: isExpandable(table) && table.name === activeTable,
             located: locatedKey === tableKey(table),
+            selected: selectedKeys.has(tableKey(table)),
           }"
           :title="
             !isExpandable(table)
               ? `${table.name}（暂不支持查看）`
               : `${table.name} · 单击展开列，右键查看更多操作`
           "
-          @click="onTableClick(table)"
+          @click="handleRowClick($event, table)"
           @dblclick="emit('select', table)"
           @contextmenu.prevent.stop="openObjectMenu($event, table)"
         >
+          <input
+            type="checkbox"
+            class="object-select"
+            :checked="selectedKeys.has(tableKey(table))"
+            :aria-label="`选择 ${table.name}`"
+            @click.stop="toggleSelection(table)"
+          />
           <Icon
             v-if="isExpandable(table)"
             class="tree-chevron"
@@ -1062,6 +1304,17 @@ watch(
         <Icon name="upload" :size="14" />
         <span>导入数据</span>
       </button>
+      <button
+        v-if="objectMenu.table.kind === 'table'"
+        class="context-menu-item"
+        role="menuitem"
+        :disabled="readOnly"
+        :title="readOnly ? '当前连接为只读' : undefined"
+        @click="menuGenerateData"
+      >
+        <Icon name="bolt" :size="14" />
+        <span>生成数据…</span>
+      </button>
     </template>
     <div
       v-if="isExpandable(objectMenu.table)"
@@ -1139,6 +1392,15 @@ watch(
         </template>
       </div>
     </div>
+    <button
+      v-if="canFetchDdl(objectMenu.table)"
+      class="context-menu-item"
+      role="menuitem"
+      @click="menuViewDefinition"
+    >
+      <Icon name="code" :size="14" />
+      <span>查看定义…</span>
+    </button>
     <button
       v-if="canFetchDdl(objectMenu.table)"
       class="context-menu-item"
@@ -1322,6 +1584,38 @@ watch(
     :confirm-text="maintenanceTitle"
     @confirm="confirmMaintenance"
     @cancel="maintenanceOpen = false"
+  />
+
+  <ConfirmDialog
+    :open="Boolean(batchConfirm)"
+    :title="`批量${batchConfirm ? batchLabel(batchConfirm.kind) : ''}`"
+    :message="`将对 ${batchConfirm?.tables.length ?? 0} 个对象执行${batchConfirm ? batchLabel(batchConfirm.kind) : ''}操作。`"
+    :detail="
+      (batchConfirm?.tables.map((table) => table.name).join('、') ?? '') +
+      ' · 此操作不可撤销'
+    "
+    :confirm-text="batchConfirm ? `确认${batchLabel(batchConfirm.kind)}` : '确认'"
+    danger
+    @confirm="confirmBatch"
+    @cancel="batchConfirm = null"
+  />
+
+  <ConfirmDialog
+    :open="Boolean(batchContinue)"
+    title="批量操作中断"
+    :message="
+      batchContinue
+        ? `执行失败：${batchContinue.lastError}`
+        : ''
+    "
+    :detail="
+      batchContinue
+        ? `还有 ${batchContinue.remaining.length} 个对象未处理，是否继续剩余对象？`
+        : ''
+    "
+    confirm-text="继续剩余"
+    @confirm="continueBatch"
+    @cancel="batchContinue = null"
   />
 
   <div v-if="exportVisible" class="export-progress" role="status" aria-live="polite">

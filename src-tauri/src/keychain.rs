@@ -192,11 +192,7 @@ mod dev_store {
                 load_map_at(&path).expect("load").get("connection:a:db"),
                 Some(&"secret".to_string())
             );
-            let mode = fs::metadata(&path)
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o777;
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
     }

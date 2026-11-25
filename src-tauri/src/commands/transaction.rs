@@ -1,8 +1,10 @@
 use super::{
-    AppState, TransactionEntry, driver_for, ensure_query_allowed, record_query_history,
+    AppState, TransactionEntry, driver_for, ensure_query_allowed, execute_with_cancel,
+    new_operation_id, record_query_history_timed,
 };
 use crate::models::QueryResult;
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::{AppHandle, State};
 use tokio::sync::Mutex;
 
@@ -58,16 +60,31 @@ pub async fn execute_transaction_query(
     session_id: String,
     sql: String,
     max_rows: Option<usize>,
+    operation_id: Option<String>,
 ) -> Result<QueryResult, String> {
     let entry = entry_for(&state, &session_id, &connection_id).await?;
     ensure_query_allowed(&app, &connection_id, &sql)?;
     let max_rows = max_rows.unwrap_or(1000).clamp(1, 10_000);
+    let operation_id = operation_id.unwrap_or_else(new_operation_id);
+    let driver = driver_for(&app, &state, &connection_id).await?;
 
+    let started = Instant::now();
     let outcome = {
         let mut session = entry.session.lock().await;
-        session.execute(&sql, max_rows).await
+        execute_with_cancel(
+            &app,
+            &state,
+            &connection_id,
+            &operation_id,
+            &mut session,
+            &sql,
+            max_rows,
+            driver.as_ref(),
+        )
+        .await
     };
-    record_query_history(&app, &connection_id, &sql, &outcome);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    record_query_history_timed(&app, &connection_id, &sql, elapsed_ms, &outcome);
     outcome
 }
 

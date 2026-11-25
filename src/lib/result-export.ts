@@ -1,7 +1,7 @@
 import type { Driver } from "./types";
 import { qualifiedIdentifier, quoteIdentifier, sqlLiteral } from "./sql-literal";
 
-export type ResultExportFormat = "csv" | "json" | "markdown" | "sql";
+export type ResultExportFormat = "csv" | "json" | "markdown" | "sql" | "xlsx";
 
 export interface ResultSortInfo {
   column: string;
@@ -128,6 +128,8 @@ export function buildExportContent(
       return buildMarkdown(snapshot);
     case "sql":
       return buildSqlInsert(snapshot, options.table, options.driver);
+    case "xlsx":
+      throw new Error("XLSX 导出需要使用二进制导出命令");
     default:
       return buildCsv(snapshot, options.withHeader);
   }

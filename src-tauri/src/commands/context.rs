@@ -53,7 +53,7 @@ pub(crate) async fn isolated_driver_for(
                 config.database = database.to_string();
             }
             let password = password_for(state, &config, "db").await?;
-            let (host, port, tunnel) = connection_target(state, &config, None).await?;
+            let (host, port, tunnel) = connection_target(state, &config, None, None).await?;
             Ok(Arc::new(
                 MySqlDriver::connect(&config, &host, port, password.as_deref(), tunnel).await?,
             ))
@@ -63,7 +63,7 @@ pub(crate) async fn isolated_driver_for(
                 config.database = database.to_string();
             }
             let password = password_for(state, &config, "db").await?;
-            let (host, port, tunnel) = connection_target(state, &config, None).await?;
+            let (host, port, tunnel) = connection_target(state, &config, None, None).await?;
             let driver =
                 PostgresDriver::connect(&config, &host, port, password.as_deref(), tunnel).await?;
             if let Some(schema) = schema_override {
@@ -358,13 +358,11 @@ mod tests {
             (Some("b".to_string()), None)
         );
         assert_eq!(
-            resolve_scope("mysql", Some("a"), None, Some("a"), None)
-                .expect("same mysql scope"),
+            resolve_scope("mysql", Some("a"), None, Some("a"), None).expect("same mysql scope"),
             (Some("a".to_string()), None)
         );
         assert_eq!(
-            resolve_scope("mysql", Some("a"), None, None, None)
-                .expect("default mysql scope"),
+            resolve_scope("mysql", Some("a"), None, None, None).expect("default mysql scope"),
             (Some("a".to_string()), None)
         );
         assert_eq!(
@@ -376,20 +374,11 @@ mod tests {
                 Some("archive"),
             )
             .expect("postgres schema target"),
-            (
-                Some("app".to_string()),
-                Some("archive".to_string())
-            )
+            (Some("app".to_string()), Some("archive".to_string()))
         );
         assert_eq!(
-            resolve_scope(
-                "postgres",
-                Some("app"),
-                Some("public"),
-                Some("other"),
-                None,
-            )
-            .expect("postgres database target"),
+            resolve_scope("postgres", Some("app"), Some("public"), Some("other"), None,)
+                .expect("postgres database target"),
             (Some("other".to_string()), Some("public".to_string()))
         );
         assert_eq!(

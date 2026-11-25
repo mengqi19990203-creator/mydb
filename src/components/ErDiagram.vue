@@ -1,11 +1,6 @@
 <script setup lang="ts">
-import {
-  computed,
-  nextTick,
-  reactive,
-  ref,
-  watch,
-} from "vue";
+import { computed, nextTick, reactive, ref, watch } from "vue";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import Icon from "./Icon.vue";
 import * as api from "../lib/api";
 import type { ErRelation, ErTable } from "../lib/types";
@@ -30,6 +25,7 @@ const NODE_WIDTH = 240;
 const HEADER_HEIGHT = 34;
 const ROW_HEIGHT = 22;
 const NODE_PADDING = 10;
+const LAYOUT_KEY = "mydb.erLayout.v1";
 
 const diagram = ref<{ tables: ErTable[]; relations: ErRelation[] } | null>(
   null,
@@ -41,6 +37,17 @@ const zoom = ref(1);
 const zoomLabel = computed(() => `${Math.round(zoom.value * 100)}%`);
 const pan = reactive({ x: 0, y: 0 });
 const canvasRef = ref<HTMLElement | null>(null);
+const search = ref("");
+
+const searchMatches = computed(() => {
+  const query = search.value.trim().toLowerCase();
+  if (!query) return new Set<string>();
+  return new Set(
+    nodes.value
+      .filter((node) => node.name.toLowerCase().includes(query))
+      .map((node) => node.name),
+  );
+});
 
 let dragging: {
   node: ErNode;
@@ -76,6 +83,154 @@ async function load() {
 }
 
 watch(() => props.connectionId, load, { immediate: true });
+
+function layoutKey(): string {
+  return `${props.connectionId}:${props.scopeLabel ?? ""}`;
+}
+
+function readSavedLayout(): Record<string, { x: number; y: number }> {
+  try {
+    const stored = window.localStorage.getItem(LAYOUT_KEY);
+    if (!stored) return {};
+    const parsed = JSON.parse(stored) as Record<
+      string,
+      Record<string, { x: number; y: number }>
+    >;
+    return parsed[layoutKey()] ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLayout() {
+  try {
+    const stored = window.localStorage.getItem(LAYOUT_KEY);
+    const parsed = stored
+      ? (JSON.parse(stored) as Record<
+          string,
+          Record<string, { x: number; y: number }>
+        >)
+      : {};
+    parsed[layoutKey()] = Object.fromEntries(
+      nodes.value.map((node) => [node.name, { x: node.x, y: node.y }]),
+    );
+    window.localStorage.setItem(LAYOUT_KEY, JSON.stringify(parsed));
+  } catch {
+    // Layout persistence is best-effort.
+  }
+}
+
+function resetLayout() {
+  try {
+    const stored = window.localStorage.getItem(LAYOUT_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored) as Record<string, unknown>;
+      delete parsed[layoutKey()];
+      window.localStorage.setItem(LAYOUT_KEY, JSON.stringify(parsed));
+    }
+  } catch {
+    // Ignore storage failures.
+  }
+  if (diagram.value) {
+    layout(diagram.value.tables, diagram.value.relations);
+    void nextTick(fitView);
+  }
+}
+
+function centerOnNode(node: ErNode) {
+  const canvas = canvasRef.value;
+  if (!canvas) return;
+  zoom.value = Math.max(zoom.value, 0.8);
+  pan.x = canvas.clientWidth / 2 - node.x * zoom.value;
+  pan.y = canvas.clientHeight / 2 - node.y * zoom.value;
+}
+
+function focusSearchMatch() {
+  const match = nodes.value.find((node) => searchMatches.value.has(node.name));
+  if (match) centerOnNode(match);
+}
+
+function xmlEscape(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+async function exportSvg() {
+  if (!nodes.value.length) return;
+  const margin = 40;
+  const left = Math.min(
+    ...nodes.value.map((node) => node.x - node.width / 2),
+  ) - margin;
+  const top = Math.min(
+    ...nodes.value.map((node) => node.y - node.height / 2),
+  ) - margin;
+  const right = Math.max(
+    ...nodes.value.map((node) => node.x + node.width / 2),
+  ) + margin;
+  const bottom = Math.max(
+    ...nodes.value.map((node) => node.y + node.height / 2),
+  ) + margin;
+  const width = Math.max(1, right - left);
+  const height = Math.max(1, bottom - top);
+  const edgeMarkup = edges.value
+    .map(
+      (edge) =>
+        `<path d="${edge.path}" fill="none" stroke="#6b7280" stroke-width="1.4" marker-end="url(#arrow)"/>`,
+    )
+    .join("\n");
+  const nodeMarkup = nodes.value
+    .map((node) => {
+      const x = node.x - node.width / 2;
+      const y = node.y - node.height / 2;
+      const columns = node.columns
+        .map((column, index) => {
+          const name = xmlEscape(column.name);
+          const type = xmlEscape(column.dataType);
+          const pk = column.primaryKey ? "  PK" : "";
+          return `<text x="${x + 10}" y="${
+            y + HEADER_HEIGHT + 16 + index * ROW_HEIGHT
+          }" fill="#d4d4d8" font-size="11" font-family="ui-monospace, monospace">${name}${pk}  <tspan fill="#8b8b91">${type}</tspan></text>`;
+        })
+        .join("\n");
+      return `<g>
+  <rect x="${x}" y="${y}" width="${node.width}" height="${node.height}" rx="8" fill="#1d1d21" stroke="${
+    node.kind === "table" ? "#3f3f46" : "#71717a"
+  }" stroke-dasharray="${node.kind === "table" ? "none" : "5 4"}"/>
+  <rect x="${x}" y="${y}" width="${node.width}" height="${HEADER_HEIGHT}" rx="8" fill="#27272a"/>
+  <text x="${x + 10}" y="${
+    y + 22
+  }" fill="#f4f4f5" font-size="12" font-weight="600" font-family="ui-sans-serif, system-ui">${xmlEscape(
+    node.name,
+  )}</text>
+  ${columns}
+</g>`;
+    })
+    .join("\n");
+  const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="${left} ${top} ${width} ${height}">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6b7280"/>
+    </marker>
+  </defs>
+  <rect x="${left}" y="${top}" width="${width}" height="${height}" fill="#131316"/>
+  ${edgeMarkup}
+  ${nodeMarkup}
+</svg>`;
+  const path = await saveDialog({
+    defaultPath: "er-diagram.svg",
+    filters: [{ name: "SVG", extensions: ["svg"] }],
+  });
+  if (typeof path !== "string") return;
+  try {
+    await api.writeTextFile(path, svg);
+  } catch (reason) {
+    error.value = String(reason);
+  }
+}
 
 function layout(tables: ErTable[], relations: ErRelation[]) {
   const list: ErNode[] = tables.map((table) => ({
@@ -164,6 +319,14 @@ function layout(tables: ErTable[], relations: ErRelation[]) {
   for (const node of list) {
     node.x = node.x - minLeft + node.width / 2 + 60;
     node.y = node.y - minTop + node.height / 2 + 60;
+  }
+  const saved = readSavedLayout();
+  for (const node of list) {
+    const position = saved[node.name];
+    if (position) {
+      node.x = position.x;
+      node.y = position.y;
+    }
   }
   nodes.value = list;
 }
@@ -323,6 +486,8 @@ function endNodeDrag(event: PointerEvent, node: ErNode) {
   }
   if (current && !current.moved) {
     emit("select", { name: node.name, kind: node.kind });
+  } else if (current?.moved) {
+    saveLayout();
   }
 }
 </script>
@@ -340,6 +505,34 @@ function endNodeDrag(event: PointerEvent, node: ErNode) {
         </span>
       </div>
       <div class="data-actions">
+        <input
+          v-model="search"
+          class="filter-input er-search"
+          placeholder="搜索表 / 视图…"
+          @keydown.enter.prevent="focusSearchMatch"
+        />
+        <button
+          class="button ghost compact"
+          :disabled="!searchMatches.size"
+          @click="focusSearchMatch"
+        >
+          定位
+        </button>
+        <button
+          class="button ghost compact"
+          :disabled="!nodes.length"
+          @click="resetLayout"
+        >
+          重置布局
+        </button>
+        <button
+          class="button ghost compact"
+          :disabled="!nodes.length"
+          @click="exportSvg"
+        >
+          <Icon name="download" :size="14" />
+          导出 SVG
+        </button>
         <button class="button ghost compact" :disabled="loading" @click="load">
           <Icon name="refresh" :size="14" />
           刷新
@@ -415,7 +608,14 @@ function endNodeDrag(event: PointerEvent, node: ErNode) {
           v-for="node in nodes"
           :key="node.name"
           class="er-node"
-          :class="`er-node-${node.kind}`"
+          :class="[
+            `er-node-${node.kind}`,
+            {
+              'search-match': searchMatches.has(node.name),
+              'search-dim':
+                searchMatches.size > 0 && !searchMatches.has(node.name),
+            },
+          ]"
           :style="{
             left: `${node.x - node.width / 2}px`,
             top: `${node.y - node.height / 2}px`,
