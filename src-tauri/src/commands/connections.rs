@@ -8,7 +8,9 @@ use crate::ssh::SshTunnel;
 use crate::storage;
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{AppHandle, State};
+use tokio::time::timeout;
 use uuid::Uuid;
 
 #[tauri::command]
@@ -114,6 +116,8 @@ pub async fn save_connection(
     state.redis_clients.lock().await.remove(&config.id);
     state.redis_tunnels.lock().await.remove(&config.id);
     state.redis_databases.lock().await.remove(&config.id);
+    state.mongo_clients.lock().await.remove(&config.id);
+    state.mongo_tunnels.lock().await.remove(&config.id);
     close_connection_transactions(&state, &config.id).await;
 
     Ok(config)
@@ -158,6 +162,8 @@ pub async fn delete_connection(
     state.redis_clients.lock().await.remove(&id);
     state.redis_tunnels.lock().await.remove(&id);
     state.redis_databases.lock().await.remove(&id);
+    state.mongo_clients.lock().await.remove(&id);
+    state.mongo_tunnels.lock().await.remove(&id);
     state.passwords.lock().await.remove(&id);
     state.ssh_passwords.lock().await.remove(&id);
     state.ssh_key_passphrases.lock().await.remove(&id);
@@ -190,6 +196,8 @@ pub async fn close_connection(state: State<'_, AppState>, id: String) -> Result<
     state.drivers.lock().await.remove(&id);
     state.redis_clients.lock().await.remove(&id);
     state.redis_tunnels.lock().await.remove(&id);
+    state.mongo_clients.lock().await.remove(&id);
+    state.mongo_tunnels.lock().await.remove(&id);
     close_connection_transactions(&state, &id).await;
     Ok(())
 }
@@ -212,6 +220,8 @@ pub async fn set_connection_read_only(
     state.drivers.lock().await.remove(&id);
     state.redis_clients.lock().await.remove(&id);
     state.redis_tunnels.lock().await.remove(&id);
+    state.mongo_clients.lock().await.remove(&id);
+    state.mongo_tunnels.lock().await.remove(&id);
     close_connection_transactions(&state, &id).await;
     Ok(saved)
 }
@@ -394,6 +404,7 @@ pub async fn connection_info(
         match config.driver.as_str() {
             "mysql" => "mysql".to_string(),
             "postgres" => "postgres".to_string(),
+            "mongodb" => "admin".to_string(),
             other => other.to_string(),
         }
     } else {
@@ -412,6 +423,14 @@ pub async fn connection_info(
             "sqlite" => format!("sqlite:///{}", file.trim_start_matches('/')),
             "redis" => format!("redis://{}:{}/{}", host, port, database),
             "postgres" => format!("postgres://{}@{}:{}/{}", user, host, port, database),
+            "mongodb" => {
+                let auth = if user.is_empty() {
+                    String::new()
+                } else {
+                    format!("{user}@")
+                };
+                format!("mongodb://{auth}{host}:{port}/{database}?authSource={}", if config.mongo_auth_source.is_empty() { "admin" } else { config.mongo_auth_source.as_str() })
+            }
             _ => format!("mysql://{}@{}:{}/{}", user, host, port, database),
         },
         ConnectionInfoFormat::UrlWithPassword => {
@@ -434,6 +453,14 @@ pub async fn connection_info(
                     "postgres://{}:{}@{}:{}/{}",
                     user, password, host, port, database
                 ),
+                "mongodb" => {
+                    let auth = if user.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{user}:{password}@")
+                    };
+                    format!("mongodb://{auth}{host}:{port}/{database}?authSource={}", if config.mongo_auth_source.is_empty() { "admin" } else { config.mongo_auth_source.as_str() })
+                }
                 _ => format!(
                     "mysql://{}:{}@{}:{}/{}",
                     user, password, host, port, database
@@ -444,6 +471,7 @@ pub async fn connection_info(
             "sqlite" => format!("jdbc:sqlite:{}", file),
             "postgres" => format!("jdbc:postgresql://{}:{}/{}", host, port, database),
             "redis" => return Err("Redis 不支持 JDBC 连接串".to_string()),
+            "mongodb" => return Err("MongoDB 不支持 JDBC 连接串".to_string()),
             _ => format!("jdbc:mysql://{}:{}/{}", host, port, database),
         },
         ConnectionInfoFormat::Dsn => match config.driver.as_str() {
@@ -453,6 +481,7 @@ pub async fn connection_info(
                 host, port, config.username, dsn_database, config.ssl_mode
             ),
             "redis" => return Err("Redis 不支持 DSN 连接串".to_string()),
+            "mongodb" => return Err("MongoDB 不支持 DSN 连接串".to_string()),
             _ => format!(
                 "host={} port={} user={} dbname={}",
                 host, port, config.username, dsn_database
@@ -475,6 +504,14 @@ pub async fn connection_info(
                 port,
                 database
             ),
+            "mongodb" => {
+                let auth = if config.username.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}@", config.username)
+                };
+                format!("mongosh \"mongodb://{auth}{host}:{port}/{database}\"")
+            }
             _ => format!(
                 "mysql -h {} -P {} -u {} -p {}",
                 host, port, config.username, dsn_database
@@ -743,6 +780,13 @@ pub async fn test_connection(
     let (host, port, tunnel) =
         connection_target(&state, &config, ssh_password, ssh_key_passphrase).await?;
 
+    if config.driver == "mongodb" {
+        let result =
+            super::mongo::test_mongo_connection(&config, &host, port, password.as_deref()).await;
+        drop(tunnel);
+        return result;
+    }
+
     if config.driver == "postgres" {
         let driver =
             PostgresDriver::connect(&config, &host, port, password.as_deref(), tunnel).await?;
@@ -751,6 +795,144 @@ pub async fn test_connection(
 
     let driver = MySqlDriver::connect(&config, &host, port, password.as_deref(), tunnel).await?;
     driver.test_connection().await
+}
+
+#[tauri::command]
+pub async fn check_connection_health(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<(), String> {
+    let config = storage::load_connections(&app)?
+        .into_iter()
+        .find(|item| item.id == connection_id)
+        .ok_or_else(|| format!("连接不存在: {connection_id}"))?;
+    let future = async {
+        if config.driver == "redis" {
+            let mut connection =
+                super::redis::redis_connection(&app, &state, &connection_id).await?;
+            crate::redis_client::ping(&mut connection).await?;
+            Ok(())
+        } else if config.driver == "mongodb" {
+            super::mongo::ping(&app, &state, &connection_id).await
+        } else {
+            let driver = driver_for(&app, &state, &connection_id).await?;
+            driver.test_connection().await
+        }
+    };
+    match timeout(Duration::from_secs(5), future).await {
+        Ok(result) => result,
+        Err(_) => Err("健康检查超时（5 秒）".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn reconnect_connection(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<super::context::ConnectionContext, String> {
+    let config = storage::load_connections(&app)?
+        .into_iter()
+        .find(|item| item.id == connection_id)
+        .ok_or_else(|| format!("连接不存在: {connection_id}"))?;
+
+    if state
+        .transactions
+        .lock()
+        .await
+        .values()
+        .any(|entry| entry.connection_id == connection_id)
+    {
+        return Err("该连接有未提交事务，请先提交或回滚".to_string());
+    }
+    if state
+        .running_queries
+        .lock()
+        .await
+        .values()
+        .any(|query| query.connection_id == connection_id)
+    {
+        return Err("查询执行中，请先停止或等待完成".to_string());
+    }
+    if query_window_uses_connection(&state, &connection_id) {
+        return Err("独立查询窗口正在使用该连接，请先关闭查询窗口".to_string());
+    }
+
+    if config.driver == "mongodb" {
+        super::mongo::reconnect(&app, &state, &connection_id).await?;
+        return Ok(super::context::ConnectionContext {
+            database: if config.database.is_empty() {
+                None
+            } else {
+                Some(config.database.clone())
+            },
+            schema: None,
+        });
+    }
+
+    if config.driver == "redis" {
+        state.redis_clients.lock().await.remove(&connection_id);
+        state.redis_tunnels.lock().await.remove(&connection_id);
+        state.server_samples.lock().await.remove(&connection_id);
+        let mut connection = timeout(
+            Duration::from_secs(10),
+            super::redis::redis_connection(&app, &state, &connection_id),
+        )
+        .await
+        .map_err(|_| "重新连接超时（10 秒）".to_string())??;
+        timeout(
+            Duration::from_secs(5),
+            crate::redis_client::ping(&mut connection),
+        )
+        .await
+        .map_err(|_| "Redis PING 超时（5 秒）".to_string())??;
+        return Ok(super::context::ConnectionContext {
+            database: None,
+            schema: None,
+        });
+    }
+
+    let old_driver = {
+        let drivers = state.drivers.lock().await;
+        drivers.get(&connection_id).cloned()
+    };
+    let (old_database, old_schema) = if let Some(driver) = old_driver {
+        driver.context().await
+    } else {
+        (None, None)
+    };
+
+    state.drivers.lock().await.remove(&connection_id);
+    state.server_samples.lock().await.remove(&connection_id);
+
+    let driver = timeout(
+        Duration::from_secs(10),
+        super::context::isolated_driver_for(
+            &app,
+            &state,
+            &connection_id,
+            old_database.as_deref(),
+            old_schema.as_deref(),
+        ),
+    )
+    .await
+    .map_err(|_| "重新连接超时（10 秒）".to_string())??;
+
+    timeout(Duration::from_secs(5), driver.test_connection())
+        .await
+        .map_err(|_| "重新连接测试超时（5 秒）".to_string())??;
+
+    state
+        .drivers
+        .lock()
+        .await
+        .insert(connection_id.clone(), driver);
+
+    Ok(super::context::ConnectionContext {
+        database: old_database,
+        schema: old_schema,
+    })
 }
 
 pub(crate) async fn driver_for(
@@ -804,6 +986,7 @@ fn validate_config(config: &mut ConnectionConfig) -> Result<(), String> {
     config.host = config.host.trim().to_string();
     config.username = config.username.trim().to_string();
     config.database = config.database.trim().to_string();
+    config.mongo_auth_source = config.mongo_auth_source.trim().to_string();
     config.ssh_host = config.ssh_host.trim().to_string();
     config.ssh_username = config.ssh_username.trim().to_string();
     config.ssh_key_path = config.ssh_key_path.trim().to_string();
@@ -890,6 +1073,20 @@ fn validate_config(config: &mut ConnectionConfig) -> Result<(), String> {
             }
             if config.ssl_mode.is_empty() {
                 config.ssl_mode = "disabled".to_string();
+            }
+        }
+        "mongodb" => {
+            if config.host.is_empty() {
+                return Err("主机不能为空".to_string());
+            }
+            if config.port == 0 {
+                config.port = 27017;
+            }
+            if config.ssl_mode.is_empty() {
+                config.ssl_mode = "disabled".to_string();
+            }
+            if config.mongo_auth_source.is_empty() {
+                config.mongo_auth_source = "admin".to_string();
             }
         }
         "redis" => {

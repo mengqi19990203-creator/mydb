@@ -30,6 +30,7 @@ function defaultPort(driver: Driver): number {
   if (driver === "mysql") return 3306;
   if (driver === "postgres") return 5432;
   if (driver === "redis") return 6379;
+  if (driver === "mongodb") return 27017;
   return 0;
 }
 
@@ -45,6 +46,7 @@ const form = reactive<{
   username: string;
   password: string;
   database: string;
+  mongoAuthSource: string;
   sslMode: SslMode;
   sslCaPath: string;
   sslClientCertPath: string;
@@ -73,6 +75,7 @@ const form = reactive<{
   username: "root",
   password: "",
   database: "",
+  mongoAuthSource: "admin",
   sslMode: "disabled",
   sslCaPath: "",
   sslClientCertPath: "",
@@ -98,7 +101,9 @@ const keyPassphraseSaved = ref(false);
 
 const passwordPlaceholder = computed(() => {
   if (props.editing?.hasPassword) return "已保存，留空保持不变";
-  return form.driver === "redis" ? "Redis 密码（可选）" : "数据库密码";
+  if (form.driver === "redis") return "Redis 密码（可选）";
+  if (form.driver === "mongodb") return "MongoDB 密码（可选）";
+  return "数据库密码";
 });
 
 const sshPasswordPlaceholder = computed(() =>
@@ -149,6 +154,7 @@ watch(
       form.username = editing.username;
       form.password = "";
       form.database = editing.database;
+      form.mongoAuthSource = editing.mongoAuthSource || "admin";
       form.sslMode = editing.sslMode;
       form.sslCaPath = editing.sslCaPath ?? "";
       form.sslClientCertPath = editing.sslClientCertPath ?? "";
@@ -178,6 +184,7 @@ watch(
       form.username = "root";
       form.password = "";
       form.database = "";
+      form.mongoAuthSource = "admin";
       form.sslMode = "disabled";
       form.sslCaPath = "";
       form.sslClientCertPath = "";
@@ -205,21 +212,27 @@ watch(
   (driver) => {
     if (
       driver === "mysql" &&
-      (!form.port || form.port === 0 || form.port === 6379 || form.port === 5432)
+      (!form.port || form.port === 0 || form.port === 6379 || form.port === 5432 || form.port === 27017)
     ) {
       form.port = 3306;
     }
     if (
       driver === "postgres" &&
-      (!form.port || form.port === 0 || form.port === 3306 || form.port === 6379)
+      (!form.port || form.port === 0 || form.port === 3306 || form.port === 6379 || form.port === 27017)
     ) {
       form.port = 5432;
     }
     if (driver === "redis") {
-      if (!form.port || form.port === 0 || form.port === 3306 || form.port === 5432) {
+      if (!form.port || form.port === 0 || form.port === 3306 || form.port === 5432 || form.port === 27017) {
         form.port = 6379;
       }
       if (!form.database.trim()) form.database = "0";
+    }
+    if (driver === "mongodb") {
+      if (!form.port || form.port === 0 || form.port === 3306 || form.port === 5432 || form.port === 6379) {
+        form.port = 27017;
+      }
+      if (!form.mongoAuthSource.trim()) form.mongoAuthSource = "admin";
     }
   },
 );
@@ -273,6 +286,7 @@ function toConfig(): ConnectionConfig {
     port: Number(form.port) || defaultPort(form.driver),
     username: form.username.trim(),
     database: form.database.trim(),
+    mongoAuthSource: form.mongoAuthSource.trim(),
     sslMode: form.sslMode,
     sslCaPath: form.sslCaPath.trim(),
     sslClientCertPath: form.sslClientCertPath.trim(),
@@ -382,6 +396,10 @@ function validate(): boolean {
       return false;
     }
   }
+  if (form.driver === "mongodb" && !form.host.trim()) {
+    error.value = "请输入主机地址";
+    return false;
+  }
   if (form.sshEnabled && form.driver !== "sqlite") {
     if (!form.sshHost.trim()) {
       error.value = "请输入 SSH 主机";
@@ -466,7 +484,9 @@ function submit() {
                   ? "连接 PostgreSQL 数据库"
                   : form.driver === "redis"
                     ? "连接 Redis 服务器"
-                    : "连接 MySQL / MariaDB 数据库"
+                    : form.driver === "mongodb"
+                      ? "连接 MongoDB 服务器"
+                      : "连接 MySQL / MariaDB 数据库"
             }}
           </p>
         </div>
@@ -486,6 +506,7 @@ function submit() {
             <select v-model="form.driver">
               <option value="mysql">🐬 MySQL / MariaDB</option>
               <option value="postgres">PostgreSQL</option>
+              <option value="mongodb">MongoDB</option>
               <option value="redis">Redis</option>
               <option value="sqlite">SQLite</option>
             </select>
@@ -509,11 +530,11 @@ function submit() {
               <input v-model.number="form.port" type="number" min="1" max="65535" />
             </label>
             <label>
-              {{ form.driver === "redis" ? "用户名（可选）" : "用户名" }}
+              {{ form.driver === "redis" || form.driver === "mongodb" ? "用户名（可选）" : "用户名" }}
               <input
                 v-model="form.username"
                 autocomplete="username"
-                :placeholder="form.driver === 'redis' ? '留空使用 default' : 'root'"
+                :placeholder="form.driver === 'mongodb' ? '留空表示无认证' : form.driver === 'redis' ? '留空使用 default' : 'root'"
               />
             </label>
             <label>
@@ -527,7 +548,11 @@ function submit() {
             </label>
             <label>
               {{
-                form.driver === "redis" ? "数据库编号" : "数据库（可选）"
+                form.driver === "redis"
+                  ? "数据库编号"
+                  : form.driver === "mongodb"
+                    ? "默认数据库（可选）"
+                    : "数据库（可选）"
               }}
               <input
                 v-model="form.database"
@@ -536,21 +561,27 @@ function submit() {
                     ? '0'
                     : form.driver === 'postgres'
                       ? '留空使用 postgres'
-                      : '留空使用 mysql'
+                      : form.driver === 'mongodb'
+                        ? '留空使用 admin'
+                        : '留空使用 mysql'
                 "
               />
             </label>
+            <label v-if="form.driver === 'mongodb'">
+              认证数据库（authSource）
+              <input v-model="form.mongoAuthSource" placeholder="admin" />
+            </label>
             <label>
-              {{ form.driver === "redis" ? "TLS" : "SSL" }}
+              {{ form.driver === "redis" || form.driver === "mongodb" ? "TLS" : "SSL" }}
               <select v-model="form.sslMode">
                 <option value="disabled">禁用</option>
-                <option v-if="form.driver !== 'redis'" value="preferred">
+                <option v-if="form.driver !== 'redis' && form.driver !== 'mongodb'" value="preferred">
                   优先使用
                 </option>
                 <option value="required">
                   {{ form.driver === "redis" ? "必须使用（TLS）" : "必须使用" }}
                 </option>
-                <template v-if="form.driver !== 'redis'">
+                <template v-if="form.driver !== 'redis' && form.driver !== 'mongodb'">
                   <option value="verify-ca">验证 CA（verify-ca）</option>
                   <option value="verify-full">
                     完整验证（verify-full，含主机名）
@@ -561,6 +592,7 @@ function submit() {
             <template
               v-if="
                 form.driver !== 'redis' &&
+                form.driver !== 'mongodb' &&
                 (form.sslMode === 'verify-ca' ||
                   form.sslMode === 'verify-full')
               "
@@ -582,7 +614,7 @@ function submit() {
                 </div>
               </label>
             </template>
-            <template v-if="form.driver !== 'redis' && form.sslMode !== 'disabled'">
+            <template v-if="form.driver !== 'redis' && form.driver !== 'mongodb' && form.sslMode !== 'disabled'">
               <label>
                 客户端证书（可选）
                 <div class="file-row">
@@ -656,7 +688,7 @@ function submit() {
             </div>
           </label>
 
-          <template v-if="form.driver === 'mysql' || form.driver === 'postgres' || form.driver === 'redis'">
+          <template v-if="form.driver === 'mysql' || form.driver === 'postgres' || form.driver === 'redis' || form.driver === 'mongodb'">
             <label class="checkbox-row span-2 ssh-toggle">
               <input v-model="form.sshEnabled" type="checkbox" />
               通过 SSH 隧道连接

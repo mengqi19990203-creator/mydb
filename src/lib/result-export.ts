@@ -18,6 +18,10 @@ export interface ResultExportSnapshot {
   hiddenCount: number;
   sourceRowCount: number;
   truncated: boolean;
+  /** Rows removed by the local result filter, when one is active. */
+  filteredOut?: number;
+  /** Human-readable AND summary of the active filter. */
+  filterSummary?: string | null;
 }
 
 export interface ResultExportOptions {
@@ -139,11 +143,14 @@ export function exportExtension(format: ResultExportFormat): string {
   return format === "markdown" ? "md" : format;
 }
 
-export function exportFilename(format: ResultExportFormat): string {
+export function exportFilename(
+  format: ResultExportFormat,
+  prefix = "mydb-result",
+): string {
   const now = new Date();
   const pad = (value: number) => String(value).padStart(2, "0");
   const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(
     now.getDate(),
   )}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  return `mydb-result-${stamp}.${exportExtension(format)}`;
+  return `${prefix}-${stamp}.${exportExtension(format)}`;
 }

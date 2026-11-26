@@ -10,6 +10,7 @@ export type PaletteIcon =
   | "history"
   | "sync"
   | "play"
+  | "check"
   | "close"
   | "filter"
   | "target"

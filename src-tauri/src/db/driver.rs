@@ -1,6 +1,7 @@
 use crate::models::{
     ColumnInfo, ColumnValue, DatabaseObjects, ErColumn, ErDiagram, ErRelation, ErTable,
-    ForeignKeyInfo, QueryResult, ScopeTableColumns, TableInfo, TableRows, TableStructure,
+    ForeignKeyInfo, QueryResult, ScopeForeignKey, ScopeTableColumns, TableInfo, TableRows,
+    TableStructure,
 };
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -216,6 +217,45 @@ pub trait DatabaseDriver: Send + Sync {
         Err("当前驱动不支持 SQL 导出".to_string())
     }
 
+    /// Streams rows matching `filter` / `sorts` in the same order as the table
+    /// grid. The default batches through `read_rows_sorted`; drivers may
+    /// override this with a true cursor.
+    async fn export_rows_filtered(
+        &self,
+        table: &str,
+        limit: Option<u64>,
+        filter: Option<&str>,
+        sorts: &[crate::models::TableSort],
+        sink: &mut (dyn FnMut(Vec<serde_json::Value>) -> Result<(), String> + Send),
+    ) -> Result<u64, String> {
+        let mut offset = 0u64;
+        let mut total = 0u64;
+        let batch = 1_000u64;
+        loop {
+            let remaining = limit.map(|limit| limit.saturating_sub(total));
+            if remaining == Some(0) {
+                break;
+            }
+            let take = remaining.map(|value| value.min(batch)).unwrap_or(batch);
+            let page = self
+                .read_rows_sorted(table, take, offset, filter, sorts)
+                .await?;
+            if page.rows.is_empty() {
+                break;
+            }
+            let count = page.rows.len() as u64;
+            for row in page.rows {
+                sink(row)?;
+                total += 1;
+            }
+            offset += count;
+            if count < take {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
     /// A DROP statement for one exported object, matching the driver's syntax.
     async fn dump_object_drop(&self, kind: &str, name: &str) -> Result<String, String> {
         let keyword = match kind {
@@ -288,6 +328,45 @@ pub trait DatabaseDriver: Send + Sync {
     /// Foreign keys declared on `table`, used by the ER diagram.
     async fn list_foreign_keys(&self, _table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
         Ok(Vec::new())
+    }
+
+    /// All foreign keys in the current database / schema. Drivers may override
+    /// this with a single metadata query; the default loops over tables.
+    async fn scope_foreign_keys(&self) -> Result<Vec<ScopeForeignKey>, String> {
+        let tables = self.list_tables().await?;
+        let mut result = Vec::new();
+        for table in tables.iter().filter(|table| table.kind == "table") {
+            for mut foreign_key in self.list_foreign_keys(&table.name).await? {
+                if foreign_key.referenced_columns.len() < foreign_key.columns.len() {
+                    let primary_columns: Vec<String> = self
+                        .list_columns(&foreign_key.referenced_table)
+                        .await?
+                        .into_iter()
+                        .filter(|column| column.primary_key)
+                        .map(|column| column.name)
+                        .collect();
+                    if primary_columns.len() == foreign_key.columns.len() {
+                        foreign_key.referenced_columns = primary_columns;
+                    }
+                }
+                if foreign_key.referenced_columns.len() != foreign_key.columns.len() {
+                    continue;
+                }
+                result.push(ScopeForeignKey {
+                    table: table.name.clone(),
+                    name: foreign_key.name,
+                    columns: foreign_key.columns,
+                    referenced_table: foreign_key.referenced_table,
+                    referenced_columns: foreign_key.referenced_columns,
+                });
+            }
+        }
+        result.sort_by(|left, right| {
+            left.table
+                .cmp(&right.table)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(result)
     }
     /// Tables and foreign-key relations for the current database/schema.
     async fn er_diagram(&self) -> Result<ErDiagram, String> {

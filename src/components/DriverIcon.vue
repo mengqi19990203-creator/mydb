@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { Driver } from "../lib/types";
+import mongodbIcon from "../assets/drivers/mongodb.svg";
 import mysqlIcon from "../assets/drivers/mysql.svg";
 import postgresIcon from "../assets/drivers/postgresql.svg";
 import redisIcon from "../assets/drivers/redis.svg";
@@ -11,6 +12,7 @@ defineProps<{
 }>();
 
 const ICONS: Record<Driver, string> = {
+  mongodb: mongodbIcon,
   mysql: mysqlIcon,
   postgres: postgresIcon,
   redis: redisIcon,

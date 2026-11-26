@@ -2,7 +2,12 @@
 import { computed } from "vue";
 import type { ConnectionConfig, QueryResult } from "../lib/types";
 
-type ConnectionStatus = "idle" | "connecting" | "connected" | "failed";
+type ConnectionStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "failed"
+  | "lost";
 
 const props = defineProps<{
   status: string;
@@ -33,6 +38,9 @@ const scope = computed(() => {
   if (connection.driver === "sqlite") return "main";
   if (connection.driver === "redis") {
     return redisDatabaseLabel(props.database ?? connection.database);
+  }
+  if (connection.driver === "mongodb") {
+    return (props.database ?? connection.database ?? "").trim();
   }
   const database = (props.database ?? connection.database ?? "").trim();
   if (connection.driver === "postgres" && props.schema) {

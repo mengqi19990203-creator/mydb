@@ -114,6 +114,32 @@ export function useVirtualRows(options: VirtualRowsOptions) {
     scrollTop.value = 0;
   }
 
+  /**
+   * Scrolls the row at `index` into view. The sticky `<thead>` is taken into
+   * account so the target row is never hidden under the header. With
+   * `center`, the row is placed around the middle of the data viewport.
+   */
+  function scrollToRow(index: number, opts: { center?: boolean } = {}) {
+    const element = options.container.value;
+    if (!element) return;
+    const header = element.querySelector("thead");
+    const headerHeight =
+      header instanceof HTMLElement ? header.getBoundingClientRect().height : 0;
+    const dataHeight = Math.max(rowHeight, element.clientHeight - headerHeight);
+    const rowTop = index * rowHeight;
+    const centeredTop =
+      dataHeight > rowHeight
+        ? rowTop - (dataHeight - rowHeight) / 2
+        : rowTop;
+    const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
+    element.scrollTop = Math.min(
+      maxScroll,
+      Math.max(0, opts.center ? centeredTop : rowTop),
+    );
+    scrollTop.value = element.scrollTop;
+    viewportHeight.value = element.clientHeight;
+  }
+
   return {
     enabled,
     start,
@@ -122,6 +148,7 @@ export function useVirtualRows(options: VirtualRowsOptions) {
     paddingBottom,
     renderedCount,
     scrollToTop,
+    scrollToRow,
     /** Exposed for tests / callers that need to force a re-measure. */
     measure,
   };

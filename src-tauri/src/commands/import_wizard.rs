@@ -3,6 +3,7 @@ use crate::models::{
     ColumnValue, ImportFailure, ImportMapping, ImportOptions, ImportPreview, ImportProgress,
     ImportSummary, PendingTableChange,
 };
+use calamine::{Data, ExcelDateTime, Reader, SheetVisible, Xlsx, open_workbook};
 use serde_json::Value;
 use std::fs::File;
 use std::io::BufReader;
@@ -48,6 +49,8 @@ pub(crate) struct TabularFile {
     pub columns: Vec<String>,
     pub rows: Vec<(usize, Vec<String>)>,
     pub delimiter: u8,
+    pub sheets: Vec<String>,
+    pub sheet: Option<String>,
 }
 
 pub(crate) fn read_tabular(
@@ -57,6 +60,7 @@ pub(crate) fn read_tabular(
 ) -> Result<TabularFile, String> {
     match format {
         "json" => read_json(path),
+        "xlsx" | "excel" => read_xlsx(path, options),
         _ => read_csv(path, options),
     }
 }
@@ -127,6 +131,8 @@ fn read_csv(path: &str, options: &ImportOptions) -> Result<TabularFile, String> 
         columns,
         rows,
         delimiter,
+        sheets: Vec::new(),
+        sheet: None,
     })
 }
 
@@ -190,6 +196,148 @@ fn read_json(path: &str) -> Result<TabularFile, String> {
         columns,
         rows: data,
         delimiter: b',',
+        sheets: Vec::new(),
+        sheet: None,
+    })
+}
+
+fn format_excel_number(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 && value.abs() < 9_007_199_254_740_992.0 {
+        return (value as i64).to_string();
+    }
+    value.to_string()
+}
+
+fn format_excel_datetime(value: &ExcelDateTime) -> String {
+    let serial = value.as_f64();
+    let Some(datetime) = value.as_datetime() else {
+        return format_excel_number(serial);
+    };
+    let time = datetime.time().format("%H:%M:%S").to_string();
+    if serial >= 0.0 && serial < 1.0 {
+        return time;
+    }
+    if time == "00:00:00" {
+        return datetime.format("%Y-%m-%d").to_string();
+    }
+    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn xlsx_cell(cell: &Data) -> String {
+    match cell {
+        Data::Empty => String::new(),
+        Data::String(text) => text.clone(),
+        Data::Int(number) => number.to_string(),
+        Data::Float(number) => format_excel_number(*number),
+        Data::Bool(flag) => flag.to_string(),
+        Data::DateTime(value) => format_excel_datetime(value),
+        Data::DateTimeIso(text) | Data::DurationIso(text) => text.clone(),
+        Data::Error(_) => String::new(),
+    }
+}
+
+fn unique_xlsx_columns(values: Vec<String>, width: usize) -> Vec<String> {
+    let mut columns: Vec<String> = Vec::new();
+    let push_unique = |base: String, columns: &mut Vec<String>| {
+        let base = if base.trim().is_empty() {
+            format!("column_{}", columns.len() + 1)
+        } else {
+            base.trim().to_string()
+        };
+        let mut candidate = base.clone();
+        let mut suffix = 2usize;
+        while columns.iter().any(|column| column == &candidate) {
+            candidate = format!("{base} ({suffix})");
+            suffix += 1;
+        }
+        columns.push(candidate);
+    };
+    for value in values {
+        push_unique(value, &mut columns);
+    }
+    while columns.len() < width {
+        push_unique(String::new(), &mut columns);
+    }
+    columns
+}
+
+fn read_xlsx(path: &str, options: &ImportOptions) -> Result<TabularFile, String> {
+    let file_size = std::fs::metadata(path)
+        .map_err(|error| format!("打开 Excel 文件失败: {error}"))?
+        .len();
+    if file_size > 50 * 1024 * 1024 {
+        return Err("Excel 文件超过 50 MB，请拆分后再导入".to_string());
+    }
+
+    let mut workbook: Xlsx<_> =
+        open_workbook(path).map_err(|error| format!("读取 Excel 失败（文件可能已加密或损坏）: {error}"))?;
+    let metadata = workbook.sheets_metadata().to_vec();
+    let sheets: Vec<String> = metadata.iter().map(|sheet| sheet.name.clone()).collect();
+    if sheets.is_empty() {
+        return Err("Excel 工作簿没有工作表".to_string());
+    }
+    let requested = options.sheet.as_deref();
+    let selected = match requested {
+        Some(name) => {
+            if !sheets.iter().any(|sheet| sheet == name) {
+                return Err(format!("工作表不存在: {name}"));
+            }
+            name.to_string()
+        }
+        None => metadata
+            .iter()
+            .find(|sheet| sheet.visible == SheetVisible::Visible)
+            .map(|sheet| sheet.name.clone())
+            .unwrap_or_else(|| sheets[0].clone()),
+    };
+
+    let range = workbook
+        .worksheet_range(&selected)
+        .map_err(|error| format!("读取工作表 {selected} 失败: {error}"))?;
+    if range.height() > 200_000 {
+        return Err("工作表超过 200,000 行，请拆分为 CSV 或分批导入".to_string());
+    }
+    if range.width() > 2_000 {
+        return Err("工作表超过 2,000 列，请拆分后再导入".to_string());
+    }
+    let start_row = range.start().map(|(row, _)| row as usize).unwrap_or(0);
+    let mut records: Vec<(usize, Vec<String>)> = Vec::new();
+    for (index, row) in range.rows().enumerate() {
+        let values: Vec<String> = row.iter().map(xlsx_cell).collect();
+        if values.iter().all(|value| value.trim().is_empty()) {
+            continue;
+        }
+        records.push((start_row + index + 1, values));
+    }
+    if records.is_empty() {
+        return Err("Excel 工作表没有数据".to_string());
+    }
+
+    let width = records.iter().map(|(_, row)| row.len()).max().unwrap_or(0);
+    let (columns, data) = if options.has_header {
+        let header = records.remove(0).1;
+        let columns = unique_xlsx_columns(header, width.max(1));
+        (columns, records)
+    } else {
+        let columns = (1..=width.max(1))
+            .map(|index| format!("column_{index}"))
+            .collect();
+        (columns, records)
+    };
+    let rows = data
+        .into_iter()
+        .map(|(line, mut values)| {
+            values.resize(columns.len(), String::new());
+            values.truncate(columns.len());
+            (line, values)
+        })
+        .collect();
+    Ok(TabularFile {
+        columns,
+        rows,
+        delimiter: b',',
+        sheets,
+        sheet: Some(selected),
     })
 }
 
@@ -209,11 +357,18 @@ pub async fn preview_import_file(
         .take(20)
         .map(|(_, row)| row.clone())
         .collect();
+    let excel = format == "xlsx" || format == "excel";
     Ok(ImportPreview {
         columns: tabular.columns,
         rows,
-        detected_delimiter: delimiter_label(tabular.delimiter),
+        detected_delimiter: if excel {
+            String::new()
+        } else {
+            delimiter_label(tabular.delimiter)
+        },
         format,
+        sheets: tabular.sheets,
+        sheet: tabular.sheet,
     })
 }
 
@@ -437,6 +592,7 @@ mod tests {
             has_header: true,
             error_mode: "rollback".to_string(),
             empty_as_null: true,
+            sheet: None,
         };
         let table = read_tabular(path.to_string_lossy().as_ref(), "csv", &options).expect("csv");
         assert_eq!(table.columns, vec!["id", "name"]);
@@ -455,5 +611,64 @@ mod tests {
         assert_eq!(table.columns, vec!["id", "meta", "name"]);
         assert_eq!(table.rows[0].1[1], "{\"a\":2}");
         assert_eq!(table.rows[1].1[1], "");
+    }
+
+    #[test]
+    fn reads_xlsx_sheets_types_and_duplicate_headers() {
+        use rust_xlsxwriter::Workbook;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("import.xlsx");
+        let mut workbook = Workbook::new();
+        let users = workbook.add_worksheet();
+        users.set_name("users").expect("name");
+        users.write_string(0, 0, "id").expect("header");
+        users.write_string(0, 1, "name").expect("header");
+        users.write_string(0, 2, "name").expect("header");
+        users.write_string(0, 3, "active").expect("header");
+        users.write_number(1, 0, 42).expect("number");
+        users.write_string(1, 1, "Ana").expect("text");
+        users.write_string(1, 2, "Ana 2").expect("text");
+        users.write_boolean(1, 3, true).expect("bool");
+        users.write_number(2, 0, 7.5).expect("float");
+        users.write_string(2, 1, "").expect("empty");
+        users.write_string(2, 2, "Ben").expect("text");
+        users.write_boolean(2, 3, false).expect("bool");
+        let notes = workbook.add_worksheet();
+        notes.set_name("notes").expect("name");
+        notes.write_string(0, 0, "code").expect("header");
+        notes.write_string(1, 0, "00123").expect("text");
+        workbook.save(&path).expect("save");
+
+        let options = ImportOptions::default();
+        let table = read_tabular(path.to_string_lossy().as_ref(), "xlsx", &options).expect("xlsx");
+        assert_eq!(table.sheets, vec!["users", "notes"]);
+        assert_eq!(table.sheet.as_deref(), Some("users"));
+        assert_eq!(table.columns, vec!["id", "name", "name (2)", "active"]);
+        assert_eq!(table.rows[0].1, vec!["42", "Ana", "Ana 2", "true"]);
+        assert_eq!(table.rows[1].1, vec!["7.5", "", "Ben", "false"]);
+
+        let notes_options = ImportOptions {
+            sheet: Some("notes".to_string()),
+            ..ImportOptions::default()
+        };
+        let notes = read_tabular(
+            path.to_string_lossy().as_ref(),
+            "xlsx",
+            &notes_options,
+        )
+        .expect("notes sheet");
+        assert_eq!(notes.columns, vec!["code"]);
+        assert_eq!(notes.rows[0].1, vec!["00123"]);
+    }
+
+    #[test]
+    fn formats_excel_dates_and_times() {
+        let date = ExcelDateTime::new(45943.5, calamine::ExcelDateTimeType::DateTime, false);
+        assert_eq!(format_excel_datetime(&date), "2025-10-13 12:00:00");
+        let day = ExcelDateTime::new(45943.0, calamine::ExcelDateTimeType::DateTime, false);
+        assert_eq!(format_excel_datetime(&day), "2025-10-13");
+        let time = ExcelDateTime::new(0.5, calamine::ExcelDateTimeType::DateTime, false);
+        assert_eq!(format_excel_datetime(&time), "12:00:00");
     }
 }

@@ -32,7 +32,7 @@ const table = ref("");
 const columns = ref<ColumnInfo[]>([]);
 const loadingTable = ref(false);
 const path = ref("");
-const format = ref<"csv" | "json">("csv");
+const format = ref<"csv" | "json" | "xlsx">("csv");
 const preview = ref<ImportPreview | null>(null);
 const previewing = ref(false);
 const targets = ref<Record<string, string>>({});
@@ -41,6 +41,7 @@ const options = ref<ImportOptions>({
   hasHeader: true,
   errorMode: "rollback",
   emptyAsNull: true,
+  sheet: null,
 });
 const error = ref("");
 const executing = ref(false);
@@ -131,11 +132,19 @@ async function chooseFile() {
   const selected = await openDialog({
     multiple: false,
     directory: false,
-    filters: [{ name: "CSV / JSON", extensions: ["csv", "json"] }],
+    filters: [
+      { name: "CSV / JSON / Excel", extensions: ["csv", "json", "xlsx"] },
+    ],
   });
   if (typeof selected !== "string") return;
   path.value = selected;
-  format.value = selected.toLowerCase().endsWith(".json") ? "json" : "csv";
+  const lower = selected.toLowerCase();
+  format.value = lower.endsWith(".xlsx")
+    ? "xlsx"
+    : lower.endsWith(".json")
+      ? "json"
+      : "csv";
+  options.value.sheet = null;
   summary.value = null;
   await runPreview();
 }
@@ -150,6 +159,9 @@ async function runPreview() {
       format.value,
       options.value,
     );
+    if (format.value === "xlsx") {
+      options.value.sheet = preview.value.sheet ?? null;
+    }
     if (format.value === "csv" && !options.value.delimiter) {
       const detected = preview.value.detectedDelimiter;
       if ([",", ";", "\\t", "|"].includes(detected)) {
@@ -244,6 +256,7 @@ watch(
         hasHeader: true,
         errorMode: "rollback",
         emptyAsNull: true,
+        sheet: null,
       };
       error.value = "";
       executing.value = false;
@@ -288,7 +301,10 @@ onBeforeUnmount(() => {
       <header class="modal-header">
         <div>
           <h2>导入数据{{ table ? ` · ${table}` : "" }}</h2>
-          <p>预览 → 列映射 → 选项 → 执行；CSV 仅支持 UTF-8，导入过程按行写入。</p>
+          <p>
+            预览 → 列映射 → 选项 → 执行；CSV 仅支持 UTF-8，Excel
+            读取缓存值且不执行公式，导入过程按行写入。
+          </p>
         </div>
         <button class="icon-button" title="关闭" :disabled="executing" @click="emit('close')">
           <Icon name="close" />
@@ -308,9 +324,28 @@ onBeforeUnmount(() => {
           文件
           <button class="button ghost compact" :disabled="executing" @click="chooseFile">
             <Icon name="upload" :size="13" />
-            {{ fileName || "选择 CSV / JSON…" }}
+            {{ fileName || "选择 CSV / JSON / Excel…" }}
           </button>
         </span>
+        <label
+          v-if="format === 'xlsx' && preview?.sheets?.length"
+          class="import-field"
+        >
+          工作表
+          <select
+            v-model="options.sheet"
+            :disabled="executing || previewing"
+            @change="changeOption"
+          >
+            <option
+              v-for="name in preview?.sheets ?? []"
+              :key="name"
+              :value="name"
+            >
+              {{ name }}
+            </option>
+          </select>
+        </label>
         <label v-if="format === 'csv'" class="import-field">
           分隔符
           <select v-model="options.delimiter" :disabled="executing" @change="changeOption">
@@ -321,7 +356,7 @@ onBeforeUnmount(() => {
             <option value="|">竖线 |</option>
           </select>
         </label>
-        <label v-if="format === 'csv'" class="import-check">
+        <label v-if="format !== 'json'" class="import-check">
           <input
             v-model="options.hasHeader"
             type="checkbox"
@@ -349,7 +384,7 @@ onBeforeUnmount(() => {
       <div v-if="loadingTable" class="panel-empty">正在读取表结构…</div>
       <div v-else-if="!table" class="panel-empty">请选择目标表。</div>
       <div v-else-if="!preview" class="panel-empty">
-        选择一个 CSV / JSON 文件后显示前 20 行预览。
+        选择一个 CSV / JSON / Excel 文件后显示前 20 行预览。
       </div>
 
       <div v-else class="import-body">
@@ -360,6 +395,9 @@ onBeforeUnmount(() => {
               文件 {{ preview.columns.length }} 列 · 映射 {{ activeMappingCount }} 列
               <template v-if="preview.format === 'csv'">
                 · 检测分隔符 {{ preview.detectedDelimiter || "—" }}
+              </template>
+              <template v-else-if="preview.format === 'xlsx'">
+                · Excel<template v-if="preview.sheet"> · {{ preview.sheet }}</template>
               </template>
             </span>
           </div>

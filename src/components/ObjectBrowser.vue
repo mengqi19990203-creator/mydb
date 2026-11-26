@@ -3,6 +3,14 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import Icon from "./Icon.vue";
 import ObjectCategoryGroups from "./ObjectCategoryGroups.vue";
 import { writeClipboard } from "../lib/clipboard";
+import {
+  loadPins,
+  makePinnedObject,
+  pinsForScope,
+  savePins,
+  togglePinned,
+  type PinnedObject,
+} from "../lib/object-pins";
 import type { Driver, TableInfo } from "../lib/types";
 
 const props = defineProps<{
@@ -57,6 +65,10 @@ const nodeMenu = ref<{
 } | null>(null);
 const toast = ref("");
 let toastTimer = 0;
+const pins = ref<PinnedObject[]>(loadPins());
+const scopePins = computed(() =>
+  pinsForScope(pins.value, props.connectionId, props.activeDatabase, props.activeSchema),
+);
 
 const isPostgres = computed(() => props.driver === "postgres");
 
@@ -95,6 +107,26 @@ function flashToast(message: string) {
   toastTimer = window.setTimeout(() => {
     toast.value = "";
   }, 1800);
+}
+
+function handleTogglePin(table: TableInfo) {
+  const candidate = makePinnedObject(
+    props.connectionId,
+    props.activeDatabase,
+    props.activeSchema,
+    table.kind,
+    table.name,
+  );
+  const result = togglePinned(pins.value, candidate);
+  if (result.limitReached) {
+    flashToast("最多置顶 50 个对象");
+    return;
+  }
+  pins.value = result.items;
+  savePins(result.items);
+  flashToast(
+    result.pinned ? `已置顶 ${table.name}` : `已取消置顶 ${table.name}`,
+  );
 }
 
 function collapseAllObjects() {
@@ -609,6 +641,7 @@ watch(
                       :tables="tables"
                       :search="search"
                       :active-table="activeTable"
+                      :pinned="scopePins"
                       :locate-target="locateTarget"
                       :locate-nonce="locateNonce"
                       :collapse-nonce="collapseNonce"
@@ -621,6 +654,7 @@ watch(
                       @import-data="emit('import-data', $event)"
                       @generate-data="emit('generate-data', $event)"
                       @view-definition="emit('view-definition', $event)"
+                      @toggle-pin="handleTogglePin"
                       @create="emit('create')"
                       @refresh="emit('refresh')"
                       @generate-sql="emit('generate-sql', $event)"
@@ -639,6 +673,7 @@ watch(
               :tables="tables"
               :search="search"
               :active-table="activeTable"
+              :pinned="scopePins"
               :locate-target="locateTarget"
               :locate-nonce="locateNonce"
               :collapse-nonce="collapseNonce"
@@ -650,6 +685,7 @@ watch(
               @import-data="emit('import-data', $event)"
                       @generate-data="emit('generate-data', $event)"
                       @view-definition="emit('view-definition', $event)"
+              @toggle-pin="handleTogglePin"
               @create="emit('create')"
               @refresh="emit('refresh')"
               @generate-sql="emit('generate-sql', $event)"
@@ -667,6 +703,7 @@ watch(
           :tables="tables"
           :search="search"
           :active-table="activeTable"
+          :pinned="scopePins"
           :locate-target="locateTarget"
           :locate-nonce="locateNonce"
           :collapse-nonce="collapseNonce"
@@ -678,6 +715,7 @@ watch(
           @import-data="emit('import-data', $event)"
                       @generate-data="emit('generate-data', $event)"
                       @view-definition="emit('view-definition', $event)"
+          @toggle-pin="handleTogglePin"
           @create="emit('create')"
           @refresh="emit('refresh')"
           @generate-sql="emit('generate-sql', $event)"

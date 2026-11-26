@@ -36,6 +36,7 @@ import type {
   ScopeSearchHit,
   ScopeTableColumns,
   ScriptOptions,
+  ScopeForeignKey,
   ServerOverview,
   ServerProcess,
   ServerUser,
@@ -44,6 +45,9 @@ import type {
   SqlScriptSummary,
   TableChangeResult,
   TableDataDiff,
+  MongoCollectionInfo,
+  MongoDocumentPage,
+  MongoIndexInfo,
   TableInfo,
   TableRows,
   TableSort,
@@ -221,6 +225,16 @@ export function getConnectionContext(
   return invoke("get_connection_context", { connectionId });
 }
 
+export function checkConnectionHealth(connectionId: string): Promise<void> {
+  return invoke("check_connection_health", { connectionId });
+}
+
+export function reconnectConnection(
+  connectionId: string,
+): Promise<ConnectionContext> {
+  return invoke("reconnect_connection", { connectionId });
+}
+
 export function listContextTables(
   connectionId: string,
   database: string | null,
@@ -345,6 +359,12 @@ export function getTableStructure(
   table: string,
 ): Promise<TableStructure> {
   return invoke("get_table_structure", { connectionId, table });
+}
+
+export function listScopeForeignKeys(
+  connectionId: string,
+): Promise<ScopeForeignKey[]> {
+  return invoke("list_scope_foreign_keys", { connectionId });
 }
 
 export function readTableRows(
@@ -832,6 +852,39 @@ export function quitApp(): Promise<void> {
   return invoke("quit_app");
 }
 
+export interface TableExportRowsRequest {
+  connectionId: string;
+  table: string;
+  format: "csv" | "json" | "sql" | "xlsx";
+  path: string;
+  filter: string | null;
+  sorts: TableSort[];
+  limit: number | null;
+  withHeader: boolean;
+  targetTable: string | null;
+  /// When set, export only these columns (current visible columns).
+  columns: string[] | null;
+  operationId: string;
+}
+
+export function exportTableRows(
+  request: TableExportRowsRequest,
+): Promise<number> {
+  return invoke("export_table_rows", {
+    connectionId: request.connectionId,
+    table: request.table,
+    format: request.format,
+    path: request.path,
+    filter: request.filter,
+    sorts: request.sorts,
+    limit: request.limit,
+    withHeader: request.withHeader,
+    targetTable: request.targetTable,
+    columns: request.columns,
+    operationId: request.operationId,
+  });
+}
+
 export interface QueryWindowPayload {
   title?: string;
   connectionId?: string | null;
@@ -867,9 +920,11 @@ export function syncMenuState(state: NativeMenuState): Promise<void> {
   return invoke("sync_menu_state", { state });
 }
 
+export type ImportFormat = "csv" | "json" | "xlsx";
+
 export function previewImportFile(
   path: string,
-  format: string,
+  format: ImportFormat,
   options: ImportOptions,
 ): Promise<ImportPreview> {
   return invoke("preview_import_file", { path, format, options });
@@ -879,7 +934,7 @@ export function executeImportFile(
   connectionId: string,
   table: string,
   path: string,
-  format: string,
+  format: ImportFormat,
   options: ImportOptions,
   mappings: ImportMapping[],
   operationId: string,
@@ -1084,4 +1139,164 @@ export function redisCommand(
   command: string,
 ): Promise<RedisCommandResult> {
   return invoke("redis_command", { connectionId, command });
+}
+
+// ---------- MongoDB ----------
+
+export function mongoListDatabases(connectionId: string): Promise<string[]> {
+  return invoke("mongo_list_databases", { connectionId });
+}
+
+export function mongoListCollections(
+  connectionId: string,
+  database: string,
+): Promise<MongoCollectionInfo[]> {
+  return invoke("mongo_list_collections", { connectionId, database });
+}
+
+export function mongoFindDocuments(
+  connectionId: string,
+  database: string,
+  collection: string,
+  filter: string,
+  projection: string,
+  sort: string,
+  skip: number,
+  limit: number,
+): Promise<MongoDocumentPage> {
+  return invoke("mongo_find_documents", {
+    connectionId,
+    database,
+    collection,
+    filter,
+    projection,
+    sort,
+    skip,
+    limit,
+  });
+}
+
+export function mongoInsertDocument(
+  connectionId: string,
+  database: string,
+  collection: string,
+  document: string,
+): Promise<unknown> {
+  return invoke("mongo_insert_document", {
+    connectionId,
+    database,
+    collection,
+    document,
+  });
+}
+
+export function mongoReplaceDocument(
+  connectionId: string,
+  database: string,
+  collection: string,
+  id: unknown,
+  document: string,
+): Promise<number> {
+  return invoke("mongo_replace_document", {
+    connectionId,
+    database,
+    collection,
+    id,
+    document,
+  });
+}
+
+export function mongoDeleteDocument(
+  connectionId: string,
+  database: string,
+  collection: string,
+  id: unknown,
+): Promise<number> {
+  return invoke("mongo_delete_document", {
+    connectionId,
+    database,
+    collection,
+    id,
+  });
+}
+
+export function mongoListIndexes(
+  connectionId: string,
+  database: string,
+  collection: string,
+): Promise<MongoIndexInfo[]> {
+  return invoke("mongo_list_indexes", { connectionId, database, collection });
+}
+
+export function mongoCreateIndex(
+  connectionId: string,
+  database: string,
+  collection: string,
+  keys: string,
+  name: string,
+  unique: boolean,
+): Promise<void> {
+  return invoke("mongo_create_index", {
+    connectionId,
+    database,
+    collection,
+    keys,
+    name,
+    unique,
+  });
+}
+
+export function mongoDropIndex(
+  connectionId: string,
+  database: string,
+  collection: string,
+  name: string,
+): Promise<void> {
+  return invoke("mongo_drop_index", { connectionId, database, collection, name });
+}
+
+export function mongoCreateCollection(
+  connectionId: string,
+  database: string,
+  name: string,
+): Promise<void> {
+  return invoke("mongo_create_collection", { connectionId, database, name });
+}
+
+export function mongoDropCollection(
+  connectionId: string,
+  database: string,
+  name: string,
+): Promise<void> {
+  return invoke("mongo_drop_collection", { connectionId, database, name });
+}
+
+export function mongoAggregateDocuments(
+  connectionId: string,
+  database: string,
+  collection: string,
+  pipeline: string,
+  limit: number,
+): Promise<MongoDocumentPage> {
+  return invoke("mongo_aggregate_documents", {
+    connectionId,
+    database,
+    collection,
+    pipeline,
+    limit,
+  });
+}
+
+export function mongoInsertDocuments(
+  connectionId: string,
+  database: string,
+  collection: string,
+  documents: string,
+): Promise<number> {
+  return invoke("mongo_insert_documents", {
+    connectionId,
+    database,
+    collection,
+    documents,
+  });
 }

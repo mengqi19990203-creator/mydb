@@ -2,8 +2,9 @@ use super::{AppState, driver_for};
 use crate::db::DatabaseDriver;
 use crate::models::{
     DatabaseExportFailure, DatabaseExportOptions, DatabaseExportProgress, DatabaseExportSummary,
-    ExportObject, ForeignKeyInfo,
+    ExportObject, ForeignKeyInfo, TableExportProgress, TableSort,
 };
+use crate::commands::xlsx::{build_workbook, write_bytes_atomic};
 use crate::storage;
 use chrono::Local;
 use std::fs::{File, OpenOptions};
@@ -314,6 +315,321 @@ async fn export_table_data(
             Err(error)
         }
     }
+}
+
+
+fn export_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn export_csv_field(value: &serde_json::Value) -> String {
+    let text = export_text(value);
+    if text.contains([',', '"', '\r', '\n']) || text.starts_with(' ') || text.ends_with(' ') {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text
+    }
+}
+
+fn export_sql_literal(value: &serde_json::Value, driver: &str) -> String {
+    match value {
+        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::Bool(flag) => if *flag { "TRUE" } else { "FALSE" }.to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(text) => {
+            if driver == "mysql" {
+                format!("'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
+            } else {
+                format!("'{}'", text.replace('\u{0}', "").replace('\'', "''"))
+            }
+        }
+        other => {
+            let text = other.to_string();
+            if driver == "mysql" {
+                format!("'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
+            } else {
+                format!("'{}'", text.replace('\'', "''"))
+            }
+        }
+    }
+}
+
+fn select_export_columns(
+    all_columns: &[String],
+    requested: Option<&[String]>,
+) -> Result<(Vec<String>, Vec<usize>), String> {
+    let Some(requested) = requested else {
+        return Ok((
+            all_columns.to_vec(),
+            (0..all_columns.len()).collect(),
+        ));
+    };
+    if requested.is_empty() {
+        return Err("未选择任何导出列".to_string());
+    }
+    let mut columns = Vec::new();
+    let mut indices = Vec::new();
+    for name in requested {
+        if columns.iter().any(|column| column == name) {
+            continue;
+        }
+        let index = all_columns
+            .iter()
+            .position(|column| column == name)
+            .ok_or_else(|| format!("导出列不存在: {name}"))?;
+        columns.push(name.clone());
+        indices.push(index);
+    }
+    Ok((columns, indices))
+}
+
+#[tauri::command]
+pub async fn export_table_rows(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+    table: String,
+    format: String,
+    path: String,
+    filter: Option<String>,
+    sorts: Vec<TableSort>,
+    limit: Option<u64>,
+    with_header: bool,
+    target_table: Option<String>,
+    columns: Option<Vec<String>>,
+    operation_id: Option<String>,
+) -> Result<u64, String> {
+    if table.trim().is_empty() {
+        return Err("表名不能为空".to_string());
+    }
+    if !matches!(format.as_str(), "csv" | "json" | "sql" | "xlsx") {
+        return Err(format!("不支持的导出格式: {format}"));
+    }
+    let driver = driver_for(&app, &state, &connection_id).await?;
+    let driver_kind = storage::load_connections(&app)?
+        .into_iter()
+        .find(|connection| connection.id == connection_id)
+        .map(|connection| connection.driver)
+        .unwrap_or_default();
+    let all_columns = driver
+        .list_columns(&table)
+        .await?
+        .into_iter()
+        .map(|column| column.name)
+        .collect::<Vec<_>>();
+    if all_columns.is_empty() {
+        return Err("表没有可导出的字段".to_string());
+    }
+    let (columns, column_indices) =
+        select_export_columns(&all_columns, columns.as_deref())?;
+    let pick = |row: &[serde_json::Value]| -> Vec<serde_json::Value> {
+        column_indices
+            .iter()
+            .map(|index| row.get(*index).cloned().unwrap_or(serde_json::Value::Null))
+            .collect()
+    };
+    let operation_id = operation_id
+        .clone()
+        .unwrap_or_else(|| format!("table-export-{}", uuid::Uuid::new_v4()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    state
+        .export_cancels
+        .lock()
+        .await
+        .insert(operation_id.clone(), cancel.clone());
+
+    let app_handle = app.clone();
+    let operation = operation_id.clone();
+    let result = async {
+        if format == "xlsx" {
+            if limit.is_some_and(|limit| limit > 200_000) {
+                return Err("XLSX 单文件最多 200,000 行，请改用 CSV".to_string());
+            }
+            let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+            let mut last_progress = Instant::now();
+            let total = driver
+                .export_rows_filtered(
+                    &table,
+                    limit,
+                    filter.as_deref(),
+                    &sorts,
+                    &mut |row| {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err("导出已取消".to_string());
+                        }
+                        if rows.len() >= 200_000 {
+                            return Err("XLSX 单文件最多 200,000 行，请改用 CSV".to_string());
+                        }
+                        rows.push(pick(&row));
+                        if last_progress.elapsed() >= Duration::from_millis(500) {
+                            last_progress = Instant::now();
+                            let _ = app_handle.emit(
+                                "table-export:progress",
+                                TableExportProgress {
+                                    operation_id: Some(operation.clone()),
+                                    rows: rows.len() as u64,
+                                    bytes: 0,
+                                    phase: "reading".to_string(),
+                                },
+                            );
+                        }
+                        Ok(())
+                    },
+                )
+                .await?;
+            let workbook = build_workbook(&columns, &rows, &table, with_header)?;
+            write_bytes_atomic(&path, &workbook)?;
+            Ok(total)
+        } else {
+            let temp = temp_path_for(Path::new(&path));
+            let file = File::create(&temp)
+                .map_err(|error| format!("创建导出文件失败: {error}"))?;
+            let mut out = BufWriter::new(file);
+            let mut bytes = 0u64;
+            let mut rows_written = 0u64;
+            let mut last_progress = Instant::now();
+            let mut first_row = true;
+            let target = target_table
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&table);
+            let table_ref = target
+                .split('.')
+                .map(|part| quote(part.trim(), &driver_kind))
+                .collect::<Vec<_>>()
+                .join(".");
+            if format == "csv" && with_header {
+                let line = columns
+                    .iter()
+                    .map(|column| {
+                        serde_json::Value::String(column.clone())
+                    })
+                    .map(|value| export_csv_field(&value))
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    + "\n";
+                write_text(&mut out, &line, &mut bytes)?;
+            }
+            if format == "json" {
+                write_text(&mut out, "[", &mut bytes)?;
+            }
+            let column_list = columns
+                .iter()
+                .map(|column| quote(column, &driver_kind))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql_prefix = format!(
+                "INSERT INTO {table_ref} ({column_list}) VALUES ("
+            );
+            let stream_result = driver
+                .export_rows_filtered(
+                    &table,
+                    limit,
+                    filter.as_deref(),
+                    &sorts,
+                    &mut |row| {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err("导出已取消".to_string());
+                        }
+                        let row = pick(&row);
+                        match format.as_str() {
+                            "csv" => {
+                                let line = row
+                                    .iter()
+                                    .map(export_csv_field)
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                                    + "\n";
+                                write_text(&mut out, &line, &mut bytes)?;
+                            }
+                            "json" => {
+                                let object = columns
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, column)| {
+                                        (
+                                            column.clone(),
+                                            row.get(index)
+                                                .cloned()
+                                                .unwrap_or(serde_json::Value::Null),
+                                        )
+                                    })
+                                    .collect::<serde_json::Map<_, _>>();
+                                let text = serde_json::to_string(&object)
+                                    .map_err(|error| format!("序列化 JSON 行失败: {error}"))?;
+                                let chunk = if first_row {
+                                    text
+                                } else {
+                                    format!(",{text}")
+                                };
+                                write_text(&mut out, &chunk, &mut bytes)?;
+                            }
+                            _ => {
+                                let values = row
+                                    .iter()
+                                    .map(|value| export_sql_literal(value, &driver_kind))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                write_text(
+                                    &mut out,
+                                    &format!("{sql_prefix}{values});\n"),
+                                    &mut bytes,
+                                )?;
+                            }
+                        }
+                        first_row = false;
+                        rows_written += 1;
+                        if last_progress.elapsed() >= Duration::from_millis(500) {
+                            last_progress = Instant::now();
+                            let _ = app_handle.emit(
+                                "table-export:progress",
+                                TableExportProgress {
+                                    operation_id: Some(operation.clone()),
+                                    rows: rows_written,
+                                    bytes,
+                                    phase: "writing".to_string(),
+                                },
+                            );
+                        }
+                        Ok(())
+                    },
+                )
+                .await;
+            if format == "json" {
+                write_text(&mut out, "]", &mut bytes)?;
+            }
+            out.flush()
+                .map_err(|error| format!("刷新导出文件失败: {error}"))?;
+            drop(out);
+            if let Err(error) = stream_result {
+                let _ = std::fs::remove_file(&temp);
+                return Err(error);
+            }
+            std::fs::rename(&temp, &path)
+                .map_err(|error| format!("保存导出文件失败: {error}"))?;
+            Ok(rows_written)
+        }
+    }
+    .await;
+
+    state.export_cancels.lock().await.remove(&operation_id);
+    let _ = app.emit(
+        "table-export:progress",
+        TableExportProgress {
+            operation_id: Some(operation_id),
+            rows: result.as_ref().copied().unwrap_or(0),
+            bytes: 0,
+            phase: if result.is_ok() { "done" } else { "failed" }.to_string(),
+        },
+    );
+    result
 }
 
 #[tauri::command]
@@ -1060,6 +1376,25 @@ fn yes_no(value: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::select_export_columns;
+
+    #[test]
+    fn select_export_columns_picks_requested_order_and_rejects_unknown() {
+        let all = vec!["id".to_string(), "name".to_string(), "amount".to_string()];
+        let (columns, indices) =
+            select_export_columns(&all, Some(&["amount".to_string(), "id".to_string(), "id".to_string()]))
+                .expect("selection");
+        assert_eq!(columns, vec!["amount".to_string(), "id".to_string()]);
+        assert_eq!(indices, vec![2, 0]);
+
+        let (columns, indices) = select_export_columns(&all, None).expect("all");
+        assert_eq!(columns, all);
+        assert_eq!(indices, vec![0, 1, 2]);
+
+        assert!(select_export_columns(&all, Some(&[])).is_err());
+        assert!(select_export_columns(&all, Some(&["missing".to_string()])).is_err());
+    }
+
     use super::*;
     use crate::db::{DatabaseDriver, SqliteDriver};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};

@@ -13,6 +13,15 @@ import {
   loadDangerConfirm,
   saveDangerConfirm,
 } from "../lib/dangerous-sql";
+import {
+  loadQueryRunMode,
+  saveQueryRunMode,
+  type QueryRunMode,
+} from "../lib/query-run-mode";
+import {
+  loadAutoReconnect,
+  saveAutoReconnect,
+} from "../lib/connection-health";
 
 const props = defineProps<{
   open: boolean;
@@ -21,11 +30,15 @@ const props = defineProps<{
 const emit = defineEmits<{
   close: [];
   "open-format-settings": [];
+  "run-mode-change": [mode: QueryRunMode];
+  "auto-reconnect-change": [enabled: boolean];
 }>();
 
 const theme = ref<ThemeMode>("dark");
 const fontSize = ref(13);
 const dangerConfirm = ref(true);
+const runMode = ref<QueryRunMode>("statement");
+const autoReconnect = ref(true);
 const saved = ref(false);
 const themeOptions: { value: ThemeMode; label: string; hint: string }[] = [
   { value: "dark", label: "深色", hint: "当前默认" },
@@ -37,6 +50,8 @@ function load() {
   theme.value = loadThemeMode();
   fontSize.value = loadEditorFontSize();
   dangerConfirm.value = loadDangerConfirm();
+  runMode.value = loadQueryRunMode();
+  autoReconnect.value = loadAutoReconnect();
   saved.value = false;
 }
 
@@ -55,6 +70,19 @@ function changeFontSize() {
 function toggleDanger() {
   dangerConfirm.value = !dangerConfirm.value;
   saveDangerConfirm(dangerConfirm.value);
+  saved.value = true;
+}
+
+function changeRunMode() {
+  saveQueryRunMode(runMode.value);
+  emit("run-mode-change", runMode.value);
+  saved.value = true;
+}
+
+function toggleAutoReconnect() {
+  autoReconnect.value = !autoReconnect.value;
+  saveAutoReconnect(autoReconnect.value);
+  emit("auto-reconnect-change", autoReconnect.value);
   saved.value = true;
 }
 
@@ -142,6 +170,39 @@ onBeforeUnmount(() => {
               打开格式化设置…
             </button>
           </div>
+        </section>
+
+        <section class="settings-section">
+          <h3>查询</h3>
+          <label class="settings-row">
+            <span>
+              运行按钮默认范围
+              <small class="settings-hint">
+                有选区时始终执行选中 SQL；无选区时按此设置
+              </small>
+            </span>
+            <select v-model="runMode" @change="changeRunMode">
+              <option value="statement">当前语句</option>
+              <option value="tab">整个标签</option>
+            </select>
+          </label>
+        </section>
+
+        <section class="settings-section">
+          <h3>连接</h3>
+          <label class="settings-row">
+            <span>
+              断线后自动重连
+              <small class="settings-hint">
+                仅恢复数据库 / SSH / Redis 连接，不会重新执行 SQL，也不会回滚事务
+              </small>
+            </span>
+            <input
+              :checked="autoReconnect"
+              type="checkbox"
+              @change="toggleAutoReconnect"
+            />
+          </label>
         </section>
 
         <section class="settings-section">

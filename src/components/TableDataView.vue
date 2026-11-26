@@ -14,39 +14,104 @@ import BatchSetDialog from "./BatchSetDialog.vue";
 import ChangePreviewDialog from "./ChangePreviewDialog.vue";
 import CellValueDialog from "./CellValueDialog.vue";
 import FilterBuilderDialog from "./FilterBuilderDialog.vue";
+import GridFindBar from "./GridFindBar.vue";
 import Icon from "./Icon.vue";
+import PasteRowsDialog from "./PasteRowsDialog.vue";
+import ResultProfile from "./ResultProfile.vue";
+import RowDetailPanel from "./RowDetailPanel.vue";
+import TableDataExportDialog from "./TableDataExportDialog.vue";
+import TableViewMenu from "./TableViewMenu.vue";
+import {
+  countMatchRows,
+  findGridMatches,
+  formatGridCell,
+  highlightSegments,
+  type GridMatch,
+} from "../lib/grid-search";
 import * as api from "../lib/api";
 import { writeClipboard } from "../lib/clipboard";
 import { qualifiedSqlName } from "../lib/generate-sql";
+import {
+  loadScopeForeignKeys,
+  peekScopeForeignKeys,
+} from "../lib/foreign-key-cache";
+import {
+  applyColumnOrder,
+  columnOrderScopeKey,
+  loadColumnOrder,
+  moveColumnKey,
+  normalizeColumnOrder,
+  saveColumnOrder,
+} from "../lib/column-order";
+import {
+  frozenOffsets,
+  frozenScopeKey,
+  loadFrozenNames,
+  normalizeFrozenNames,
+  saveFrozenNames,
+} from "../lib/frozen-columns";
+import {
+  createTableViewProfile,
+  loadTableViewState,
+  profileColumnKeys,
+  saveTableViewState,
+  tableViewScopeKey,
+  tableViewSignature,
+  MAX_PROFILES_PER_TABLE,
+  TABLE_VIEW_PAGE_SIZES,
+  type TableViewProfile,
+} from "../lib/table-views";
+import {
+  clonePendingSnapshot,
+  pushPendingHistory,
+  takePendingHistory,
+  type PendingSnapshot,
+} from "../lib/pending-history";
 import {
   buildRowInsert,
   buildRowJson,
   buildRowUpdate,
 } from "../lib/row-copy";
 import { quoteIdentifier, sqlLiteral } from "../lib/sql-literal";
+import type { ChartData } from "../lib/result-chart";
 import { useVirtualRows } from "../lib/virtual-rows";
 import type {
   ColumnInfo,
   ColumnValue,
   Driver,
   PendingTableChange,
+  RowDetailField,
+  ScopeForeignKey,
+  TableInfo,
   TableSort,
 } from "../lib/types";
 
-const props = defineProps<{
-  connectionId: string;
-  table: string;
-  tableKind?: string;
-  databaseLabel?: string;
-  driver?: Driver;
-  database?: string;
-  schema?: string | null;
-  readOnly?: boolean;
-}>();
+const props = withDefaults(
+  defineProps<{
+    connectionId: string;
+    table: string;
+    tableKind?: string;
+    databaseLabel?: string;
+    driver?: Driver;
+    database?: string;
+    schema?: string | null;
+    readOnly?: boolean;
+    /// Split panes pass false so they never overwrite the main table's pins.
+    persistFrozen?: boolean;
+    tables?: TableInfo[];
+    initialFilter?: string;
+    linkedFilterLabel?: string;
+  }>(),
+  { persistFrozen: true },
+);
 
 const emit = defineEmits<{
   "generate-data": [];
   "import-data": [];
+  "open-linked-table": [
+    payload: { table: string; filter: string; label: string },
+  ];
+  "connection-error": [message: string];
 }>();
 
 const vFocus = {
@@ -67,7 +132,7 @@ interface CellMenu {
 }
 
 interface ResizeState {
-  name: string;
+  key: string;
   startX: number;
   startWidth: number;
 }
@@ -117,6 +182,8 @@ const importHasHeader = ref(true);
 const updates = ref<Record<number, Record<string, unknown>>>({});
 const pendingDeletes = ref<Set<number>>(new Set());
 const pendingInserts = ref<InsertDraft[]>([]);
+const undoStack = ref<PendingSnapshot[]>([]);
+const redoStack = ref<PendingSnapshot[]>([]);
 const selectedRows = ref<Set<number>>(new Set());
 const pageInput = ref("1");
 const previewOpen = ref(false);
@@ -128,13 +195,96 @@ const valueViewer = ref<{
   rowIndex: number;
   colIndex: number;
 } | null>(null);
+const detailOpen = ref(false);
+const detailRowIndex = ref(0);
+const frozenIndices = ref<number[]>([]);
+const frozenNames = ref<string[]>([]);
+const hiddenNames = ref<string[]>([]);
+const columnOrder = ref<string[]>([]);
+let columnOrderSaveTimer = 0;
+let pendingColumnOrderSave: { scope: string; order: string[] } | null = null;
+let columnDrag: {
+  index: number;
+  startX: number;
+  startY: number;
+  frozen: boolean;
+  moved: boolean;
+  target: number | null;
+  after: boolean;
+} | null = null;
+const columnDragState = ref<{
+  index: number;
+  target: number | null;
+  after: boolean;
+} | null>(null);
+let suppressHeaderClick = false;
+const viewProfiles = ref<TableViewProfile[]>([]);
+const activeViewId = ref<string | null>(null);
+const defaultViewId = ref<string | null>(null);
+const viewBaseline = ref<string | null>(null);
+let pendingColumnView: TableViewProfile | null = null;
+const headerMenu = ref<{
+  x: number;
+  y: number;
+  colIndex: number;
+} | null>(null);
+const pasteOpen = ref(false);
+const tableExportOpen = ref(false);
+const profileOpen = ref(false);
+const foreignKeys = ref<ScopeForeignKey[]>([]);
+const foreignKeysLoading = ref(false);
+const foreignKeysError = ref("");
 const scrollRef = ref<HTMLElement | null>(null);
+const rootRef = ref<HTMLElement | null>(null);
+const findOpen = ref(false);
+const findQuery = ref("");
+const findTerm = ref("");
+const findCaseSensitive = ref(false);
+const findIndex = ref(0);
+const findBar = ref<InstanceType<typeof GridFindBar> | null>(null);
+let findTimer = 0;
+let restoreFocus: HTMLElement | null = null;
 let insertDraftSequence = 0;
 let selectionAnchor: number | null = null;
 let resizeState: ResizeState | null = null;
 
 const primaryKeys = computed(() =>
   columns.value.filter((column) => column.primaryKey),
+);
+const profileKeys = computed(() => profileColumnKeys(columns.value));
+const hiddenSet = computed(() => new Set(hiddenNames.value));
+const orderedColumnIndices = computed(() => {
+  const keys = profileKeys.value;
+  const orderedKeys = applyColumnOrder(keys, columnOrder.value);
+  const indexByKey = new Map(keys.map((key, index) => [key, index]));
+  return orderedKeys
+    .map((key) => indexByKey.get(key))
+    .filter((index): index is number => index !== undefined);
+});
+
+const visibleColumnEntries = computed(() => {
+  const entries = orderedColumnIndices.value
+    .map((index) => ({ column: columns.value[index], index }))
+    .filter((entry) => entry.column && !hiddenSet.value.has(entry.column.name));
+  const frozen = entries.filter((entry) =>
+    frozenIndices.value.includes(entry.index),
+  );
+  const rest = entries.filter(
+    (entry) => !frozenIndices.value.includes(entry.index),
+  );
+  return [...frozen, ...rest];
+});
+const visibleColumns = computed(() =>
+  visibleColumnEntries.value.map((entry) => entry.column),
+);
+const visibleIndices = computed(() =>
+  visibleColumnEntries.value.map((entry) => entry.index),
+);
+const visibleColumnNames = computed(() =>
+  visibleColumnEntries.value.map((entry) => entry.column.name),
+);
+const hiddenColumnCount = computed(
+  () => columns.value.length - visibleColumns.value.length,
 );
 const driverKind = computed<Driver>(() => props.driver ?? "sqlite");
 const isTable = computed(() => (props.tableKind ?? "table") === "table");
@@ -160,6 +310,50 @@ const canEdit = computed(
     (primaryKeys.value.length > 0 ||
       (isTable.value && matchColumns.value.length > 0)),
 );
+
+const pasteDisabledReason = computed(() => {
+  if (props.readOnly) return "当前连接为只读";
+  if (!isTable.value) return "视图不支持新增行";
+  if (!columns.value.length) return "当前表没有可编辑字段";
+  if (pendingInserts.value.length >= 10_000) {
+    return "待提交新增行已达 10,000 行上限";
+  }
+  return "";
+});
+
+function openPasteDialog() {
+  if (pasteDisabledReason.value) {
+    showMessage(pasteDisabledReason.value);
+    return;
+  }
+  commitEdit();
+  pasteOpen.value = true;
+}
+
+function applyPastedRows(
+  drafts: Array<Array<unknown | undefined>>,
+  skipped: number,
+) {
+  if (!drafts.length) return;
+  if (pendingInserts.value.length + drafts.length > 10_000) {
+    showMessage("待提交新增行超过 10,000 行，已取消本次粘贴");
+    return;
+  }
+  recordHistory();
+  const created = drafts.map((values) => ({
+    id: ++insertDraftSequence,
+    values,
+  }));
+  pendingInserts.value = [...pendingInserts.value, ...created];
+  selectedRows.value = new Set();
+  selectionAnchor = null;
+  pasteOpen.value = false;
+  showMessage(
+    `已粘贴 ${created.length} 行到待提交${
+      skipped ? `（跳过 ${skipped} 行）` : ""
+    }`,
+  );
+}
 
 const displayRows = computed<DisplayRow[]>(() => {
   const list: DisplayRow[] = rows.value.map((row, origin) => {
@@ -200,6 +394,7 @@ const {
   paddingTop: virtualPaddingTop,
   paddingBottom: virtualPaddingBottom,
   scrollToTop,
+  scrollToRow,
 } = useVirtualRows({
   container: scrollRef,
   rowCount: computed(() => displayRows.value.length),
@@ -227,6 +422,170 @@ watch([virtualStart, virtualEnd], ([start, end]) => {
   }
 });
 
+const findMatches = computed<GridMatch[]>(() =>
+  findGridMatches(
+    displayRows.value.map((row) => row.values),
+    visibleIndices.value.map((index) => ({ index })),
+    findTerm.value,
+    { caseSensitive: findCaseSensitive.value },
+  ),
+);
+const findRowCount = computed(() => countMatchRows(findMatches.value));
+const currentMatch = computed(
+  () => findMatches.value[findIndex.value] ?? null,
+);
+const matchCellKeys = computed(() => {
+  const keys = new Set<string>();
+  for (const match of findMatches.value) {
+    keys.add(`${match.rowIndex}:${match.columnIndex}`);
+  }
+  return keys;
+});
+const findScopeHint = computed(
+  () =>
+    `仅搜索当前页 ${displayRows.value.length} 行的可见列，全表请用 WHERE；不改变查询与导出范围`,
+);
+const findHighlights = computed(() => {
+  const highlights = new Map<
+    string,
+    ReturnType<typeof highlightSegments>
+  >();
+  if (!findTerm.value.trim()) return highlights;
+  for (const entry of virtualRows.value) {
+    for (const columnIndex of visibleIndices.value) {
+      const key = `${entry.index}:${columnIndex}`;
+      if (!matchCellKeys.value.has(key)) continue;
+      highlights.set(
+        key,
+        highlightSegments(
+          formatCell(entry.row.values[columnIndex]),
+          findTerm.value,
+          findCaseSensitive.value,
+        ),
+      );
+    }
+  }
+  return highlights;
+});
+
+watch(
+  [findQuery, findCaseSensitive],
+  ([query]) => {
+    window.clearTimeout(findTimer);
+    findTimer = window.setTimeout(() => {
+      findTerm.value = query;
+      findIndex.value = 0;
+      void nextTick(() => {
+        if (findMatches.value.length) jumpToMatch(0, false);
+      });
+    }, 100);
+  },
+);
+
+watch(findMatches, (list) => {
+  if (!list.length) {
+    findIndex.value = 0;
+    return;
+  }
+  if (findIndex.value >= list.length) findIndex.value = 0;
+});
+
+function highlightFor(rowIndex: number, columnIndex: number) {
+  return findHighlights.value.get(`${rowIndex}:${columnIndex}`) ?? null;
+}
+
+function jumpToMatch(index: number, scroll = true) {
+  const list = findMatches.value;
+  if (!list.length) return;
+  const next = ((index % list.length) + list.length) % list.length;
+  findIndex.value = next;
+  if (!scroll) return;
+  const match = list[next];
+  void nextTick(() => scrollToRow(match.rowIndex, { center: true }));
+}
+
+function nextMatch() {
+  jumpToMatch(findIndex.value + 1);
+}
+
+function previousMatch() {
+  jumpToMatch(findIndex.value - 1);
+}
+
+async function focusSearch() {
+  if (!findOpen.value) {
+    restoreFocus =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    findOpen.value = true;
+    if (findQuery.value.trim()) findTerm.value = findQuery.value;
+  }
+  await nextTick();
+  findBar.value?.focusInput();
+}
+
+function closeSearch() {
+  window.clearTimeout(findTimer);
+  findOpen.value = false;
+  findTerm.value = "";
+  findIndex.value = 0;
+  const target = restoreFocus;
+  restoreFocus = null;
+  void nextTick(() => target?.focus());
+}
+
+function resetSearch() {
+  window.clearTimeout(findTimer);
+  findOpen.value = false;
+  findQuery.value = "";
+  findTerm.value = "";
+  findIndex.value = 0;
+}
+
+watch(
+  () => [props.connectionId, props.table, props.database, props.schema],
+  () => {
+    resetSearch();
+    detailOpen.value = false;
+    pasteOpen.value = false;
+    foreignKeys.value = [];
+    foreignKeysError.value = "";
+    foreignKeysLoading.value = false;
+    frozenIndices.value = [];
+    frozenNames.value = [];
+    headerMenu.value = null;
+  },
+);
+
+watch(displayRows, (list) => {
+  if (!detailOpen.value) return;
+  if (!list.length) {
+    detailOpen.value = false;
+    return;
+  }
+  if (detailRowIndex.value >= list.length) {
+    detailRowIndex.value = list.length - 1;
+  }
+});
+
+const pageExportRows = computed(() =>
+  displayRows.value
+    .filter((row) => row.state !== "delete")
+    .map((row) => [...row.values]),
+);
+const pageVisibleRows = computed(() =>
+  pageExportRows.value.map((row) =>
+    visibleIndices.value.map((index) => row[index] ?? null),
+  ),
+);
+const selectedExportRows = computed(() =>
+  [...selectedRows.value]
+    .map((index) => displayRows.value[index])
+    .filter((row) => row && row.state !== "delete")
+    .map((row) => [...row!.values]),
+);
+
 const pendingCount = computed(() => {
   const updated = Object.keys(updates.value).filter(
     (key) => !pendingDeletes.value.has(Number(key)),
@@ -249,7 +608,14 @@ const updateCopyReason = computed(() => {
   if (saving.value) return "正在保存，暂不能复制 UPDATE";
   if (!primaryKeys.value.length) return "无主键，无法生成 UPDATE";
   if (
-    !columns.value.some(
+    !primaryKeys.value.every((key) =>
+      visibleColumns.value.some((column) => column.name === key.name),
+    )
+  ) {
+    return "主键列已隐藏，无法生成 UPDATE";
+  }
+  if (
+    !visibleColumns.value.some(
       (column) => !column.primaryKey && !column.autoIncrement,
     )
   ) {
@@ -264,8 +630,221 @@ const page = computed(() => Math.floor(offset.value / limit.value) + 1);
 const pageCount = computed(() =>
   Math.max(1, Math.ceil(total.value / limit.value)),
 );
+const tableProfileData = computed<ChartData>(() => ({
+  columns: columns.value.map((column) => column.name),
+  visibleColumns: visibleColumnEntries.value.map((entry) => ({
+    name: entry.column.name,
+    index: entry.index,
+  })),
+  rows: rows.value,
+  truncated: false,
+}));
+const tableProfilePage = computed(() => ({
+  page: page.value,
+  pageCount: pageCount.value,
+  total: total.value,
+  pending: hasPendingChanges.value,
+}));
 const pendingChanges = computed(() => buildPendingChanges());
 const pendingSql = computed(() => buildPendingSql(pendingChanges.value));
+const canUndo = computed(
+  () => canEdit.value && undoStack.value.length > 0,
+);
+const canRedo = computed(
+  () => canEdit.value && redoStack.value.length > 0,
+);
+
+function pendingSnapshot(): PendingSnapshot {
+  return clonePendingSnapshot({
+    updates: updates.value,
+    deletes: [...pendingDeletes.value],
+    inserts: pendingInserts.value.map((draft) => ({
+      id: draft.id,
+      values: draft.values,
+    })),
+  });
+}
+
+function recordHistory() {
+  pushPendingHistory(undoStack.value, pendingSnapshot());
+  redoStack.value = [];
+}
+
+function applyPendingSnapshot(snapshot: PendingSnapshot) {
+  const copy = clonePendingSnapshot(snapshot);
+  updates.value = copy.updates;
+  pendingDeletes.value = new Set(copy.deletes);
+  pendingInserts.value = copy.inserts.map((draft) => ({
+    id: draft.id,
+    values: draft.values,
+  }));
+  editing.value = null;
+  selectedRows.value = new Set();
+  selectionAnchor = null;
+  previewOpen.value = false;
+}
+
+function undo() {
+  if (!canUndo.value) return;
+  const target = takePendingHistory(undoStack.value);
+  if (!target) return;
+  pushPendingHistory(redoStack.value, pendingSnapshot());
+  applyPendingSnapshot(target);
+  showMessage("已撤销上一步");
+}
+
+function redo() {
+  if (!canRedo.value) return;
+  const target = takePendingHistory(redoStack.value);
+  if (!target) return;
+  pushPendingHistory(undoStack.value, pendingSnapshot());
+  applyPendingSnapshot(target);
+  showMessage("已重做");
+}
+
+function resetHistory() {
+  undoStack.value = [];
+  redoStack.value = [];
+}
+
+const detailRow = computed(
+  () => displayRows.value[detailRowIndex.value] ?? null,
+);
+const detailEditable = computed(
+  () =>
+    Boolean(
+      canEdit.value &&
+        detailRow.value &&
+        detailRow.value.state !== "delete",
+    ),
+);
+const detailReadOnlyReason = computed(() => {
+  if (props.readOnly) return "只读连接";
+  if (!isTable.value) return "视图不支持编辑";
+  if (detailRow.value?.state === "delete") {
+    return "该行已标记删除，撤销删除后可编辑";
+  }
+  if (!canEdit.value) return "当前表不可编辑";
+  return "";
+});
+const detailRowLabel = computed(() => {
+  if (!detailRow.value) return "";
+  return `当前页第 ${detailRowIndex.value + 1} / ${
+    displayRows.value.length
+  } 行 · 全表第 ${offset.value + detailRowIndex.value + 1} 行`;
+});
+const detailFields = computed<RowDetailField[]>(() => {
+  const row = detailRow.value;
+  if (!row) return [];
+  return columns.value.map((column, index) => {
+    const binary = isBinaryColumn(column);
+    let editable = Boolean(canEdit.value && !binary && row.state !== "delete");
+    let disabledReason = "";
+    if (!canEdit.value) {
+      disabledReason = props.readOnly
+        ? "只读连接"
+        : !isTable.value
+          ? "视图不支持编辑"
+          : "当前表不可编辑";
+      editable = false;
+    } else if (binary) {
+      disabledReason = "二进制字段不支持编辑";
+    } else if (row.state === "delete") {
+      disabledReason = "该行已标记删除，撤销删除后可编辑";
+    }
+    return {
+      name: column.name,
+      value: row.values[index],
+      type: column.dataType,
+      nullable: column.nullable,
+      primaryKey: column.primaryKey,
+      autoIncrement: column.autoIncrement,
+      comment: column.comment,
+      hidden: hiddenSet.value.has(column.name),
+      modified: isCellModified(detailRowIndex.value, index),
+      editable,
+      disabledReason,
+      binary,
+    };
+  });
+});
+
+function openRowDetail(index: number) {
+  const row = displayRows.value[index];
+  if (!row) return;
+  commitEdit();
+  detailRowIndex.value = index;
+  detailOpen.value = true;
+}
+
+function openDetailFromToolbar() {
+  const selected = [...selectedRows.value].sort((left, right) => left - right);
+  openRowDetail(selected[0] ?? 0);
+}
+
+function closeRowDetail() {
+  detailOpen.value = false;
+}
+
+function moveRowDetail(delta: number) {
+  const next = detailRowIndex.value + delta;
+  if (next < 0 || next >= displayRows.value.length) return;
+  detailRowIndex.value = next;
+}
+
+function setDetailValue(index: number, value: unknown) {
+  const column = columns.value[index];
+  const row = detailRow.value;
+  if (!column || !row || row.state === "delete" || !canEdit.value) return;
+  if (isBinaryColumn(column)) return;
+  if (sameValue(row.values[index], value)) return;
+  recordHistory();
+  setCellPending(detailRowIndex.value, index, value);
+  showMessage("已加入待提交，尚未写入数据库");
+}
+
+function applyDetailEdit(index: number, raw: string) {
+  const column = columns.value[index];
+  if (!column) return;
+  setDetailValue(index, parseInput(raw, column));
+}
+
+function setDetailNull(index: number) {
+  const column = columns.value[index];
+  if (!column?.nullable) return;
+  setDetailValue(index, null);
+}
+
+function viewDetailValue(index: number) {
+  valueViewer.value = { rowIndex: detailRowIndex.value, colIndex: index };
+}
+
+async function copyDetailValue(index: number) {
+  const field = detailFields.value[index];
+  if (!field) return;
+  try {
+    await writeClipboard(formatCell(field.value));
+    showMessage(`已复制 ${field.name}`);
+  } catch (reason) {
+    error.value = `复制失败: ${reason}`;
+  }
+}
+
+async function copyDetailRowJson() {
+  const row = detailRow.value;
+  if (!row) return;
+  try {
+    await writeClipboard(
+      buildRowJson(
+        columns.value.map((column) => column.name),
+        row.values.map((value) => value ?? null),
+      ),
+    );
+    showMessage("已复制整行 JSON（全部字段）");
+  } catch (reason) {
+    error.value = `复制失败: ${reason}`;
+  }
+}
 
 function sortDirectionFor(column: string): "asc" | "desc" | null {
   return sorts.value.find((sort) => sort.column === column)?.direction ?? null;
@@ -274,17 +853,7 @@ const insertColumns = computed(() =>
   columns.value.filter((column) => !column.autoIncrement),
 );
 
-function formatCell(value: unknown): string {
-  if (value === null || value === undefined) return "NULL";
-  if (typeof value === "object") {
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return String(value);
-    }
-  }
-  return String(value);
-}
+const formatCell = formatGridCell;
 
 function isNull(value: unknown): boolean {
   return value === null || value === undefined;
@@ -328,20 +897,389 @@ function defaultColumnWidth(column: ColumnInfo): number {
   return 100;
 }
 
-function columnWidth(name: string): number {
-  const stored = columnWidths[name];
+function columnWidthAt(index: number): number {
+  const column = columns.value[index];
+  if (!column) return 140;
+  const key = profileKeys.value[index] ?? column.name;
+  const stored = columnWidths[key] ?? columnWidths[column.name];
   if (stored) return stored;
-  const column = columns.value.find((item) => item.name === name);
-  return column ? defaultColumnWidth(column) : 140;
+  return defaultColumnWidth(column);
 }
 
-function startResize(event: MouseEvent, name: string) {
+const tableOrderScope = computed(() =>
+  columnOrderScopeKey(
+    driverKind.value,
+    props.connectionId,
+    props.database,
+    props.schema,
+    props.table,
+    props.tableKind ?? "table",
+  ),
+);
+const frozenScope = computed(() =>
+  frozenScopeKey(
+    driverKind.value,
+    props.connectionId,
+    props.database,
+    props.schema,
+    props.table,
+  ),
+);
+const visibleFrozenIndices = computed(() =>
+  visibleColumnEntries.value
+    .filter((entry) => frozenIndices.value.includes(entry.index))
+    .map((entry) => entry.index),
+);
+const frozenColumns = computed(() =>
+  columns.value.filter((_, index) => visibleFrozenIndices.value.includes(index)),
+);
+const lastFrozenIndex = computed(
+  () => visibleFrozenIndices.value[visibleFrozenIndices.value.length - 1] ?? null,
+);
+const frozenLeft = computed(() =>
+  frozenOffsets(
+    columns.value.map((column, index) =>
+      hiddenSet.value.has(column.name) ? 0 : columnWidthAt(index),
+    ),
+    visibleFrozenIndices.value,
+    76,
+  ),
+);
+
+function applyFrozenNames(names: string[]) {
+  const normalized = normalizeFrozenNames(
+    names,
+    columns.value.map((column) => column.name),
+  );
+  frozenNames.value = normalized;
+  frozenIndices.value = normalized
+    .map((name) => columns.value.findIndex((column) => column.name === name))
+    .filter((index) => index >= 0);
+}
+
+function restoreFrozenColumns() {
+  if (props.persistFrozen === false) {
+    // Split panes keep their session-local frozen columns across paging.
+    applyFrozenNames(frozenNames.value);
+    return;
+  }
+  applyFrozenNames(loadFrozenNames(frozenScope.value));
+}
+
+function persistFrozenColumns() {
+  if (props.persistFrozen === false) return;
+  saveFrozenNames(frozenScope.value, frozenNames.value);
+}
+
+function freezeColumn(index: number) {
+  if (!canFreezeColumn(index)) {
+    showMessage(
+      visibleColumns.value.length <= 1
+        ? "至少保留一列可滚动"
+        : "当前无需横向滚动",
+    );
+    return;
+  }
+  const position = visibleIndices.value.indexOf(index);
+  if (position < 0) return;
+  frozenNames.value = visibleIndices.value
+    .slice(0, position + 1)
+    .map((columnIndex) => columns.value[columnIndex]?.name ?? "")
+    .filter(Boolean);
+  frozenIndices.value = frozenNames.value
+    .map((name) => columns.value.findIndex((column) => column.name === name))
+    .filter((columnIndex) => columnIndex >= 0);
+  persistFrozenColumns();
+  closeCellMenu();
+  headerMenu.value = null;
+}
+
+function unfreezeColumns() {
+  frozenIndices.value = [];
+  frozenNames.value = [];
+  persistFrozenColumns();
+  closeCellMenu();
+  headerMenu.value = null;
+}
+
+function canFreezeColumn(index: number): boolean {
+  if (visibleColumns.value.length <= 1) return false;
+  const position = visibleIndices.value.indexOf(index);
+  if (position < 0 || position >= visibleColumns.value.length - 1) return false;
+  const element = scrollRef.value;
+  if (element && element.scrollWidth <= element.clientWidth + 1) {
+    return false;
+  }
+  return true;
+}
+
+function canHideColumn(index: number): boolean {
+  return (
+    visibleIndices.value.includes(index) && visibleColumns.value.length > 1
+  );
+}
+
+function hideColumn(index: number) {
+  const column = columns.value[index];
+  if (!column) return;
+  if (!canHideColumn(index)) {
+    showMessage("至少保留一列可见");
+    return;
+  }
+  commitEdit();
+  hiddenNames.value = [...hiddenNames.value, column.name];
+  headerMenu.value = null;
+  closeCellMenu();
+}
+
+function showAllColumns() {
+  if (!hiddenNames.value.length) return;
+  hiddenNames.value = [];
+  headerMenu.value = null;
+  closeCellMenu();
+}
+
+function normalizeHiddenColumns(): boolean {
+  const names = columns.value.map((column) => column.name);
+  const kept = normalizeFrozenNames(hiddenNames.value, names);
+  const changed = kept.length !== hiddenNames.value.length;
+  if (names.length && kept.length >= names.length) {
+    // Keep the first column visible even if a stored view hid everything.
+    hiddenNames.value = kept.filter((name) => name !== names[0]);
+    return true;
+  }
+  hiddenNames.value = kept;
+  return changed;
+}
+
+function frozenMenuLabel(index: number): string {
+  const position = visibleIndices.value.indexOf(index);
+  const names =
+    position < 0
+      ? []
+      : visibleIndices.value
+          .slice(0, position + 1)
+          .map((columnIndex) => columns.value[columnIndex]?.name ?? "");
+  const preview =
+    names.length <= 3
+      ? names.join("、")
+      : `${names.slice(0, 2).join("、")}… 等 ${names.length} 列`;
+  return `冻结到此列（${preview}）`;
+}
+
+function flushColumnOrderSave() {
+  window.clearTimeout(columnOrderSaveTimer);
+  const pending = pendingColumnOrderSave;
+  pendingColumnOrderSave = null;
+  if (!pending) return;
+  if (!saveColumnOrder(pending.scope, pending.order)) {
+    showMessage("列顺序未保存（本地存储不可用或已满）");
+  }
+}
+
+function scheduleColumnOrderSave() {
+  if (props.persistFrozen === false) return;
+  pendingColumnOrderSave = {
+    scope: tableOrderScope.value,
+    order: normalizeColumnOrder(columnOrder.value, profileKeys.value),
+  };
+  window.clearTimeout(columnOrderSaveTimer);
+  columnOrderSaveTimer = window.setTimeout(flushColumnOrderSave, 300);
+}
+
+function tableColumnBlock(
+  index: number,
+): Array<{ column: ColumnInfo; index: number }> {
+  const frozen = frozenIndices.value.includes(index);
+  return visibleColumnEntries.value.filter(
+    (entry) => frozenIndices.value.includes(entry.index) === frozen,
+  );
+}
+
+function reorderTableColumn(from: number, to: number, after: boolean) {
+  const fromKey = profileKeys.value[from];
+  const toKey = profileKeys.value[to];
+  if (!fromKey || !toKey || from === to) return;
+  const frozenFrom = frozenIndices.value.includes(from);
+  const frozenTo = frozenIndices.value.includes(to);
+  if (frozenFrom !== frozenTo) {
+    showMessage("请先取消冻结或先冻结该列，再跨冻结块移动");
+    return;
+  }
+  const order = normalizeColumnOrder(columnOrder.value, profileKeys.value);
+  columnOrder.value = moveColumnKey(order, fromKey, toKey, after);
+  frozenNames.value = visibleColumnEntries.value
+    .filter((entry) => frozenIndices.value.includes(entry.index))
+    .map((entry) => entry.column.name);
+  scheduleColumnOrderSave();
+}
+
+function cleanupColumnDrag() {
+  columnDrag = null;
+  columnDragState.value = null;
+  window.removeEventListener("mousemove", moveColumnDrag);
+  window.removeEventListener("mouseup", finishColumnDrag);
+  window.removeEventListener("keydown", cancelColumnDragOnEscape, true);
+}
+
+function startColumnDrag(event: MouseEvent, index: number) {
+  if (event.button !== 0) return;
+  const target = event.target as HTMLElement | null;
+  if (target?.closest(".col-resizer")) return;
+  commitEdit();
+  columnDrag = {
+    index,
+    startX: event.clientX,
+    startY: event.clientY,
+    frozen: frozenIndices.value.includes(index),
+    moved: false,
+    target: null,
+    after: false,
+  };
+  window.addEventListener("mousemove", moveColumnDrag);
+  window.addEventListener("mouseup", finishColumnDrag);
+  window.addEventListener("keydown", cancelColumnDragOnEscape, true);
+}
+
+function moveColumnDrag(event: MouseEvent) {
+  if (!columnDrag) return;
+  if (
+    !columnDrag.moved &&
+    Math.abs(event.clientX - columnDrag.startX) < 4 &&
+    Math.abs(event.clientY - columnDrag.startY) < 4
+  ) {
+    return;
+  }
+  columnDrag.moved = true;
+  event.preventDefault();
+  const element = document.elementFromPoint(event.clientX, event.clientY);
+  const header = element?.closest<HTMLElement>("th[data-col-index]");
+  if (!header) {
+    columnDragState.value = {
+      index: columnDrag.index,
+      target: null,
+      after: false,
+    };
+    return;
+  }
+  const target = Number(header.dataset.colIndex);
+  if (!Number.isInteger(target) || target === columnDrag.index) {
+    columnDragState.value = {
+      index: columnDrag.index,
+      target: null,
+      after: false,
+    };
+    return;
+  }
+  const rect = header.getBoundingClientRect();
+  columnDragState.value = {
+    index: columnDrag.index,
+    target,
+    after: event.clientX > rect.left + rect.width / 2,
+  };
+}
+
+function finishColumnDrag() {
+  const drag = columnDrag;
+  const state = columnDragState.value;
+  cleanupColumnDrag();
+  if (!drag) return;
+  if (drag.moved) {
+    suppressHeaderClick = true;
+    window.setTimeout(() => {
+      suppressHeaderClick = false;
+    }, 0);
+  }
+  if (!drag.moved || !state || state.target === null) return;
+  reorderTableColumn(drag.index, state.target, state.after);
+}
+
+function cancelColumnDrag() {
+  if (!columnDrag) return;
+  cleanupColumnDrag();
+  suppressHeaderClick = true;
+  window.setTimeout(() => {
+    suppressHeaderClick = false;
+  }, 0);
+}
+
+function cancelColumnDragOnEscape(event: KeyboardEvent) {
+  if (event.key !== "Escape" || !columnDrag) return;
   event.preventDefault();
   event.stopPropagation();
+  cancelColumnDrag();
+}
+
+function handleHeaderClick(name: string, additive: boolean) {
+  if (suppressHeaderClick) {
+    suppressHeaderClick = false;
+    return;
+  }
+  toggleSort(name, additive);
+}
+
+function canMoveHeader(
+  direction: "left" | "right" | "first" | "last",
+): boolean {
+  const menu = headerMenu.value;
+  if (!menu) return false;
+  const block = tableColumnBlock(menu.colIndex);
+  const position = block.findIndex((entry) => entry.index === menu.colIndex);
+  if (position < 0 || block.length < 2) return false;
+  if (direction === "left" || direction === "first") return position > 0;
+  return position < block.length - 1;
+}
+
+function moveHeaderColumn(
+  direction: "left" | "right" | "first" | "last",
+) {
+  const menu = headerMenu.value;
+  if (!menu || !canMoveHeader(direction)) return;
+  const block = tableColumnBlock(menu.colIndex);
+  const position = block.findIndex((entry) => entry.index === menu.colIndex);
+  let target: { index: number } | undefined;
+  let after = false;
+  if (direction === "left") {
+    target = block[position - 1];
+  } else if (direction === "right") {
+    target = block[position + 1];
+    after = true;
+  } else if (direction === "first") {
+    target = block[0];
+  } else {
+    target = block[block.length - 1];
+    after = true;
+  }
+  headerMenu.value = null;
+  if (target) reorderTableColumn(menu.colIndex, target.index, after);
+}
+
+function openHeaderMenu(event: MouseEvent, colIndex: number) {
+  event.preventDefault();
+  event.stopPropagation();
+  closeCellMenu();
+  headerMenu.value = {
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - 230)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 280)),
+    colIndex,
+  };
+}
+
+function resetColumnWidth(index: number) {
+  const column = columns.value[index];
+  if (!column) return;
+  delete columnWidths[profileKeys.value[index] ?? column.name];
+  delete columnWidths[column.name];
+}
+
+function startResize(event: MouseEvent, index: number) {
+  event.preventDefault();
+  event.stopPropagation();
+  const key = profileKeys.value[index] ?? String(index);
   resizeState = {
-    name,
+    key,
     startX: event.clientX,
-    startWidth: columnWidth(name),
+    startWidth: columnWidthAt(index),
   };
   window.addEventListener("mousemove", moveResize);
   window.addEventListener("mouseup", stopResize);
@@ -349,7 +1287,7 @@ function startResize(event: MouseEvent, name: string) {
 
 function moveResize(event: MouseEvent) {
   if (!resizeState) return;
-  columnWidths[resizeState.name] = Math.max(
+  columnWidths[resizeState.key] = Math.max(
     60,
     Math.min(
       600,
@@ -383,14 +1321,95 @@ function openCellMenu(event: MouseEvent, rowIndex: number, colIndex: number) {
 function closeCellMenu() {
   cellMenu.value = null;
   copyAsOpen.value = false;
+  headerMenu.value = null;
 }
 
 function onGlobalKey(event: KeyboardEvent) {
   if (event.key === "Escape") {
+    if (findOpen.value) {
+      closeSearch();
+      return;
+    }
+    if (detailOpen.value) {
+      detailOpen.value = false;
+      return;
+    }
     closeCellMenu();
     if (insertOpen.value) insertOpen.value = false;
     if (importRequest.value) importRequest.value = null;
+    return;
   }
+  const modifier = event.metaKey || event.ctrlKey;
+  if (modifier && !event.altKey) {
+    const key = event.key.toLowerCase();
+    const wantsUndo = key === "z" && !event.shiftKey;
+    const wantsRedo =
+      (key === "z" && event.shiftKey) || (key === "y" && !event.shiftKey);
+    if (
+      (wantsUndo || wantsRedo) &&
+      (wantsUndo ? canUndo.value : canRedo.value)
+    ) {
+      const root = rootRef.value;
+      const target = event.target;
+      if (!root || !(target instanceof Node) || !root.contains(target)) {
+        return;
+      }
+      const element = target instanceof Element ? target : null;
+      if (element?.closest('.modal-backdrop, [role="dialog"]')) return;
+      if (
+        element?.closest(
+          'input, textarea, select, [contenteditable="true"], .cm-editor',
+        )
+      ) {
+        return;
+      }
+      event.preventDefault();
+      if (wantsUndo) undo();
+      else redo();
+      return;
+    }
+    if (event.shiftKey && key === "v") {
+      const root = rootRef.value;
+      const target = event.target;
+      if (!root || !(target instanceof Node) || !root.contains(target)) {
+        return;
+      }
+      const element = target instanceof Element ? target : null;
+      if (element?.closest('.modal-backdrop, [role="dialog"]')) return;
+      if (
+        element?.closest(
+          'input, textarea, select, [contenteditable="true"], .cm-editor',
+        )
+      ) {
+        return;
+      }
+      event.preventDefault();
+      openPasteDialog();
+      return;
+    }
+  }
+  if (!modifier || event.key.toLowerCase() !== "f") {
+    return;
+  }
+  const root = rootRef.value;
+  const target = event.target;
+  if (!root || !(target instanceof Node) || !root.contains(target)) return;
+  const element = target instanceof Element ? target : null;
+  if (element?.closest(".grid-findbar")) {
+    event.preventDefault();
+    void focusSearch();
+    return;
+  }
+  if (element?.closest('.modal-backdrop, [role="dialog"]')) return;
+  if (
+    element?.closest(
+      'input, textarea, select, [contenteditable="true"], .cm-editor',
+    )
+  ) {
+    return;
+  }
+  event.preventDefault();
+  void focusSearch();
 }
 
 function menuValue(): unknown {
@@ -398,6 +1417,180 @@ function menuValue(): unknown {
   return displayRows.value[cellMenu.value.rowIndex]?.values[
     cellMenu.value.colIndex
   ];
+}
+
+function openDetailFromMenu() {
+  const menu = cellMenu.value;
+  if (!menu) return;
+  const index = menu.rowIndex;
+  closeCellMenu();
+  openRowDetail(index);
+}
+
+async function ensureForeignKeys(force = false) {
+  if (!isTable.value || foreignKeysLoading.value) return;
+  const cached = force
+    ? null
+    : peekScopeForeignKeys(props.connectionId, props.database, props.schema);
+  if (cached) {
+    foreignKeys.value = cached;
+    return;
+  }
+  foreignKeysLoading.value = true;
+  foreignKeysError.value = "";
+  try {
+    foreignKeys.value = await loadScopeForeignKeys(
+      props.connectionId,
+      props.database,
+      props.schema,
+      force,
+    );
+  } catch (reason) {
+    foreignKeysError.value = String(reason);
+  } finally {
+    foreignKeysLoading.value = false;
+  }
+}
+
+function tableAvailable(name: string): boolean {
+  if (!props.tables?.length) return true;
+  return props.tables.some(
+    (table) =>
+      table.name === name &&
+      (table.kind === "table" || table.kind === "view" || table.kind === "matview"),
+  );
+}
+
+function stableLinkValues(values: unknown[]): boolean {
+  return values.every(
+    (value) =>
+      value !== null &&
+      value !== undefined &&
+      typeof value !== "object",
+  );
+}
+
+function linkFilter(columns: string[], values: unknown[]): string {
+  return columns
+    .map(
+      (column, index) =>
+        `${quoteIdentifier(column, driverKind.value)} = ${sqlLiteral(
+          values[index],
+          driverKind.value,
+        )}`,
+    )
+    .join(" AND ");
+}
+
+interface OutboundLink {
+  key: string;
+  foreignKey: ScopeForeignKey;
+  values: unknown[];
+  enabled: boolean;
+  reason: string;
+}
+
+interface InboundLink {
+  key: string;
+  foreignKey: ScopeForeignKey;
+  values: unknown[];
+  enabled: boolean;
+  reason: string;
+}
+
+const outgoingLinks = computed<OutboundLink[]>(() => {
+  const menu = cellMenu.value;
+  if (!menu || !isTable.value) return [];
+  const row = displayRows.value[menu.rowIndex];
+  const column = columns.value[menu.colIndex];
+  if (!row || !column) return [];
+  return foreignKeys.value
+    .filter(
+      (foreignKey) =>
+        foreignKey.table === props.table &&
+        foreignKey.columns.includes(column.name),
+    )
+    .map((foreignKey) => {
+      const values = foreignKey.columns.map(
+        (name) => row.values[columnIndex(name)],
+      );
+      const enabled =
+        stableLinkValues(values) && tableAvailable(foreignKey.referencedTable);
+      const reason = !stableLinkValues(values)
+        ? "外键列包含 NULL 或非标量值，无法定位引用行"
+        : !tableAvailable(foreignKey.referencedTable)
+          ? "目标表不在当前库 / 模式"
+          : "";
+      return {
+        key: `${foreignKey.table}:${foreignKey.name}`,
+        foreignKey,
+        values,
+        enabled,
+        reason,
+      };
+    });
+});
+
+const incomingLinks = computed<InboundLink[]>(() => {
+  const menu = cellMenu.value;
+  if (!menu || !isTable.value) return [];
+  const row = displayRows.value[menu.rowIndex];
+  if (!row) return [];
+  return foreignKeys.value
+    .filter((foreignKey) => foreignKey.referencedTable === props.table)
+    .map((foreignKey) => {
+      const values = foreignKey.referencedColumns.map(
+        (name) => row.values[columnIndex(name)],
+      );
+      const enabled =
+        stableLinkValues(values) && tableAvailable(foreignKey.table);
+      const reason = !stableLinkValues(values)
+        ? "当前行的被引用列包含 NULL 或非标量值"
+        : !tableAvailable(foreignKey.table)
+          ? "引用表不在当前库 / 模式"
+          : "";
+      return {
+        key: `${foreignKey.table}:${foreignKey.name}`,
+        foreignKey,
+        values,
+        enabled,
+        reason,
+      };
+    });
+});
+
+function openOutboundLink(link: OutboundLink) {
+  if (!link.enabled) {
+    showMessage(link.reason);
+    return;
+  }
+  emit("open-linked-table", {
+    table: link.foreignKey.referencedTable,
+    filter: linkFilter(
+      link.foreignKey.referencedColumns,
+      link.values,
+    ),
+    label: `${props.table}.${link.foreignKey.columns.join(", ")}`,
+  });
+  closeCellMenu();
+}
+
+function openInboundLink(link: InboundLink) {
+  if (!link.enabled) {
+    showMessage(link.reason);
+    return;
+  }
+  emit("open-linked-table", {
+    table: link.foreignKey.table,
+    filter: linkFilter(link.foreignKey.columns, link.values),
+    label: `${link.foreignKey.table}.${link.foreignKey.columns.join(", ")}`,
+  });
+  closeCellMenu();
+}
+
+function openForeignKeysFromMenu() {
+  closeCellMenu();
+  void ensureForeignKeys(true);
 }
 
 const viewerValue = computed<unknown>(() => {
@@ -468,7 +1661,9 @@ async function copyRowValues() {
   const row = displayRows.value[cellMenu.value.rowIndex]?.values;
   if (!row) return;
   try {
-    await writeClipboard(row.map(formatCell).join("\t"));
+    await writeClipboard(
+      visibleIndices.value.map((index) => formatCell(row[index])).join("\t"),
+    );
     showMessage("已复制整行");
   } catch (reason) {
     error.value = `复制失败: ${reason}`;
@@ -496,12 +1691,13 @@ async function copyAs(kind: "insert" | "update" | "json") {
   const row = menuRow();
   if (!row) return;
 
+  const projected = visibleIndices.value.map((index) => row[index]);
   let text: string;
   let label: string;
   if (kind === "insert") {
     text = buildRowInsert(
-      columns.value,
-      row,
+      visibleColumns.value,
+      projected,
       driverKind.value,
       tableIdentifier(),
     );
@@ -509,8 +1705,8 @@ async function copyAs(kind: "insert" | "update" | "json") {
   } else if (kind === "update") {
     if (updateCopyReason.value) return;
     const sql = buildRowUpdate(
-      columns.value,
-      row,
+      visibleColumns.value,
+      projected,
       driverKind.value,
       tableIdentifier(),
     );
@@ -518,10 +1714,7 @@ async function copyAs(kind: "insert" | "update" | "json") {
     text = sql;
     label = "UPDATE";
   } else {
-    text = buildRowJson(
-      columns.value.map((column) => column.name),
-      row,
-    );
+    text = buildRowJson(visibleColumnNames.value, projected);
     label = "JSON";
   }
 
@@ -572,13 +1765,16 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  cleanupColumnDrag();
+  flushColumnOrderSave();
   window.clearTimeout(messageTimer);
+  window.clearTimeout(findTimer);
   window.removeEventListener("click", closeCellMenu);
   window.removeEventListener("keydown", onGlobalKey);
   stopResize();
 });
 
-async function load(nextOffset = offset.value) {
+async function load(nextOffset = offset.value): Promise<boolean> {
   loading.value = true;
   error.value = "";
   try {
@@ -593,6 +1789,18 @@ async function load(nextOffset = offset.value) {
       sorts.value,
     );
     columns.value = pageData.columns;
+    if (pendingColumnView) {
+      const view = pendingColumnView;
+      pendingColumnView = null;
+      applyProfileColumns(view);
+    } else {
+      restoreFrozenColumns();
+      normalizeHiddenColumns();
+      columnOrder.value = normalizeColumnOrder(
+        columnOrder.value,
+        profileKeys.value,
+      );
+    }
     rows.value = pageData.rows;
     total.value = pageData.total;
     offset.value = pageData.offset;
@@ -601,37 +1809,33 @@ async function load(nextOffset = offset.value) {
     );
     selectedRows.value = new Set();
     selectionAnchor = null;
+    detailOpen.value = false;
+    resetHistory();
+    void ensureForeignKeys();
     scrollToTop();
+    return true;
   } catch (reason) {
     rows.value = [];
     total.value = 0;
     error.value = String(reason);
+    emit("connection-error", error.value);
+    return false;
   } finally {
     loading.value = false;
   }
 }
 
 watch(
-  [() => props.connectionId, () => props.table],
+  [
+    () => props.connectionId,
+    () => props.table,
+    () => props.database,
+    () => props.schema,
+    () => props.tableKind,
+  ],
   () => {
-    clearMessage();
-    sorts.value = [];
-    filterOpen.value = false;
-    filterDraft.value = "";
-    appliedFilter.value = "";
-    for (const key of Object.keys(columnWidths)) {
-      delete columnWidths[key];
-    }
-    cellMenu.value = null;
-    columns.value = [];
-    rows.value = [];
-    total.value = 0;
-    clearPendingState();
-    rows.value = [];
-    const saved = readSavedPageSize();
-    limit.value = saved;
-    pageInput.value = "1";
-    void load(0);
+    // Defer past setup: initializeScope reads computeds declared later.
+    void nextTick(() => initializeScope());
   },
   { immediate: true },
 );
@@ -661,6 +1865,369 @@ function savePageSize(size: number) {
   } catch {
     // Page size persistence is best-effort.
   }
+}
+
+const viewScope = computed(() =>
+  tableViewScopeKey(
+    driverKind.value,
+    props.connectionId,
+    props.database,
+    props.schema,
+    props.table,
+    props.tableKind ?? "table",
+  ),
+);
+
+function keyByColumnName(): Map<string, string> {
+  const map = new Map<string, string>();
+  profileKeys.value.forEach((key, index) => {
+    const name = columns.value[index]?.name;
+    if (name && !map.has(name)) map.set(name, key);
+  });
+  return map;
+}
+
+function currentViewConfig() {
+  const widths: Record<string, number> = {};
+  profileKeys.value.forEach((key, index) => {
+    const value =
+      columnWidths[key] ?? columnWidths[columns.value[index]?.name ?? ""];
+    if (value) widths[key] = Math.round(value);
+  });
+  const keyByName = keyByColumnName();
+  return {
+    filter: appliedFilter.value.trim(),
+    sorts: sorts.value.map((sort) => ({ ...sort })),
+    limit: limit.value,
+    widths,
+    hidden: hiddenNames.value
+      .map((name) => keyByName.get(name))
+      .filter((key): key is string => Boolean(key)),
+    frozen: frozenNames.value
+      .map((name) => keyByName.get(name))
+      .filter((key): key is string => Boolean(key)),
+    order: normalizeColumnOrder(columnOrder.value, profileKeys.value),
+  };
+}
+
+function currentViewSignature(): string {
+  return tableViewSignature(currentViewConfig());
+}
+
+const viewDirty = computed(
+  () =>
+    Boolean(activeViewId.value) &&
+    Boolean(viewBaseline.value) &&
+    currentViewSignature() !== viewBaseline.value,
+);
+
+function readViewState() {
+  const state = loadTableViewState(viewScope.value);
+  viewProfiles.value = state.profiles;
+  defaultViewId.value = state.defaultId;
+  activeViewId.value = null;
+  viewBaseline.value = null;
+}
+
+function persistViewState(): boolean {
+  const saved = saveTableViewState(viewScope.value, {
+    profiles: viewProfiles.value,
+    activeId: activeViewId.value,
+    defaultId: defaultViewId.value,
+  });
+  if (!saved) {
+    showMessage("视图配置保存失败：本地存储不可用或已满");
+  }
+  return saved;
+}
+
+function sortViewProfiles() {
+  viewProfiles.value = [...viewProfiles.value].sort(
+    (left, right) => right.updatedAt - left.updatedAt,
+  );
+}
+
+function applyProfileSettings(
+  profile: TableViewProfile,
+  validateSorts: boolean,
+): number {
+  const names = new Set(columns.value.map((column) => column.name));
+  const before = profile.sorts.length;
+  sorts.value = validateSorts
+    ? profile.sorts.filter((sort) => names.has(sort.column))
+    : profile.sorts.map((sort) => ({ ...sort }));
+  const missingSorts = before - sorts.value.length;
+  appliedFilter.value = profile.filter;
+  filterDraft.value = profile.filter;
+  filterOpen.value = Boolean(profile.filter);
+  limit.value = TABLE_VIEW_PAGE_SIZES.includes(profile.limit)
+    ? profile.limit
+    : 100;
+  pageInput.value = "1";
+  savePageSize(limit.value);
+  return missingSorts;
+}
+
+function applyProfileColumns(profile: TableViewProfile): number {
+  const keyIndices = new Map(
+    profileKeys.value.map((key, index) => [key, index]),
+  );
+  let dropped = 0;
+  for (const key of Object.keys(columnWidths)) {
+    delete columnWidths[key];
+  }
+  for (const [key, width] of Object.entries(profile.widths)) {
+    const index = keyIndices.get(key);
+    if (index === undefined) {
+      dropped += 1;
+      continue;
+    }
+    columnWidths[key] = Math.max(
+      60,
+      Math.min(600, Math.round(width)),
+    );
+  }
+  const hidden: string[] = [];
+  for (const key of profile.hidden) {
+    const index = keyIndices.get(key);
+    if (index === undefined) {
+      dropped += 1;
+      continue;
+    }
+    const name = columns.value[index]?.name;
+    if (name) hidden.push(name);
+  }
+  hiddenNames.value = hidden;
+  normalizeHiddenColumns();
+  const frozen: string[] = [];
+  for (const key of profile.frozen) {
+    const index = keyIndices.get(key);
+    if (index === undefined) {
+      dropped += 1;
+      continue;
+    }
+    const name = columns.value[index]?.name;
+    if (name) frozen.push(name);
+  }
+  applyFrozenNames(frozen);
+  persistFrozenColumns();
+  columnOrder.value = normalizeColumnOrder(
+    profile.order?.length ? profile.order : columnOrder.value,
+    profileKeys.value,
+  );
+  return dropped;
+}
+
+interface ViewSnapshot {
+  filter: string;
+  sorts: TableSort[];
+  limit: number;
+  widths: Record<string, number>;
+  hidden: string[];
+  frozen: string[];
+  order: string[];
+  offset: number;
+  activeId: string | null;
+  baseline: string | null;
+}
+
+function captureViewSnapshot(): ViewSnapshot {
+  return {
+    filter: appliedFilter.value,
+    sorts: sorts.value.map((sort) => ({ ...sort })),
+    limit: limit.value,
+    widths: { ...columnWidths },
+    hidden: [...hiddenNames.value],
+    frozen: [...frozenNames.value],
+    order: [...columnOrder.value],
+    offset: offset.value,
+    activeId: activeViewId.value,
+    baseline: viewBaseline.value,
+  };
+}
+
+function restoreViewSnapshot(snapshot: ViewSnapshot) {
+  appliedFilter.value = snapshot.filter;
+  filterDraft.value = snapshot.filter;
+  filterOpen.value = Boolean(snapshot.filter);
+  sorts.value = snapshot.sorts.map((sort) => ({ ...sort }));
+  limit.value = snapshot.limit;
+  savePageSize(snapshot.limit);
+  for (const key of Object.keys(columnWidths)) {
+    delete columnWidths[key];
+  }
+  Object.assign(columnWidths, snapshot.widths);
+  hiddenNames.value = [...snapshot.hidden];
+  columnOrder.value = [...snapshot.order];
+  applyFrozenNames(snapshot.frozen);
+  persistFrozenColumns();
+  activeViewId.value = snapshot.activeId;
+  viewBaseline.value = snapshot.baseline;
+  pendingColumnView = null;
+}
+
+function applyView(id: string) {
+  const profile = viewProfiles.value.find((item) => item.id === id);
+  if (!profile || !columns.value.length) return;
+  ensureClean("应用表视图", async () => {
+    const snapshot = captureViewSnapshot();
+    const missingSorts = applyProfileSettings(profile, true);
+    pendingColumnView = profile;
+    const ok = await load(0);
+    if (!ok) {
+      const failure = error.value || "读取失败";
+      restoreViewSnapshot(snapshot);
+      await load(snapshot.offset);
+      showMessage(`应用视图失败：${failure}；已恢复原状态`);
+      return;
+    }
+    activeViewId.value = profile.id;
+    viewBaseline.value = currentViewSignature();
+    const notes: string[] = [];
+    if (missingSorts) notes.push(`忽略 ${missingSorts} 个失效排序`);
+    showMessage(
+      `已应用视图「${profile.name}」${notes.length ? `（${notes.join("，")}）` : ""}`,
+    );
+  });
+}
+
+function saveView(name: string, makeDefault: boolean) {
+  if (viewProfiles.value.length >= MAX_PROFILES_PER_TABLE) {
+    showMessage(`每张表最多 ${MAX_PROFILES_PER_TABLE} 个视图`);
+    return;
+  }
+  const profile = createTableViewProfile(name, currentViewConfig());
+  viewProfiles.value = [profile, ...viewProfiles.value];
+  sortViewProfiles();
+  activeViewId.value = profile.id;
+  if (makeDefault) defaultViewId.value = profile.id;
+  viewBaseline.value = currentViewSignature();
+  if (persistViewState()) {
+    showMessage(`已保存视图「${profile.name}」`);
+  }
+}
+
+function updateView() {
+  const id = activeViewId.value;
+  if (!id) return;
+  const current = viewProfiles.value.find((profile) => profile.id === id);
+  if (!current) return;
+  const config = currentViewConfig();
+  viewProfiles.value = viewProfiles.value.map((profile) =>
+    profile.id === id
+      ? {
+          ...profile,
+          ...config,
+          name: profile.name,
+          updatedAt: Date.now(),
+        }
+      : profile,
+  );
+  sortViewProfiles();
+  viewBaseline.value = currentViewSignature();
+  if (persistViewState()) {
+    showMessage(`已更新视图「${current.name}」`);
+  }
+}
+
+function renameView(id: string, name: string) {
+  viewProfiles.value = viewProfiles.value.map((profile) =>
+    profile.id === id
+      ? { ...profile, name: name.trim(), updatedAt: Date.now() }
+      : profile,
+  );
+  sortViewProfiles();
+  persistViewState();
+}
+
+function deleteView(id: string) {
+  const removed = viewProfiles.value.find((profile) => profile.id === id);
+  viewProfiles.value = viewProfiles.value.filter(
+    (profile) => profile.id !== id,
+  );
+  if (activeViewId.value === id) {
+    activeViewId.value = null;
+    viewBaseline.value = null;
+  }
+  if (defaultViewId.value === id) defaultViewId.value = null;
+  if (persistViewState() && removed) {
+    showMessage(`已删除视图「${removed.name}」`);
+  }
+}
+
+function setDefaultView(id: string | null) {
+  defaultViewId.value = id;
+  persistViewState();
+  const profile = viewProfiles.value.find((item) => item.id === id);
+  showMessage(
+    profile
+      ? `已将「${profile.name}」设为默认视图`
+      : "已取消默认视图",
+  );
+}
+
+async function initializeScope() {
+  flushColumnOrderSave();
+  cleanupColumnDrag();
+  clearMessage();
+  sorts.value = [];
+  const initialFilter = props.initialFilter?.trim() ?? "";
+  filterOpen.value = Boolean(initialFilter);
+  filterDraft.value = initialFilter;
+  appliedFilter.value = initialFilter;
+  for (const key of Object.keys(columnWidths)) {
+    delete columnWidths[key];
+  }
+  hiddenNames.value = [];
+  columnOrder.value = loadColumnOrder(tableOrderScope.value);
+  cellMenu.value = null;
+  headerMenu.value = null;
+  columns.value = [];
+  rows.value = [];
+  total.value = 0;
+  clearPendingState();
+  pendingColumnView = null;
+  readViewState();
+  const saved = readSavedPageSize();
+  limit.value = saved;
+  pageInput.value = "1";
+
+  const defaultProfile = !initialFilter
+    ? viewProfiles.value.find((profile) => profile.id === defaultViewId.value)
+    : null;
+  if (!defaultProfile) {
+    await load(0);
+    return;
+  }
+
+  applyProfileSettings(defaultProfile, false);
+  pendingColumnView = defaultProfile;
+  activeViewId.value = defaultProfile.id;
+  const ok = await load(0);
+  if (ok) {
+    viewBaseline.value = currentViewSignature();
+    return;
+  }
+
+  const failure = error.value || "读取失败";
+  sorts.value = [];
+  appliedFilter.value = initialFilter;
+  filterDraft.value = initialFilter;
+  filterOpen.value = false;
+  limit.value = saved;
+  savePageSize(saved);
+  hiddenNames.value = [];
+  columnOrder.value = loadColumnOrder(tableOrderScope.value);
+  for (const key of Object.keys(columnWidths)) {
+    delete columnWidths[key];
+  }
+  applyFrozenNames([]);
+  persistFrozenColumns();
+  activeViewId.value = null;
+  viewBaseline.value = null;
+  pendingColumnView = null;
+  await load(0);
+  showMessage(`默认视图应用失败：${failure}；已恢复默认条件`);
 }
 
 function applyFilter() {
@@ -825,6 +2392,7 @@ function commitEdit() {
     editing.value = null;
     return;
   }
+  recordHistory();
   setCellPending(
     current.rowIndex,
     current.colIndex,
@@ -839,6 +2407,7 @@ function deleteRow(rowIndex: number) {
   const row = displayRows.value[rowIndex];
   if (!row) return;
   if (row.origin === null) {
+    recordHistory();
     pendingInserts.value = pendingInserts.value.filter(
       (draft) => draft.id !== row.insertId,
     );
@@ -849,15 +2418,13 @@ function deleteRow(rowIndex: number) {
     restoreRow(rowIndex);
     return;
   }
+  recordHistory();
   pendingDeletes.value = new Set([
     ...pendingDeletes.value,
     row.origin,
   ]);
-  if (updates.value[row.origin]) {
-    const next = { ...updates.value };
-    delete next[row.origin];
-    updates.value = next;
-  }
+  // Keep updates for this row: a delete can be undone with restoreRow(), and
+  // buildPendingChanges() already skips updates for deleted rows.
   editing.value = null;
   showMessage("已标记删除，提交后生效");
 }
@@ -865,6 +2432,8 @@ function deleteRow(rowIndex: number) {
 function restoreRow(rowIndex: number) {
   const row = displayRows.value[rowIndex];
   if (!row || row.origin === null) return;
+  if (!pendingDeletes.value.has(row.origin)) return;
+  recordHistory();
   const next = new Set(pendingDeletes.value);
   next.delete(row.origin);
   pendingDeletes.value = next;
@@ -885,20 +2454,19 @@ function confirmBatchDelete() {
   if (!count) return;
   const deletes = new Set(pendingDeletes.value);
   const insertsToRemove = new Set<number>();
+  let changed = false;
   for (const index of selectedRows.value) {
     const row = displayRows.value[index];
     if (!row || row.state === "delete") continue;
+    changed = true;
     if (row.origin === null) {
       if (row.insertId !== undefined) insertsToRemove.add(row.insertId);
     } else {
       deletes.add(row.origin);
-      if (updates.value[row.origin]) {
-        const next = { ...updates.value };
-        delete next[row.origin];
-        updates.value = next;
-      }
     }
   }
+  if (!changed) return;
+  recordHistory();
   pendingDeletes.value = deletes;
   if (insertsToRemove.size) {
     pendingInserts.value = pendingInserts.value.filter(
@@ -930,6 +2498,7 @@ function submitInsert() {
       values[index] = parseInput(insertValues[column.name] ?? "", column);
     }
   }
+  recordHistory();
   pendingInserts.value = [
     ...pendingInserts.value,
     { id: ++insertDraftSequence, values },
@@ -1047,6 +2616,7 @@ function clearPendingState() {
   selectedRows.value = new Set();
   selectionAnchor = null;
   editing.value = null;
+  resetHistory();
 }
 
 function discardPendingChanges() {
@@ -1164,6 +2734,16 @@ function batchSetValue(columnName: string, rawValue: string, useNull: boolean) {
   const index = columnIndex(columnName);
   if (index < 0) return;
   const value = useNull ? null : parseInput(rawValue, column);
+  const hasTarget = [...selectedRows.value].some(
+    (rowIndex) =>
+      displayRows.value[rowIndex] &&
+      rowState(rowIndex) !== "delete",
+  );
+  if (!hasTarget) {
+    batchSetOpen.value = false;
+    return;
+  }
+  recordHistory();
   for (const rowIndex of selectedRows.value) {
     if (rowState(rowIndex) === "delete") continue;
     const row = displayRows.value[rowIndex];
@@ -1194,6 +2774,7 @@ function cloneSelectedRows() {
     clones.push({ id: ++insertDraftSequence, values });
   }
   if (!clones.length) return;
+  recordHistory();
   pendingInserts.value = [...pendingInserts.value, ...clones];
   showMessage(`已克隆 ${clones.length} 行到待提交新增`);
 }
@@ -1201,24 +2782,26 @@ function cloneSelectedRows() {
 async function copySelectedRows(as: "tsv" | "json") {
   const selected = [...selectedRows.value]
     .map((index) => displayRows.value[index])
-    .filter((row): row is DisplayRow => Boolean(row));
+    .filter(
+      (row): row is DisplayRow => Boolean(row) && row.state !== "delete",
+    );
   if (!selected.length) return;
   try {
     if (as === "tsv") {
-      const header = columns.value
-        .map((column) => column.name)
-        .join("\t");
+      const header = visibleColumnNames.value.join("\t");
       const lines = selected.map((row) =>
-        row.values.map(formatCell).join("\t"),
+        visibleIndices.value
+          .map((index) => formatCell(row.values[index]))
+          .join("\t"),
       );
       await writeClipboard([header, ...lines].join("\n"));
       showMessage(`已复制 ${selected.length} 行为 TSV`);
     } else {
       const payload = selected.map((row) =>
         Object.fromEntries(
-          columns.value.map((column, index) => [
-            column.name,
-            row.values[index] ?? null,
+          visibleColumnEntries.value.map((entry) => [
+            entry.column.name,
+            row.values[entry.index] ?? null,
           ]),
         ),
       );
@@ -1252,8 +2835,8 @@ function csvEscape(value: unknown): string {
 }
 
 async function exportCsv() {
-  const lines = [columns.value.map((column) => csvEscape(column.name)).join(",")];
-  for (const row of rows.value) {
+  const lines = [visibleColumnNames.value.map(csvEscape).join(",")];
+  for (const row of pageVisibleRows.value) {
     lines.push(row.map(csvEscape).join(","));
   }
 
@@ -1281,8 +2864,8 @@ async function exportJson() {
   try {
     const payload = {
       table: props.table,
-      columns: columns.value,
-      rows: rows.value,
+      columns: visibleColumnNames.value,
+      rows: pageVisibleRows.value,
     };
     await api.writeTextFile(path, JSON.stringify(payload, null, 2));
     showMessage(`已导出当前页到 ${path}`);
@@ -1300,8 +2883,8 @@ async function exportXlsx() {
 
   try {
     const summary = await api.exportQueryResultXlsx(
-      columns.value.map((column) => column.name),
-      rows.value,
+      visibleColumnNames.value,
+      pageVisibleRows.value,
       path,
       props.table,
       true,
@@ -1367,7 +2950,7 @@ defineExpose({
 </script>
 
 <template>
-  <section class="data-view">
+  <section ref="rootRef" class="data-view">
     <header class="data-toolbar">
       <div class="data-title">
         <strong>{{ table }}</strong>
@@ -1386,17 +2969,52 @@ defineExpose({
         </span>
       </div>
       <div class="data-actions">
-        <template v-if="pendingCount">
-          <span class="pending-badge">{{ pendingCount }} 项待提交</span>
-          <button class="button ghost compact" :disabled="saving" @click="previewOpen = true">
-            查看 SQL
+        <TableViewMenu
+          :key="viewScope"
+          :profiles="viewProfiles"
+          :active-id="activeViewId"
+          :default-id="defaultViewId"
+          :dirty="viewDirty"
+          :disabled="loading || saving || !columns.length"
+          :scope-label="databaseLabel || ''"
+          @apply="applyView"
+          @save="saveView"
+          @update="updateView"
+          @rename="renameView"
+          @remove="deleteView"
+          @set-default="setDefaultView"
+        />
+        <template v-if="pendingCount || canUndo || canRedo">
+          <button
+            class="icon-button"
+            title="撤销上一步（⌘/Ctrl+Z）"
+            aria-label="撤销上一步"
+            :disabled="!canUndo || saving"
+            @click="undo"
+          >
+            <Icon name="undo" :size="14" />
           </button>
-          <button class="button primary compact" :disabled="saving" @click="submitPendingChanges">
-            {{ saving ? "提交中…" : "提交" }}
+          <button
+            class="icon-button"
+            title="重做（⌘/Ctrl+Shift+Z）"
+            aria-label="重做"
+            :disabled="!canRedo || saving"
+            @click="redo"
+          >
+            <Icon name="redo" :size="14" />
           </button>
-          <button class="button ghost compact" :disabled="saving" @click="discardPendingChanges">
-            放弃
-          </button>
+          <template v-if="pendingCount">
+            <span class="pending-badge">{{ pendingCount }} 项待提交</span>
+            <button class="button ghost compact" :disabled="saving" @click="previewOpen = true">
+              查看 SQL
+            </button>
+            <button class="button primary compact" :disabled="saving" @click="submitPendingChanges">
+              {{ saving ? "提交中…" : "提交" }}
+            </button>
+            <button class="button ghost compact" :disabled="saving" @click="discardPendingChanges">
+              放弃
+            </button>
+          </template>
         </template>
         <button
           class="button ghost compact"
@@ -1408,6 +3026,24 @@ defineExpose({
         </button>
         <button
           class="button ghost compact"
+          :disabled="!displayRows.length"
+          title="查看当前行详情"
+          @click="openDetailFromToolbar"
+        >
+          <Icon name="view" :size="14" />
+          行详情
+        </button>
+        <button
+          class="button ghost compact"
+          :disabled="loading || !rows.length"
+          title="按列剖析当前页（非全表，不含待提交修改）"
+          @click="profileOpen = true"
+        >
+          <Icon name="list" :size="14" />
+          剖析当前页
+        </button>
+        <button
+          class="button ghost compact"
           :disabled="!columns.length || readOnly"
           @click="openInsert"
         >
@@ -1416,11 +3052,29 @@ defineExpose({
         </button>
         <button
           class="button ghost compact"
+          :disabled="!columns.length"
+          title="按当前页 / 选中行 / 全部匹配导出"
+          @click="tableExportOpen = true"
+        >
+          <Icon name="download" :size="14" />
+          导出…
+        </button>
+        <button
+          class="button ghost compact"
           :disabled="importing || readOnly"
           @click="emit('import-data')"
         >
           <Icon name="upload" :size="14" />
           {{ importing ? "导入中…" : "导入数据…" }}
+        </button>
+        <button
+          class="button ghost compact"
+          :disabled="Boolean(pasteDisabledReason)"
+          :title="pasteDisabledReason || '从剪贴板粘贴多行到待提交'"
+          @click="openPasteDialog"
+        >
+          <Icon name="paste" :size="14" />
+          粘贴新增…
         </button>
         <button
           class="button ghost compact"
@@ -1463,6 +3117,15 @@ defineExpose({
     </header>
 
     <div class="data-filterbar">
+      <button
+        class="button ghost compact filter-toggle"
+        :class="{ active: findOpen }"
+        title="查找当前页（⌘/Ctrl+F）"
+        @click="focusSearch"
+      >
+        <Icon name="search" :size="14" />
+        查找
+      </button>
       <button
         class="button ghost compact filter-toggle"
         :class="{ active: filterOpen || appliedFilter }"
@@ -1508,6 +3171,21 @@ defineExpose({
         已筛选
       </span>
       <span v-else class="filter-meta">全部行</span>
+      <button
+        v-if="hiddenColumnCount"
+        class="link-button hidden-columns-badge"
+        :title="`已隐藏 ${hiddenColumnCount} 列，点击恢复全部列`"
+        @click="showAllColumns"
+      >
+        已隐藏 {{ hiddenColumnCount }} 列 · 显示全部
+      </button>
+      <span
+        v-if="linkedFilterLabel && appliedFilter"
+        class="filter-meta linked-filter-meta"
+        :title="`来自 ${linkedFilterLabel}`"
+      >
+        来自 {{ linkedFilterLabel }}
+      </span>
       <div class="spacer"></div>
       <div v-if="sorts.length" class="sort-chips">
         <button
@@ -1523,6 +3201,23 @@ defineExpose({
         <button class="sort-chip clear" @click="clearSorts">清除排序</button>
       </div>
     </div>
+
+    <GridFindBar
+      v-if="findOpen"
+      ref="findBar"
+      :query="findQuery"
+      :case-sensitive="findCaseSensitive"
+      :match-count="findMatches.length"
+      :row-count="findRowCount"
+      :current="findIndex"
+      :scope-hint="findScopeHint"
+      placeholder="查找当前页…"
+      @update:query="findQuery = $event"
+      @update:case-sensitive="findCaseSensitive = $event"
+      @next="nextMatch"
+      @prev="previousMatch"
+      @close="closeSearch"
+    />
 
     <div v-if="selectedCount" class="data-selectionbar">
       <span>已选 {{ selectedCount }} 行</span>
@@ -1594,9 +3289,9 @@ defineExpose({
           <col style="width: 32px" />
           <col style="width: 44px" />
           <col
-            v-for="column in columns"
-            :key="column.name"
-            :style="{ width: columnWidth(column.name) + 'px' }"
+            v-for="cellEntry in visibleColumnEntries"
+            :key="cellEntry.index"
+            :style="{ width: columnWidthAt(cellEntry.index) + 'px' }"
           />
         </colgroup>
         <thead>
@@ -1611,36 +3306,74 @@ defineExpose({
             </th>
             <th class="row-index">#</th>
             <th
-              v-for="column in columns"
-              :key="column.name"
+              v-for="cellEntry in visibleColumnEntries"
+              :key="cellEntry.index"
+              :data-col-index="cellEntry.index"
               class="sortable"
+              :class="{
+                'frozen-head': frozenIndices.includes(cellEntry.index),
+                'frozen-boundary': cellEntry.index === lastFrozenIndex,
+                'col-dragging':
+                  columnDragState?.index === cellEntry.index,
+                'col-drop-before':
+                  columnDragState?.target === cellEntry.index &&
+                  !columnDragState.after,
+                'col-drop-after':
+                  columnDragState?.target === cellEntry.index &&
+                  columnDragState.after,
+              }"
+              :style="
+                frozenLeft[cellEntry.index] !== undefined
+                  ? { left: `${frozenLeft[cellEntry.index]}px` }
+                  : undefined
+              "
               tabindex="0"
               :aria-sort="
-                sortDirectionFor(column.name) === 'asc'
+                sortDirectionFor(cellEntry.column.name) === 'asc'
                   ? 'ascending'
-                  : sortDirectionFor(column.name) === 'desc'
+                  : sortDirectionFor(cellEntry.column.name) === 'desc'
                     ? 'descending'
                     : 'none'
               "
-              @click="toggleSort(column.name, $event.shiftKey)"
-              @keydown.enter.prevent="toggleSort(column.name, $event.shiftKey)"
-              @keydown.space.prevent="toggleSort(column.name, $event.shiftKey)"
+              @mousedown="startColumnDrag($event, cellEntry.index)"
+              @click="handleHeaderClick(cellEntry.column.name, $event.shiftKey)"
+              @keydown.enter.prevent="
+                toggleSort(cellEntry.column.name, $event.shiftKey)
+              "
+              @keydown.space.prevent="
+                toggleSort(cellEntry.column.name, $event.shiftKey)
+              "
+              @contextmenu.prevent="openHeaderMenu($event, cellEntry.index)"
             >
               <span class="column-head">
-                <span>{{ column.name }}</span>
-                <span v-if="column.primaryKey" class="pk-badge">PK</span>
+                <span>{{ cellEntry.column.name }}</span>
+                <span v-if="cellEntry.column.primaryKey" class="pk-badge">PK</span>
+                <span
+                  v-if="cellEntry.index === lastFrozenIndex"
+                  class="frozen-pin"
+                  role="img"
+                  :aria-label="`已冻结 ${frozenColumns.length} 列`"
+                  :title="`已冻结 ${frozenColumns.length} 列`"
+                >
+                  <Icon name="pin" :size="11" />
+                </span>
                 <Icon
-                  v-if="sortDirectionFor(column.name)"
-                  :name="sortDirectionFor(column.name) === 'asc' ? 'chevron-up' : 'chevron-down'"
+                  v-if="sortDirectionFor(cellEntry.column.name)"
+                  :name="
+                    sortDirectionFor(cellEntry.column.name) === 'asc'
+                      ? 'chevron-up'
+                      : 'chevron-down'
+                  "
                   :size="12"
                   class="sort-icon"
                 />
               </span>
-              <span class="column-type">{{ column.dataType }}</span>
+              <span class="column-type">{{ cellEntry.column.dataType }}</span>
               <span
                 class="col-resizer"
-                title="拖拽调整列宽"
-                @mousedown="startResize($event, column.name)"
+                title="拖拽调整列宽，双击恢复默认"
+                @mousedown="startResize($event, cellEntry.index)"
+                @dblclick.stop="resetColumnWidth(cellEntry.index)"
                 @click.stop
               ></span>
             </th>
@@ -1653,7 +3386,7 @@ defineExpose({
             aria-hidden="true"
           >
             <td
-              :colspan="columns.length + 2"
+              :colspan="visibleColumnEntries.length + 2"
               :style="{ height: `${virtualPaddingTop}px` }"
             ></td>
           </tr>
@@ -1676,27 +3409,37 @@ defineExpose({
             </td>
             <td class="row-index">{{ offset + entry.index + 1 }}</td>
             <td
-              v-for="(cell, colIndex) in entry.row.values"
-              :key="colIndex"
+              v-for="cellEntry in visibleColumnEntries"
+              :key="cellEntry.index"
               :class="{
-                null: isNull(cell),
-                num: typeof cell === 'number',
+                null: isNull(entry.row.values[cellEntry.index]),
+                num: typeof entry.row.values[cellEntry.index] === 'number',
                 editable: canEdit,
-                modified: isCellModified(entry.index, colIndex),
+                modified: isCellModified(entry.index, cellEntry.index),
+                'grid-match-active':
+                  currentMatch?.rowIndex === entry.index &&
+                  currentMatch?.columnIndex === cellEntry.index,
+                'frozen-cell': frozenIndices.includes(cellEntry.index),
+                'frozen-boundary': cellEntry.index === lastFrozenIndex,
               }"
-              :title="formatCell(cell)"
+              :style="
+                frozenLeft[cellEntry.index] !== undefined
+                  ? { left: `${frozenLeft[cellEntry.index]}px` }
+                  : undefined
+              "
+              :title="formatCell(entry.row.values[cellEntry.index])"
               tabindex="-1"
-              :data-cell="`${entry.index}:${colIndex}`"
-              @dblclick="startEdit(entry.index, colIndex)"
+              :data-cell="`${entry.index}:${cellEntry.index}`"
+              @dblclick="startEdit(entry.index, cellEntry.index)"
               @contextmenu.prevent="
-                openCellMenu($event, entry.index, colIndex)
+                openCellMenu($event, entry.index, cellEntry.index)
               "
             >
               <input
                 v-if="
                   editing &&
                   editing.rowIndex === entry.index &&
-                  editing.colIndex === colIndex
+                  editing.colIndex === cellEntry.index
                 "
                 v-model="editing.value"
                 v-focus
@@ -1705,7 +3448,19 @@ defineExpose({
                 @keydown.esc.prevent="editing = null"
                 @blur="commitEdit"
               />
-              <template v-else>{{ formatCell(cell) }}</template>
+              <template v-else-if="highlightFor(entry.index, cellEntry.index)">
+                <span
+                  v-for="(segment, segmentIndex) in highlightFor(
+                    entry.index,
+                    cellEntry.index,
+                  ) ?? []"
+                  :key="segmentIndex"
+                  :class="{ 'grid-match': segment.match }"
+                >{{ segment.text }}</span>
+              </template>
+              <template v-else>{{
+                formatCell(entry.row.values[cellEntry.index])
+              }}</template>
             </td>
           </tr>
           <tr
@@ -1714,7 +3469,7 @@ defineExpose({
             aria-hidden="true"
           >
             <td
-              :colspan="columns.length + 2"
+              :colspan="visibleColumnEntries.length + 2"
               :style="{ height: `${virtualPaddingBottom}px` }"
             ></td>
           </tr>
@@ -1927,6 +3682,97 @@ defineExpose({
     />
 
     <div
+      v-if="headerMenu"
+      class="context-menu"
+      role="menu"
+      :style="{ left: headerMenu.x + 'px', top: headerMenu.y + 'px' }"
+      @click.stop
+    >
+      <button
+        class="context-menu-item"
+        :disabled="!canMoveHeader('first')"
+        aria-label="移到最前"
+        @click="moveHeaderColumn('first')"
+      >
+        <Icon name="chevron-up" :size="14" />
+        移到最前
+      </button>
+      <button
+        class="context-menu-item"
+        :disabled="!canMoveHeader('left')"
+        aria-label="左移一列"
+        @click="moveHeaderColumn('left')"
+      >
+        <Icon name="chevron-left" :size="14" />
+        左移
+      </button>
+      <button
+        class="context-menu-item"
+        :disabled="!canMoveHeader('right')"
+        aria-label="右移一列"
+        @click="moveHeaderColumn('right')"
+      >
+        <Icon name="chevron-right" :size="14" />
+        右移
+      </button>
+      <button
+        class="context-menu-item"
+        :disabled="!canMoveHeader('last')"
+        aria-label="移到最后"
+        @click="moveHeaderColumn('last')"
+      >
+        <Icon name="chevron-down" :size="14" />
+        移到最后
+      </button>
+      <div class="context-separator"></div>
+      <button
+        class="context-menu-item"
+        :disabled="!canFreezeColumn(headerMenu.colIndex)"
+        :title="
+          canFreezeColumn(headerMenu.colIndex)
+            ? undefined
+            : visibleColumns.length <= 1
+              ? '至少保留一列可滚动'
+              : '当前无需横向滚动'
+        "
+        @click="freezeColumn(headerMenu.colIndex)"
+      >
+        <Icon name="pin" :size="14" />
+        {{ frozenMenuLabel(headerMenu.colIndex) }}
+      </button>
+      <button
+        v-if="frozenIndices.length"
+        class="context-menu-item"
+        @click="unfreezeColumns"
+      >
+        <Icon name="close" :size="14" />
+        取消冻结
+      </button>
+      <div class="context-separator"></div>
+      <button
+        class="context-menu-item"
+        :disabled="!canHideColumn(headerMenu.colIndex)"
+        :title="
+          canHideColumn(headerMenu.colIndex)
+            ? undefined
+            : '至少保留一列可见'
+        "
+        @click="hideColumn(headerMenu.colIndex)"
+      >
+        <Icon name="close" :size="14" />
+        隐藏此列
+      </button>
+      <button
+        v-if="hiddenColumnCount"
+        class="context-menu-item"
+        @click="showAllColumns"
+      >
+        <Icon name="view" :size="14" />
+        显示所有列（{{ hiddenColumnCount }}）
+      </button>
+    </div>
+
+    <div
       v-if="cellMenu"
       class="context-menu"
       role="menu"
@@ -1937,6 +3783,81 @@ defineExpose({
         <Icon name="view" :size="14" />
         查看值…
       </button>
+      <button class="context-menu-item" @click="openDetailFromMenu">
+        <Icon name="list" :size="14" />
+        查看行详情…
+      </button>
+      <button
+        class="context-menu-item"
+        :disabled="Boolean(pasteDisabledReason)"
+        :title="pasteDisabledReason || '从剪贴板粘贴多行'"
+        @click="closeCellMenu(); openPasteDialog()"
+      >
+        <Icon name="paste" :size="14" />
+        粘贴新增行…
+      </button>
+      <template
+        v-if="
+          isTable &&
+          (foreignKeysLoading ||
+            foreignKeysError ||
+            outgoingLinks.length ||
+            incomingLinks.length)
+        "
+      >
+        <div class="context-separator"></div>
+        <span class="context-menu-label">关联</span>
+        <button
+          v-if="foreignKeysLoading"
+          class="context-menu-item"
+          disabled
+        >
+          正在加载关联信息…
+        </button>
+        <button
+          v-else-if="foreignKeysError"
+          class="context-menu-item"
+          @click="openForeignKeysFromMenu"
+        >
+          <Icon name="warning" :size="14" />
+          关联信息不可用，点击重试
+        </button>
+        <template v-else>
+          <button
+            v-for="link in outgoingLinks"
+            :key="`out-${link.key}`"
+            class="context-menu-item"
+            :disabled="!link.enabled"
+            :title="link.reason || `打开 ${link.foreignKey.referencedTable}`"
+            @click="openOutboundLink(link)"
+          >
+            <Icon name="external" :size="14" />
+            打开引用行 → {{ link.foreignKey.referencedTable }}（{{
+              link.foreignKey.referencedColumns.join(", ")
+            }}）
+          </button>
+          <button
+            v-for="link in incomingLinks.slice(0, 30)"
+            :key="`in-${link.key}`"
+            class="context-menu-item"
+            :disabled="!link.enabled"
+            :title="link.reason || `查看 ${link.foreignKey.table}`"
+            @click="openInboundLink(link)"
+          >
+            <Icon name="list" :size="14" />
+            查看引用记录 → {{ link.foreignKey.table }}.{{
+              link.foreignKey.columns.join(", ")
+            }}
+          </button>
+          <button
+            v-if="incomingLinks.length > 30"
+            class="context-menu-item"
+            disabled
+          >
+            引用过多（{{ incomingLinks.length }} 项），请从结构页查看
+          </button>
+        </template>
+      </template>
       <div class="context-separator"></div>
       <button class="context-menu-item" @click="copyCellValue">
         <Icon name="copy" :size="14" />
@@ -2015,6 +3936,65 @@ defineExpose({
         </button>
       </template>
     </div>
+
+    <ResultProfile
+      v-if="profileOpen"
+      dialog
+      :data="tableProfileData"
+      :table-page="tableProfilePage"
+      @close="profileOpen = false"
+    />
+
+    <TableDataExportDialog
+      :open="tableExportOpen"
+      :connection-id="connectionId"
+      :table="table"
+      :driver="driverKind"
+      :columns="columns.map((column) => column.name)"
+      :visible-columns="visibleColumnNames"
+      :page-rows="pageExportRows"
+      :selected-rows="selectedExportRows"
+      :total="total"
+      :filter="appliedFilter"
+      :sorts="sorts"
+      :has-pending-changes="hasPendingChanges"
+      :scope-label="databaseLabel || ''"
+      @close="tableExportOpen = false"
+      @exported="
+        tableExportOpen = false;
+        showMessage(`已导出 ${$event[1]} 行到 ${$event[0]}`);
+      "
+    />
+
+    <PasteRowsDialog
+      :open="pasteOpen"
+      :table="table"
+      :columns="columns"
+      :disabled-reason="pasteDisabledReason"
+      :pending-inserts="pendingInserts.length"
+      @close="pasteOpen = false"
+      @confirm="applyPastedRows"
+    />
+
+    <RowDetailPanel
+      :open="detailOpen"
+      :title="table"
+      :row-label="detailRowLabel"
+      :fields="detailFields"
+      :editable="detailEditable"
+      :read-only-reason="detailReadOnlyReason"
+      :row-state="detailRow?.state"
+      :can-previous="detailRowIndex > 0"
+      :can-next="detailRowIndex < displayRows.length - 1"
+      @close="closeRowDetail"
+      @previous="moveRowDetail(-1)"
+      @next="moveRowDetail(1)"
+      @edit="applyDetailEdit"
+      @set-null="setDetailNull"
+      @view-value="viewDetailValue"
+      @copy-value="copyDetailValue"
+      @copy-row-json="copyDetailRowJson"
+    />
 
     <CellValueDialog
       :open="Boolean(valueViewer)"

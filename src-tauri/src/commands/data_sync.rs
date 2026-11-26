@@ -706,17 +706,24 @@ fn canonical_value(value: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         ),
-        Value::Object(map) => format!(
-            "{{{}}}",
-            map.iter()
-                .map(|(key, item)| format!(
-                    "{}:{}",
-                    canonical_value(&Value::String(key.clone())),
-                    canonical_value(item)
-                ))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+        Value::Object(map) => {
+            // serde_json may be compiled with `preserve_order` (enabled by the
+            // BSON dependency), so never rely on map iteration order here.
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            format!(
+                "{{{}}}",
+                entries
+                    .into_iter()
+                    .map(|(key, item)| format!(
+                        "{}:{}",
+                        canonical_value(&Value::String(key.clone())),
+                        canonical_value(item)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
     }
 }
 

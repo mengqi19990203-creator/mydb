@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import ColumnEditorDialog from "./ColumnEditorDialog.vue";
 import ConfirmDialog from "./ConfirmDialog.vue";
 import ForeignKeyEditorDialog, {
@@ -29,6 +29,8 @@ const props = defineProps<{
   driver: Driver;
   kind?: string;
   focusIndex?: string | null;
+  focusColumn?: string | null;
+  focusColumnPulse?: number;
   readOnly?: boolean;
 }>();
 
@@ -50,6 +52,9 @@ const dropTarget = ref<{
 } | null>(null);
 const dropOpen = ref(false);
 const indexSection = ref<HTMLElement | null>(null);
+const columnSection = ref<HTMLElement | null>(null);
+const highlightedColumn = ref<string | null>(null);
+let columnHighlightTimer = 0;
 const foreignKeyOpen = ref(false);
 const availableTables = ref<TableInfo[]>([]);
 
@@ -100,6 +105,48 @@ async function scrollToFocusedIndex() {
 
 watch([() => props.focusIndex, structure], () => {
   void scrollToFocusedIndex();
+});
+
+async function scrollToFocusedColumn() {
+  window.clearTimeout(columnHighlightTimer);
+  highlightedColumn.value = null;
+  const target = props.focusColumn;
+  if (!target) return;
+  await nextTick();
+  if (!structure.value) return;
+  const rows = columnSection.value?.querySelectorAll<HTMLElement>(
+    "tr[data-column-name]",
+  );
+  const row = rows
+    ? Array.from(rows).find((item) => item.dataset.columnName === target)
+    : undefined;
+  if (!row) {
+    message.value = `结构中未找到字段 ${target}`;
+    return;
+  }
+  message.value = "";
+  row.scrollIntoView({ block: "center", behavior: "smooth" });
+  highlightedColumn.value = target;
+  columnHighlightTimer = window.setTimeout(() => {
+    highlightedColumn.value = null;
+  }, 1500);
+}
+
+watch(
+  [
+    () => props.focusColumn,
+    () => props.focusColumnPulse,
+    structure,
+    loading,
+  ],
+  () => {
+    void scrollToFocusedColumn();
+  },
+  { immediate: true },
+);
+
+onBeforeUnmount(() => {
+  window.clearTimeout(columnHighlightTimer);
 });
 
 function columnsLabel(columns: string[]): string {
@@ -307,7 +354,7 @@ async function confirmDrop() {
         <p v-if="message" class="data-message success">{{ message }}</p>
         <p v-if="actionError" class="data-message error">{{ actionError }}</p>
 
-        <section class="structure-section">
+        <section ref="columnSection" class="structure-section">
           <h3>字段 <span>{{ structure.columns.length }}</span></h3>
           <table class="structure-table">
             <thead>
@@ -323,7 +370,12 @@ async function confirmDrop() {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="column in structure.columns" :key="column.name">
+              <tr
+                v-for="column in structure.columns"
+                :key="column.name"
+                :data-column-name="column.name"
+                :class="{ 'column-focused': column.name === highlightedColumn }"
+              >
                 <td class="mono">{{ column.name }}</td>
                 <td class="mono">{{ column.dataType }}</td>
                 <td>{{ column.nullable ? "是" : "否" }}</td>

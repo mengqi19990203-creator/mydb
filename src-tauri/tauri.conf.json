@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "mydb",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "identifier": "com.mengqi.mydb",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -20,7 +20,10 @@
         "theme": "Dark",
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "trafficLightPosition": { "x": 16, "y": 14 },
+        "trafficLightPosition": {
+          "x": 16,
+          "y": 14
+        },
         "backgroundColor": "#18181b"
       }
     ],

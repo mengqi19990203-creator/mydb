@@ -109,6 +109,12 @@ export const SHORTCUTS: ShortcutEntry[] = [
   },
   {
     scope: "editor",
+    action: "打开光标处对象",
+    keys: "F12",
+    context: "表名 / 列名；也可 Cmd/Ctrl+Click",
+  },
+  {
+    scope: "editor",
     action: "格式化 SQL",
     keys: "Shift+Mod+F",
     context: "只格式化选区或光标所在语句",
@@ -153,6 +159,36 @@ export const SHORTCUTS: ShortcutEntry[] = [
     scope: "grid",
     action: "关闭单元格菜单",
     keys: "Escape",
+  },
+  {
+    scope: "grid",
+    action: "在已加载结果中查找",
+    keys: "Mod+F",
+    context: "结果网格 / 结果面板聚焦时",
+  },
+  {
+    scope: "table",
+    action: "查找当前页",
+    keys: "Mod+F",
+    context: "表数据页聚焦时",
+  },
+  {
+    scope: "table",
+    action: "撤销待提交编辑",
+    keys: "Mod+Z",
+    context: "表数据页聚焦时",
+  },
+  {
+    scope: "table",
+    action: "重做待提交编辑",
+    keys: "Shift+Mod+Z",
+    context: "表数据页聚焦时",
+  },
+  {
+    scope: "table",
+    action: "重做待提交编辑",
+    keys: "Ctrl+Y",
+    context: "Windows / Linux",
   },
   {
     scope: "table",

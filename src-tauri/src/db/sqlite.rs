@@ -1544,8 +1544,30 @@ async fn sqlite_foreign_keys(
             on_update,
         });
         entry.columns.push(from);
-        if let Some(to) = to {
+        if let Some(to) = to.filter(|value| !value.trim().is_empty()) {
             entry.referenced_columns.push(to);
+        }
+    }
+
+    for foreign_key in foreign_keys.values_mut() {
+        if foreign_key.referenced_columns.len() >= foreign_key.columns.len() {
+            continue;
+        }
+        let sql = format!(
+            "PRAGMA table_info({})",
+            quote_identifier(&foreign_key.referenced_table)
+        );
+        let columns = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(pool)
+            .await
+            .map_err(|error| format!("读取外键目标字段失败: {error}"))?;
+        let primary: Vec<String> = columns
+            .into_iter()
+            .filter(|row| row.try_get::<i64, _>("pk").unwrap_or(0) > 0)
+            .filter_map(|row| row.try_get::<String, _>("name").ok())
+            .collect();
+        if primary.len() == foreign_key.columns.len() {
+            foreign_key.referenced_columns = primary;
         }
     }
 
@@ -1586,6 +1608,77 @@ mod tests {
             .await
             .expect("connect");
         (dir, driver)
+    }
+
+    #[tokio::test]
+    async fn streams_filtered_sorted_export_rows() {
+        let (_dir, driver) = test_driver().await;
+        driver
+            .execute(
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER, status TEXT)",
+                1000,
+            )
+            .await
+            .expect("create");
+        driver
+            .execute(
+                "INSERT INTO orders (id, amount, status) VALUES (1, 30, 'paid'), (2, 10, 'paid'), (3, 20, 'new')",
+                1000,
+            )
+            .await
+            .expect("insert");
+        let mut rows = Vec::new();
+        let count = driver
+            .export_rows_filtered(
+                "orders",
+                None,
+                Some("status = 'paid'"),
+                &[crate::models::TableSort {
+                    column: "amount".to_string(),
+                    direction: "desc".to_string(),
+                }],
+                &mut |row| {
+                    rows.push(row);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("stream");
+        assert_eq!(count, 2);
+        assert_eq!(rows[0][1], serde_json::json!(30));
+        assert_eq!(rows[1][1], serde_json::json!(10));
+    }
+
+    #[tokio::test]
+    async fn lists_scope_foreign_keys_and_fills_implicit_target_columns() {
+        let (_dir, driver) = test_driver().await;
+        driver
+            .execute(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY, x TEXT, y TEXT, UNIQUE (x, y))",
+                1000,
+            )
+            .await
+            .expect("parent");
+        driver
+            .execute(
+                "CREATE TABLE child (pid INTEGER REFERENCES parent, a TEXT, b TEXT, FOREIGN KEY (a, b) REFERENCES parent (x, y))",
+                1000,
+            )
+            .await
+            .expect("child");
+        let foreign_keys = driver.scope_foreign_keys().await.expect("scope fks");
+        let implicit = foreign_keys
+            .iter()
+            .find(|foreign_key| foreign_key.table == "child" && foreign_key.columns == vec!["pid"])
+            .expect("implicit fk");
+        assert_eq!(implicit.referenced_table, "parent");
+        assert_eq!(implicit.referenced_columns, vec!["id"]);
+        let composite = foreign_keys
+            .iter()
+            .find(|foreign_key| foreign_key.table == "child" && foreign_key.columns.len() == 2)
+            .expect("composite fk");
+        assert_eq!(composite.columns, vec!["a", "b"]);
+        assert_eq!(composite.referenced_columns, vec!["x", "y"]);
     }
 
     #[tokio::test]

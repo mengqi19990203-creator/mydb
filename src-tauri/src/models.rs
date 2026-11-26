@@ -40,6 +40,9 @@ pub struct ConnectionConfig {
     pub port: u16,
     pub username: String,
     pub database: String,
+    /// MongoDB authentication database (authSource). Empty uses `admin`.
+    #[serde(default)]
+    pub mongo_auth_source: String,
     pub ssl_mode: String,
     #[serde(default)]
     pub ssl_ca_path: String,
@@ -94,6 +97,7 @@ impl Default for ConnectionConfig {
             port: 0,
             username: String::new(),
             database: String::new(),
+            mongo_auth_source: String::new(),
             ssl_mode: default_ssl_mode(),
             ssl_ca_path: String::new(),
             ssl_client_cert_path: String::new(),
@@ -127,6 +131,35 @@ pub struct TableInfo {
 pub struct DatabaseObjects {
     pub database: String,
     pub objects: Vec<TableInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoCollectionInfo {
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoDocumentPage {
+    /// Documents encoded as MongoDB extended JSON (ObjectId, dates, binary...).
+    pub documents: Vec<Value>,
+    pub total: u64,
+    pub skip: u64,
+    pub limit: u64,
+    pub elapsed_ms: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoIndexInfo {
+    pub name: String,
+    pub keys: Value,
+    pub unique: bool,
+    pub sparse: bool,
+    pub expire_after_seconds: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -189,6 +222,16 @@ pub struct ForeignKeyInfo {
     pub referenced_columns: Vec<String>,
     pub on_delete: String,
     pub on_update: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopeForeignKey {
+    pub table: String,
+    pub name: String,
+    pub columns: Vec<String>,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,6 +366,12 @@ pub struct ImportPreview {
     pub rows: Vec<Vec<String>>,
     pub detected_delimiter: String,
     pub format: String,
+    /// Worksheet names for Excel files; empty for CSV / JSON.
+    #[serde(default)]
+    pub sheets: Vec<String>,
+    /// Worksheet used for this preview, when the format is Excel.
+    #[serde(default)]
+    pub sheet: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +389,9 @@ pub struct ImportOptions {
     /// `rollback` / `stop` / `skip`.
     pub error_mode: String,
     pub empty_as_null: bool,
+    /// Selected Excel worksheet; ignored for CSV / JSON.
+    #[serde(default)]
+    pub sheet: Option<String>,
 }
 
 impl Default for ImportOptions {
@@ -349,6 +401,7 @@ impl Default for ImportOptions {
             has_header: true,
             error_mode: "rollback".to_string(),
             empty_as_null: true,
+            sheet: None,
         }
     }
 }
@@ -370,6 +423,15 @@ pub struct ImportSummary {
     pub cancelled: bool,
     pub rolled_back: bool,
     pub failures: Vec<ImportFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableExportProgress {
+    pub operation_id: Option<String>,
+    pub rows: u64,
+    pub bytes: u64,
+    pub phase: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

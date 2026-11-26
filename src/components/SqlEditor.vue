@@ -1,8 +1,19 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { basicSetup } from "codemirror";
-import { Compartment, EditorState, Prec } from "@codemirror/state";
-import { EditorView, keymap } from "@codemirror/view";
+import {
+  Compartment,
+  EditorState,
+  Prec,
+  StateEffect,
+  StateField,
+} from "@codemirror/state";
+import {
+  Decoration,
+  EditorView,
+  keymap,
+  type DecorationSet,
+} from "@codemirror/view";
 import {
   findNext,
   findPrevious,
@@ -13,13 +24,22 @@ import { toggleComment } from "@codemirror/commands";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { tags } from "@lezer/highlight";
-import { statementAtCursor, statementRangeAtCursor } from "../lib/sql-statements";
+import {
+  hasSqlContent,
+  splitSqlStatements,
+  statementAtCursor,
+  statementRangeAtCursor,
+} from "../lib/sql-statements";
 import {
   compressSql,
   formatGuard,
   loadFormatOptions,
   stripComments,
 } from "../lib/sql-format";
+import {
+  resolveSqlNavigation,
+  type SqlNavigationPayload,
+} from "../lib/sql-navigation";
 import type { Driver, ScopeTableColumns } from "../lib/types";
 
 const props = defineProps<{
@@ -27,18 +47,73 @@ const props = defineProps<{
   tabId: string;
   driver: Driver;
   completionTables: ScopeTableColumns[];
+  database?: string | null;
+  schema?: string | null;
 }>();
 const emit = defineEmits<{
   "update:modelValue": [value: string];
   selection: [value: string];
   run: [sql?: string];
+  scope: [payload: { index: number; total: number }];
   notice: [message: string, kind: "info" | "error"];
   busy: [value: boolean];
+  navigate: [payload: SqlNavigationPayload];
 }>();
+
+const setNavigationHover = StateEffect.define<
+  { from: number; to: number } | null
+>();
+
+const navigationHoverField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(value, transaction) {
+    let next = value.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (!effect.is(setNavigationHover)) continue;
+      next = effect.value
+        ? Decoration.set([
+            Decoration.mark({ class: "cm-sql-navigable" }).range(
+              effect.value.from,
+              effect.value.to,
+            ),
+          ])
+        : Decoration.none;
+    }
+    return next;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
 
 const host = ref<HTMLElement>();
 let view: EditorView | undefined;
+let scopeTimer = 0;
 const language = new Compartment();
+
+function scheduleScope(state: EditorState) {
+  window.clearTimeout(scopeTimer);
+  scopeTimer = window.setTimeout(() => {
+    const selection = state.selection.main;
+    const ranges = splitSqlStatements(state.doc.toString()).filter((range) =>
+      hasSqlContent(range.text),
+    );
+    if (selection.from !== selection.to || !ranges.length) {
+      emit("scope", { index: 0, total: 0 });
+      return;
+    }
+    let index = ranges.findIndex(
+      (range) =>
+        selection.head >= range.start && selection.head <= range.end,
+    );
+    if (index < 0) {
+      index = 0;
+      for (let position = 0; position < ranges.length; position += 1) {
+        if (ranges[position].end < selection.head) index = position;
+        else break;
+      }
+    }
+    emit("scope", { index: index + 1, total: ranges.length });
+  }, 100);
+}
 
 export type EditorCommand =
   | "search"
@@ -183,10 +258,94 @@ function insertSnippet(text: string) {
   view.focus();
 }
 
+export interface SqlCheckTarget {
+  text: string;
+  from: number;
+  to: number;
+  document: string;
+  scope: "statement" | "tab" | "selection";
+}
+
+function rangeTarget(from: number, to: number): SqlCheckTarget | null {
+  if (!view) return null;
+  const document = view.state.doc.toString();
+  const start = Math.max(0, Math.min(document.length, from));
+  const end = Math.max(start, Math.min(document.length, to));
+  if (start === end) return null;
+  return {
+    text: document.slice(start, end),
+    from: start,
+    to: end,
+    document,
+    scope: "selection",
+  };
+}
+
+function checkTarget(
+  scope: "statement" | "tab",
+  ignoreSelection = false,
+): SqlCheckTarget | null {
+  if (!view) return null;
+  const document = view.state.doc.toString();
+  const selection = view.state.selection.main;
+  if (!ignoreSelection && selection.from !== selection.to) {
+    return {
+      text: document.slice(selection.from, selection.to),
+      from: selection.from,
+      to: selection.to,
+      document,
+      scope: "selection",
+    };
+  }
+  if (scope === "tab") {
+    return {
+      text: document,
+      from: 0,
+      to: document.length,
+      document,
+      scope: "tab",
+    };
+  }
+  const ranges = splitSqlStatements(document).filter((range) =>
+    hasSqlContent(range.text),
+  );
+  const exact = statementRangeAtCursor(document, selection.head);
+  let range = exact && hasSqlContent(exact.text) ? exact : null;
+  if (!range) {
+    range =
+      [...ranges].reverse().find((item) => item.end <= selection.head) ??
+      ranges[0] ??
+      null;
+  }
+  if (!range) return null;
+  return {
+    text: document.slice(range.start, range.end),
+    from: range.start,
+    to: range.end,
+    document,
+    scope: "statement",
+  };
+}
+
+function revealRange(from: number, to: number) {
+  if (!view) return;
+  const length = view.state.doc.length;
+  const start = Math.max(0, Math.min(length, from));
+  const end = Math.max(start, Math.min(length, to));
+  view.dispatch({
+    selection: { anchor: start, head: end },
+    scrollIntoView: true,
+  });
+  view.focus();
+}
+
 defineExpose({
   runCommand,
   formatSql,
   insertSnippet,
+  checkTarget,
+  rangeTarget,
+  revealRange,
   currentStatement(): string {
     if (!view) return "";
     const { from, to } = view.state.selection.main;
@@ -194,6 +353,61 @@ defineExpose({
     return statementAtCursor(view.state.doc.toString(), from);
   },
 });
+
+let lastHoverRange = "";
+let lastHoverAt = 0;
+let lastModifierDown = false;
+
+function resolveNavigationAt(position: number): SqlNavigationPayload | null {
+  if (!view) return null;
+  const document = view.state.doc.toString();
+  if (document.length > 100 * 1024) {
+    return {
+      from: position,
+      to: position,
+      reason: "SQL 过大，暂不支持导航。",
+    };
+  }
+  return resolveSqlNavigation({
+    document,
+    offset: position,
+    tables: props.completionTables,
+    driver: props.driver,
+    scopeInfo: {
+      database: props.database ?? null,
+      schema: props.schema ?? null,
+    },
+  });
+}
+
+function setHover(range: { from: number; to: number } | null) {
+  if (!view) return;
+  const key = range ? `${range.from}:${range.to}` : "";
+  if (key === lastHoverRange) return;
+  lastHoverRange = key;
+  view.dispatch({ effects: setNavigationHover.of(range) });
+}
+
+function clearNavigationHover() {
+  setHover(null);
+}
+
+function navigateAt(position: number): boolean {
+  const payload = resolveNavigationAt(position);
+  if (!payload) return false;
+  emit("navigate", payload);
+  clearNavigationHover();
+  return true;
+}
+
+function onModifierKeyUp(event: KeyboardEvent) {
+  if (event.key !== "Meta" && event.key !== "Control") return;
+  if (!event.metaKey && !event.ctrlKey) clearNavigationHover();
+}
+
+function onWindowBlur() {
+  clearNavigationHover();
+}
 
 function dialectFor(driver: Driver) {
   switch (driver) {
@@ -285,12 +499,70 @@ onMounted(() => {
         editorTheme,
         Prec.high(syntaxHighlighting(dbxHighlight)),
         EditorView.lineWrapping,
+        navigationHoverField,
+        EditorView.domEventHandlers({
+          mousemove(event, target) {
+            const modifier = event.metaKey || event.ctrlKey;
+            if (!modifier) {
+              lastModifierDown = false;
+              clearNavigationHover();
+              return;
+            }
+            const now = performance.now();
+            if (
+              lastModifierDown &&
+              now - lastHoverAt < 50
+            ) {
+              return;
+            }
+            lastModifierDown = true;
+            lastHoverAt = now;
+            const position = target.posAtCoords({
+              x: event.clientX,
+              y: event.clientY,
+            });
+            if (position == null) {
+              clearNavigationHover();
+              return;
+            }
+            const started = performance.now();
+            const payload = resolveNavigationAt(position);
+            if (performance.now() - started > 50) {
+              clearNavigationHover();
+              return;
+            }
+            setHover(
+              payload?.kind
+                ? { from: payload.from, to: payload.to }
+                : null,
+            );
+          },
+          mouseleave() {
+            clearNavigationHover();
+          },
+          mousedown(event, target) {
+            if (event.button !== 0) return false;
+            if (!event.metaKey && !event.ctrlKey) return false;
+            const position = target.posAtCoords({
+              x: event.clientX,
+              y: event.clientY,
+            });
+            if (position == null) return false;
+            const payload = resolveNavigationAt(position);
+            if (!payload) return false;
+            event.preventDefault();
+            emit("navigate", payload);
+            clearNavigationHover();
+            return true;
+          },
+        }),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             emit("update:modelValue", update.state.doc.toString());
           }
           if (update.docChanged || update.selectionSet) {
             emit("selection", selectedText(update.state));
+            scheduleScope(update.state);
           }
         }),
         keymap.of([
@@ -302,6 +574,10 @@ onMounted(() => {
               return true;
             },
           },
+          {
+            key: "F12",
+            run: (target) => navigateAt(target.state.selection.main.head),
+          },
         ]),
       ],
     }),
@@ -311,6 +587,15 @@ onMounted(() => {
   // The parent owns the per-tab selection so the toolbar Run button can use
   // it after the editor loses focus.
   emit("selection", "");
+  scheduleScope(view.state);
+  window.addEventListener("keyup", onModifierKeyUp);
+  window.addEventListener("blur", onWindowBlur);
+});
+
+onBeforeUnmount(() => {
+  window.clearTimeout(scopeTimer);
+  window.removeEventListener("keyup", onModifierKeyUp);
+  window.removeEventListener("blur", onWindowBlur);
 });
 
 watch(
@@ -319,6 +604,7 @@ watch(
     if (!view) return;
     view.dispatch({ selection: { anchor: 0 } });
     emit("selection", "");
+    scheduleScope(view.state);
   },
 );
 
@@ -332,6 +618,7 @@ watch(
         selection: { anchor: 0 },
       });
       emit("selection", "");
+      scheduleScope(view.state);
     }
   },
 );

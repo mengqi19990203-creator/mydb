@@ -21,6 +21,7 @@ import {
   qualifiedDisplayName,
   type GeneratedSqlKind,
 } from "../lib/generate-sql";
+import type { PinnedObject } from "../lib/object-pins";
 import type { ColumnInfo, Driver, TableInfo } from "../lib/types";
 
 const props = defineProps<{
@@ -35,6 +36,7 @@ const props = defineProps<{
   locateTarget?: string | null;
   locateNonce?: number;
   collapseNonce?: number;
+  pinned?: PinnedObject[];
 }>();
 
 const emit = defineEmits<{
@@ -48,6 +50,7 @@ const emit = defineEmits<{
   create: [];
   refresh: [];
   "generate-sql": [payload: { sql: string; title: string }];
+  "toggle-pin": [table: TableInfo];
 }>();
 
 const collapsed = ref<Record<string, boolean>>({});
@@ -208,8 +211,61 @@ const groups = computed(() =>
   })),
 );
 
+const PINNED_COLLAPSED_KEY = "mydb.objectPinsCollapsed.v1";
+const pinnedCollapsed = ref(false);
+try {
+  pinnedCollapsed.value =
+    window.localStorage.getItem(PINNED_COLLAPSED_KEY) === "1";
+} catch {
+  // Ignore storage failures; the section still works in memory.
+}
+
+function togglePinnedSection() {
+  pinnedCollapsed.value = !pinnedCollapsed.value;
+  try {
+    window.localStorage.setItem(
+      PINNED_COLLAPSED_KEY,
+      pinnedCollapsed.value ? "1" : "0",
+    );
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+const pinnedObjects = computed(() => {
+  const query = props.search.trim().toLowerCase();
+  const result: Array<{ pin: PinnedObject; table: TableInfo }> = [];
+  for (const pin of props.pinned ?? []) {
+    const table = props.tables.find(
+      (item) => item.kind === pin.kind && item.name === pin.name,
+    );
+    if (!table) continue;
+    if (query && !table.name.toLowerCase().includes(query)) continue;
+    result.push({ pin, table });
+  }
+  return result;
+});
+
+function isPinnedTable(table: TableInfo): boolean {
+  return (props.pinned ?? []).some(
+    (pin) => pin.kind === table.kind && pin.name === table.name,
+  );
+}
+
+function togglePin(table: TableInfo) {
+  emit("toggle-pin", table);
+  closeObjectMenu();
+}
+
 function kindLabel(kind: string): string {
   return KIND_LABELS[kind] ?? "对象";
+}
+
+function objectIcon(kind: string): ObjectCategory["icon"] {
+  return (
+    categories.value.find((category) => category.kind === kind)?.icon ??
+    "table"
+  );
 }
 
 const visibleObjects = computed(() =>
@@ -1135,6 +1191,71 @@ watch(
     </button>
   </div>
   <div
+    v-if="pinnedObjects.length"
+    class="object-group object-pinned-section"
+  >
+    <button
+      class="object-group-header"
+      data-tree-nav
+      :aria-expanded="!pinnedCollapsed"
+      @click="togglePinnedSection"
+    >
+      <Icon
+        :name="pinnedCollapsed ? 'chevron-right' : 'chevron-down'"
+        :size="12"
+      />
+      <Icon name="pin" class="pinned-section-icon" :size="12" />
+      <span>常用对象</span>
+      <span class="group-count">{{ pinnedObjects.length }}</span>
+    </button>
+    <div v-show="!pinnedCollapsed" class="object-group-items">
+      <div
+        v-for="entry in pinnedObjects"
+        :key="`${entry.table.kind}:${entry.table.name}`"
+        class="object-item tree-table-row object-pinned-row"
+        :data-object-key="tableKey(entry.table)"
+        role="button"
+        tabindex="0"
+        data-tree-nav
+        :class="{
+          active: entry.table.name === activeTable,
+          located: locatedKey === tableKey(entry.table),
+        }"
+        :title="`${entry.table.name} · 打开数据（右键取消置顶）`"
+        @click="emit('select', entry.table)"
+        @keydown.enter.prevent="emit('select', entry.table)"
+        @keydown.space.prevent="emit('select', entry.table)"
+        @contextmenu.prevent.stop="openObjectMenu($event, entry.table)"
+      >
+        <Icon
+          class="object-kind"
+          :name="objectIcon(entry.table.kind)"
+          :size="14"
+        />
+        <span class="object-name">{{ entry.table.name }}</span>
+        <span class="pinned-kind">{{ kindLabel(entry.table.kind) }}</span>
+        <button
+          class="tree-open pinned-unpin"
+          tabindex="-1"
+          title="取消置顶"
+          aria-label="取消置顶"
+          :aria-pressed="true"
+          @click.stop="togglePin(entry.table)"
+          @dblclick.stop
+        >
+          <Icon name="pin" :size="13" />
+        </button>
+      </div>
+    </div>
+  </div>
+  <div
+    v-else-if="!search.trim()"
+    class="tree-hint pinned-empty"
+  >
+    右键对象 → 置顶到常用对象
+  </div>
+
+  <div
     v-for="group in groups"
     :key="group.kind"
     class="object-group"
@@ -1294,6 +1415,20 @@ watch(
       >
         <Icon name="table" :size="14" />
         <span>在新标签打开</span>
+      </button>
+      <button
+        class="context-menu-item"
+        role="menuitem"
+        @click="togglePin(objectMenu.table)"
+      >
+        <Icon name="pin" :size="14" />
+        <span>
+          {{
+            isPinnedTable(objectMenu.table)
+              ? "取消置顶"
+              : "置顶到常用对象"
+          }}
+        </span>
       </button>
       <button
         v-if="objectMenu.table.kind === 'table'"

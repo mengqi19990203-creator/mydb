@@ -66,7 +66,7 @@ fn ensure_read_only_redis(command: &str) -> Result<(), String> {
     }
 }
 
-async fn redis_connection(
+pub(crate) async fn redis_connection(
     app: &AppHandle,
     state: &AppState,
     connection_id: &str,

@@ -1,7 +1,7 @@
 {
   "name": "mydb",
   "private": true,
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "A lightweight, cross-platform database client",
   "author": "蒙其同学 <jianglichun996@163.com> (https://github.com/mengqi19990203-creator)",
   "license": "Apache-2.0",

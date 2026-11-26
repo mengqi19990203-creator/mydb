@@ -31,6 +31,7 @@ interface ImportedConnection {
   port: number;
   username: string;
   database: string;
+  mongoAuthSource?: string;
   sslMode: SslMode;
   sshEnabled: boolean;
   sshHost: string;
@@ -107,6 +108,7 @@ function exportPayload() {
       port: connection.port,
       username: connection.username,
       database: connection.database,
+      mongoAuthSource: connection.mongoAuthSource ?? "",
       sslMode: connection.sslMode,
       sshEnabled: connection.sshEnabled,
       sshHost: connection.sshHost,
@@ -148,6 +150,7 @@ function driverFromProvider(provider: string): Driver | null {
   if (value.includes("mysql") || value.includes("maria")) return "mysql";
   if (value.includes("postgres")) return "postgres";
   if (value.includes("sqlite")) return "sqlite";
+  if (value.includes("mongo")) return "mongodb";
   return null;
 }
 
@@ -162,9 +165,10 @@ function emptyConnection(
     color: "#58a6ff",
     file: "",
     host: "127.0.0.1",
-    port: driver === "mysql" ? 3306 : driver === "postgres" ? 5432 : 0,
+    port: driver === "mysql" ? 3306 : driver === "postgres" ? 5432 : driver === "mongodb" ? 27017 : 0,
     username: driver === "postgres" ? "postgres" : "root",
-    database: driver === "postgres" ? "postgres" : driver === "mysql" ? "mysql" : "",
+    database: driver === "postgres" ? "postgres" : driver === "mysql" ? "mysql" : driver === "mongodb" ? "admin" : "",
+    mongoAuthSource: driver === "mongodb" ? "admin" : "",
     sslMode: "disabled",
     sshEnabled: false,
     sshHost: "",

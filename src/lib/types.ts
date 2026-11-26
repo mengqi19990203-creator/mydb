@@ -1,4 +1,4 @@
-export type Driver = "sqlite" | "mysql" | "postgres" | "redis";
+export type Driver = "sqlite" | "mysql" | "postgres" | "redis" | "mongodb";
 export type SslMode =
   | "disabled"
   | "preferred"
@@ -18,6 +18,7 @@ export interface ConnectionConfig {
   port: number;
   username: string;
   database: string;
+  mongoAuthSource?: string;
   sslMode: SslMode;
   sslCaPath: string;
   sslClientCertPath: string;
@@ -57,6 +58,53 @@ export interface TableInfo {
 export interface DatabaseObjects {
   database: string;
   objects: TableInfo[];
+}
+
+export interface MongoCollectionInfo {
+  name: string;
+  kind: "collection" | "view" | "timeseries" | string;
+}
+
+export interface MongoDocumentPage {
+  documents: Record<string, unknown>[];
+  total: number;
+  skip: number;
+  limit: number;
+  elapsedMs: number;
+  truncated: boolean;
+}
+
+export interface MongoIndexInfo {
+  name: string;
+  keys: unknown;
+  unique: boolean;
+  sparse: boolean;
+  expireAfterSeconds: number | null;
+}
+
+
+export type SqlCheckSeverity = "error" | "warning" | "info";
+
+export interface SqlCheckIssue {
+  severity: SqlCheckSeverity;
+  code: string;
+  message: string;
+  /// Absolute character offset in the editor document.
+  from: number;
+  to: number;
+  /// 1-based position for display.
+  line: number;
+  column: number;
+}
+
+export interface SqlCheckResult {
+  issues: SqlCheckIssue[];
+  scope: "statement" | "tab" | "selection";
+  checkedFrom: number;
+  checkedTo: number;
+  objectCheck: "available" | "unavailable";
+  tokenCount: number;
+  truncated: boolean;
 }
 
 export interface QueryResult {
@@ -113,6 +161,14 @@ export interface ForeignKeyInfo {
   onUpdate: string;
 }
 
+export interface ScopeForeignKey {
+  table: string;
+  name: string;
+  columns: string[];
+  referencedTable: string;
+  referencedColumns: string[];
+}
+
 export interface TableStructure {
   columns: ColumnInfo[];
   indexes: IndexInfo[];
@@ -150,6 +206,9 @@ export interface ImportPreview {
   rows: string[][];
   detectedDelimiter: string;
   format: string;
+  /** Worksheet names for Excel imports; empty for CSV / JSON. */
+  sheets?: string[];
+  sheet?: string | null;
 }
 
 export interface ImportMapping {
@@ -162,6 +221,8 @@ export interface ImportOptions {
   hasHeader: boolean;
   errorMode: "rollback" | "stop" | "skip" | string;
   emptyAsNull: boolean;
+  /** Selected Excel worksheet; ignored for CSV / JSON. */
+  sheet?: string | null;
 }
 
 export interface ImportFailure {
@@ -332,6 +393,21 @@ export interface PendingTableChange {
   changes: ColumnValue[];
   values: ColumnValue[];
   singleRow: boolean;
+}
+
+export interface RowDetailField {
+  name: string;
+  value: unknown;
+  type?: string;
+  nullable?: boolean;
+  primaryKey?: boolean;
+  autoIncrement?: boolean;
+  comment?: string | null;
+  hidden?: boolean;
+  modified?: boolean;
+  editable?: boolean;
+  disabledReason?: string;
+  binary?: boolean;
 }
 
 export interface TableChangeResult {

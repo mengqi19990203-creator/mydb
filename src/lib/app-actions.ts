@@ -17,6 +17,7 @@ export type AppActionIcon =
   | "upload"
   | "close"
   | "play"
+  | "check"
   | "more";
 
 export interface AppAction {

@@ -10,6 +10,7 @@ mod export;
 mod generate;
 mod history;
 mod import_wizard;
+mod mongo;
 mod query;
 mod query_cancel;
 mod redis;
@@ -35,6 +36,7 @@ pub use export::*;
 pub use generate::*;
 pub use history::*;
 pub use import_wizard::*;
+pub use mongo::*;
 pub use query::*;
 pub use query_cancel::*;
 pub use script::*;
@@ -82,6 +84,14 @@ pub struct AppState {
     /// Last Redis logical database selected for a connection, reapplied when
     /// the multiplexed connection is recreated.
     pub redis_databases: Mutex<HashMap<String, i64>>,
+    /// MongoDB clients keyed by connection id. The client is cloneable and
+    /// already owns its connection pool.
+    pub mongo_clients: Mutex<HashMap<String, mongodb::Client>>,
+    /// Serialises first-time MongoDB client creation so parallel UI requests
+    /// cannot create duplicate SSH tunnels or clients.
+    pub mongo_connect_lock: Mutex<()>,
+    /// SSH tunnels forwarding MongoDB traffic, kept alive with the cached client.
+    pub mongo_tunnels: Mutex<HashMap<String, SshTunnel>>,
     pub passwords: Mutex<HashMap<String, String>>,
     pub ssh_passwords: Mutex<HashMap<String, String>>,
     pub ssh_key_passphrases: Mutex<HashMap<String, String>>,

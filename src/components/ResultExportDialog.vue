@@ -16,6 +16,7 @@ const props = defineProps<{
   open: boolean;
   snapshot: ResultExportSnapshot | null;
   driver: Driver;
+  filenamePrefix?: string;
 }>();
 
 const emit = defineEmits<{
@@ -112,7 +113,13 @@ async function submit() {
   let path: string | null;
   try {
     const selected = await saveDialog({
-      defaultPath: exportFilename(format.value),
+      defaultPath: exportFilename(
+        format.value,
+        (props.filenamePrefix ?? "mydb-result")
+          .replace(/[\\/:*?"<>|\s]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 60) || "mydb-result",
+      ),
       filters: [
         {
           name: formatExtensions[format.value],
@@ -184,6 +191,10 @@ onBeforeUnmount(() => {
           （已隐藏 {{ snapshot.hiddenCount }} 列）
         </span>
         <span v-if="sortLabel"> · 排序：{{ sortLabel }}</span>
+      </p>
+      <p v-if="snapshot?.filterSummary" class="result-export-summary">
+        已筛选：{{ snapshot.filterSummary }}（筛掉
+        {{ snapshot.filteredOut ?? 0 }} 行）
       </p>
       <p v-if="snapshot?.truncated" class="result-export-warning">
         当前结果仅 {{ rowsCount }} 行（已截断），导出和排序都只针对这些行

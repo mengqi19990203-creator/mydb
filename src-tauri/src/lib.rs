@@ -128,6 +128,8 @@ fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<taur
         MenuItemBuilder::with_id("menu-editor-goto-line", "转到行…").build(handle)?;
     let edit_toggle_comment =
         MenuItemBuilder::with_id("menu-editor-toggle-comment", "注释 / 取消注释").build(handle)?;
+    let edit_check_sql =
+        MenuItemBuilder::with_id("menu-check-sql", "检查 SQL").build(handle)?;
     let edit_format_sql =
         MenuItemBuilder::with_id("menu-editor-format-sql", "格式化 SQL").build(handle)?;
     let edit_snippets = MenuItemBuilder::with_id("menu-editor-snippets", "SQL 片段库…")
@@ -175,6 +177,7 @@ fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<taur
         .item(&edit_find_previous)
         .item(&edit_goto_line)
         .item(&edit_toggle_comment)
+        .item(&edit_check_sql)
         .item(&edit_format_sql)
         .item(&edit_compress_sql)
         .item(&edit_format_settings)
@@ -360,6 +363,7 @@ pub fn run() {
             "menu-editor-find-previous" => "menu:editor-find-previous",
             "menu-editor-goto-line" => "menu:editor-goto-line",
             "menu-editor-toggle-comment" => "menu:editor-toggle-comment",
+            "menu-check-sql" => "menu:check-sql",
             "menu-editor-format-sql" => "menu:editor-format-sql",
             "menu-editor-compress-sql" => "menu:editor-compress-sql",
             "menu-editor-format-settings" => "menu:editor-format-settings",
@@ -412,6 +416,8 @@ pub fn run() {
             commands::delete_connection_group,
             commands::move_connection_to_group,
             commands::test_connection,
+            commands::check_connection_health,
+            commands::reconnect_connection,
             commands::list_tables,
             commands::list_scope_columns,
             commands::list_databases,
@@ -439,6 +445,7 @@ pub fn run() {
             commands::list_columns,
             commands::get_table_structure,
             commands::get_er_diagram,
+            commands::list_scope_foreign_keys,
             commands::database_docs_snapshot,
             commands::server_overview,
             commands::server_users,
@@ -476,6 +483,7 @@ pub fn run() {
             commands::execute_sql_file,
             commands::cancel_sql_script,
             commands::export_object,
+            commands::export_table_rows,
             commands::export_query_result_xlsx,
             commands::cancel_export,
             commands::table_maintenance,
@@ -512,6 +520,19 @@ pub fn run() {
             commands::redis_zset_set,
             commands::redis_zset_remove,
             commands::redis_command,
+            commands::mongo_list_databases,
+            commands::mongo_list_collections,
+            commands::mongo_find_documents,
+            commands::mongo_aggregate_documents,
+            commands::mongo_insert_document,
+            commands::mongo_insert_documents,
+            commands::mongo_replace_document,
+            commands::mongo_delete_document,
+            commands::mongo_list_indexes,
+            commands::mongo_create_index,
+            commands::mongo_drop_index,
+            commands::mongo_create_collection,
+            commands::mongo_drop_collection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

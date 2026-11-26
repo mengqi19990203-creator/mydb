@@ -84,6 +84,36 @@ export function splitSqlStatements(sql: string): SqlStatementRange[] {
   return ranges;
 }
 
+/** Whether a split fragment contains anything besides whitespace and SQL
+ * comments. Used to ignore trailing comments when counting statements. */
+export function hasSqlContent(text: string): boolean {
+  let index = 0;
+  while (index < text.length) {
+    const character = text[index];
+    if (/\s/.test(character)) {
+      index += 1;
+      continue;
+    }
+    if (character === "-" && text[index + 1] === "-") {
+      const end = text.indexOf("\n", index);
+      index = end < 0 ? text.length : end + 1;
+      continue;
+    }
+    if (character === "#") {
+      const end = text.indexOf("\n", index);
+      index = end < 0 ? text.length : end + 1;
+      continue;
+    }
+    if (character === "/" && text[index + 1] === "*") {
+      const end = text.indexOf("*/", index + 2);
+      index = end < 0 ? text.length : end + 2;
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
 export function statementAtCursor(sql: string, position: number): string {
   const exact = statementRangeAtCursor(sql, position);
   if (exact) return exact.text;

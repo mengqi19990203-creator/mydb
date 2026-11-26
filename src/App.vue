@@ -24,6 +24,7 @@ import GlobalSearchDialog from "./components/GlobalSearchDialog.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
 import Icon from "./components/Icon.vue";
 import ImportWizardDialog from "./components/ImportWizardDialog.vue";
+import MongoWorkspace from "./components/MongoWorkspace.vue";
 import ObjectBrowser from "./components/ObjectBrowser.vue";
 import ObjectSourceDialog from "./components/ObjectSourceDialog.vue";
 import PromptDialog from "./components/PromptDialog.vue";
@@ -56,6 +57,10 @@ import {
   type DangerFinding,
 } from "./lib/dangerous-sql";
 import {
+  loadQueryRunMode,
+  type QueryRunMode,
+} from "./lib/query-run-mode";
+import {
   clearPaletteRecent,
   loadPaletteRecent,
   recordPaletteRecent,
@@ -64,7 +69,7 @@ import {
   type PaletteRecentEntry,
 } from "./lib/command-palette";
 import { readClipboard, writeClipboard } from "./lib/clipboard";
-import { splitSqlStatements } from "./lib/sql-statements";
+import { hasSqlContent, splitSqlStatements } from "./lib/sql-statements";
 import type {
   AppAction,
   MenuBarItem,
@@ -82,6 +87,26 @@ import {
   saveWorkspaceLayout,
   type WorkspaceLayout,
 } from "./lib/layout";
+import {
+  defaultPinName,
+  estimateResultBytes,
+  cloneQueryResult,
+  MAX_PINNED_BYTES,
+  MAX_PINNED_RESULTS,
+  MAX_PINNED_TOTAL_BYTES,
+  nextPinId,
+  pinnedResultBytes,
+  uniquePinName,
+  type PinnedQueryResult,
+} from "./lib/pinned-results";
+import {
+  HEALTH_CHECK_INTERVAL_MS,
+  isConnectionLostError,
+  loadAutoReconnect,
+  saveAutoReconnect,
+  summarizeConnectionError,
+} from "./lib/connection-health";
+import type { SqlNavigationPayload } from "./lib/sql-navigation";
 import type {
   ConnectionConfig,
   ConnectionGroupInfo,
@@ -107,7 +132,12 @@ interface ConnectionGroup {
   order?: number;
 }
 
-type ConnectionStatus = "idle" | "connecting" | "connected" | "failed";
+type ConnectionStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "failed"
+  | "lost";
 
 interface AppContextMenu {
   x: number;
@@ -235,6 +265,12 @@ interface QueryTab {
   /// Currently selected editor text; run uses it instead of the whole tab.
   selectedSql: string;
   result: QueryResult | null;
+  /// Multiple results produced by one editor run (one entry per statement).
+  resultSets: QueryResult[];
+  resultSetIndex: number;
+  /// Failure after at least one statement succeeded; shown without hiding
+  /// the results that already completed.
+  batchError: string | null;
   error: string | null;
   running: boolean;
   operationId: string | null;
@@ -246,6 +282,9 @@ interface QueryTab {
   showExplain: boolean;
   inTransaction: boolean;
   transactionBusy: boolean;
+  /// Session-only result snapshots; never persisted to localStorage.
+  pinnedResults: PinnedQueryResult[];
+  activePinId: string | null;
 }
 
 const connections = ref<ConnectionConfig[]>([]);
@@ -297,6 +336,10 @@ interface TableTab {
   table: TableInfo;
   mode: "data" | "structure";
   focusedIndex: string | null;
+  focusedColumn?: string | null;
+  focusedColumnPulse?: number;
+  linkedFilter?: string | null;
+  linkedFilterLabel?: string | null;
 }
 
 interface ErTab {
@@ -355,6 +398,7 @@ const settingsOpen = ref(false);
 const queryBuilderOpen = ref(false);
 const databaseDocsOpen = ref(false);
 const dangerousConfirmEnabled = ref(loadDangerConfirm());
+const queryRunMode = ref<QueryRunMode>(loadQueryRunMode());
 const dangerousSqlRequest = ref<{
   tabId: string;
   sql: string;
@@ -424,6 +468,9 @@ function createQueryTab(
     savedSql: null,
     selectedSql: "",
     result: null,
+    resultSets: [],
+    resultSetIndex: 0,
+    batchError: null,
     error: null,
     running: false,
     operationId: null,
@@ -435,6 +482,8 @@ function createQueryTab(
     showExplain: false,
     inTransaction: false,
     transactionBusy: false,
+    pinnedResults: [],
+    activePinId: null,
   };
 }
 
@@ -501,7 +550,7 @@ const completionSource = computed(() => {
   const tab = activeTab.value;
   if (!tab?.connectionId) return null;
   const connection = connectionFor(tab.connectionId);
-  if (!connection || connection.driver === "redis") return null;
+  if (!connection || connection.driver === "redis" || connection.driver === "mongodb") return null;
   const database = normalizeScopeValue(tab.database);
   const schema = normalizeScopeValue(tab.schema);
   return {
@@ -643,10 +692,41 @@ function setSplitExplainView(value: boolean) {
   }
 }
 
+function selectResultSetOnTab(tab: QueryTab, index: number) {
+  if (!tab.resultSets.length) return;
+  const next = Math.max(0, Math.min(index, tab.resultSets.length - 1));
+  tab.resultSetIndex = next;
+  tab.result = tab.resultSets[next];
+}
+
+function selectActiveResultSet(index: number) {
+  if (activeTab.value) selectResultSetOnTab(activeTab.value, index);
+}
+
+function selectSplitResultSet(index: number) {
+  if (splitView.value?.kind === "query") {
+    selectResultSetOnTab(splitView.value.query, index);
+  }
+}
+
 function runSplitQuery(selectedSql?: string) {
   const view = splitView.value;
   if (view?.kind === "query") {
-    void runQueryOnTab(view.query, selectedSql);
+    void runQueryOnTab(view.query, selectedSql, "auto");
+  }
+}
+
+function runSplitStatement() {
+  const view = splitView.value;
+  if (view?.kind === "query") {
+    void runStatementOnTab(view.query);
+  }
+}
+
+function runSplitTab() {
+  const view = splitView.value;
+  if (view?.kind === "query") {
+    void runWholeTabOnTab(view.query);
   }
 }
 
@@ -741,6 +821,7 @@ const tableMode = computed<"data" | "structure">({
   },
 });
 const viewMode = computed<"sql" | "table" | "er" | "empty">(() => {
+  if (isMongoConnection.value) return "empty";
   if (activeTableTab.value) return "table";
   if (activeErTab.value) return "er";
   if (tabs.value.some((tab) => tab.id === activeWorkspaceTabId.value)) {
@@ -750,6 +831,7 @@ const viewMode = computed<"sql" | "table" | "er" | "empty">(() => {
 });
 
 const statusActiveKind = computed<"query" | "table" | "er" | null>(() => {
+  if (isMongoConnection.value) return null;
   if (activeTableTab.value) return "table";
   if (activeErTab.value) return "er";
   if (tabs.value.some((tab) => tab.id === activeWorkspaceTabId.value)) {
@@ -759,6 +841,7 @@ const statusActiveKind = computed<"query" | "table" | "er" | null>(() => {
 });
 
 const statusActiveLabel = computed(() => {
+  if (isMongoConnection.value) return "";
   const table = activeTableTab.value;
   if (table) {
     return `${table.mode === "structure" ? "结构" : "表"} · ${
@@ -899,6 +982,17 @@ const historyLoaded = ref(false);
 const historyEntries = ref<HistoryEntry[]>([]);
 const connectionStatus = ref<ConnectionStatus>("idle");
 const connectionError = ref("");
+const autoReconnect = ref(loadAutoReconnect());
+const lostConnectionError = ref("");
+const lostBannerDismissed = ref(false);
+const reconnecting = ref(false);
+const reconnectAutoAttempt = ref(false);
+const reconnectNotice = ref("");
+let healthTimer = 0;
+let healthCheckInFlight = false;
+let lastHealthyAt = 0;
+let autoReconnectTried = false;
+let reconnectNoticeTimer = 0;
 
 interface ConfirmRequest {
   title: string;
@@ -946,6 +1040,26 @@ const selected = computed(
 const isRedisConnection = computed(
   () => selected.value?.driver === "redis",
 );
+const isMongoConnection = computed(
+  () => selected.value?.driver === "mongodb",
+);
+const mongoDatabaseByConnection = reactive<Record<string, string>>({});
+const mongoDatabase = computed(() => {
+  const connection = selected.value;
+  if (!connection || connection.driver !== "mongodb") return null;
+  return (
+    mongoDatabaseByConnection[connection.id] ??
+    normalizeScopeValue(connection.database) ??
+    ""
+  );
+});
+
+function handleMongoDatabaseChange(database: string) {
+  const connection = selected.value;
+  if (!connection) return;
+  mongoDatabaseByConnection[connection.id] = database;
+  status.value = `MongoDB 数据库：${database}`;
+}
 /// Whether the Redis key browser / console is currently open. Selecting a
 /// Redis connection opens it; closing the Redis tab returns to the start page.
 const redisWorkspaceOpen = ref(true);
@@ -983,6 +1097,9 @@ const connectionChipScope = computed(() => {
       ? `db${database.padStart(2, "0")}`
       : `db${database}`;
   }
+  if (connection.driver === "mongodb") {
+    return mongoDatabase.value ?? "";
+  }
   const database = activeDatabase.value ?? connection.database;
   if (connection.driver === "postgres" && activeSchema.value) {
     return `${database} · ${activeSchema.value}`;
@@ -1015,6 +1132,7 @@ function scopeLabelFor(tab: TabSource): string {
   if (!connection) return "";
   if (connection.driver === "sqlite") return "main";
   if (connection.driver === "redis") return "";
+  if (connection.driver === "mongodb") return tab.database ?? connection.database;
   const database = tab.database ?? connection.database;
   if (connection.driver === "postgres" && tab.schema) {
     return `${database} · ${tab.schema}`;
@@ -1113,8 +1231,183 @@ const connectionStatusLabel = computed(() => {
       return "已连接";
     case "failed":
       return "连接失败";
+    case "lost":
+      return "连接已断开";
     default:
       return "未连接";
+  }
+});
+
+const reconnectDisabledReason = computed(() => {
+  if (reconnecting.value) return "正在重新连接…";
+  if (activeTab.value?.inTransaction) {
+    return "该连接有未提交事务，请先提交或回滚";
+  }
+  if (activeTab.value?.running) return "查询执行中，请先停止或等待完成";
+  return "";
+});
+
+function stopHealthChecks() {
+  if (healthTimer) {
+    window.clearInterval(healthTimer);
+    healthTimer = 0;
+  }
+  healthCheckInFlight = false;
+}
+
+function scheduleHealthChecks() {
+  stopHealthChecks();
+  if (!selectedId.value || connectionStatus.value !== "connected") return;
+  lastHealthyAt = lastHealthyAt || Date.now();
+  healthTimer = window.setInterval(() => {
+    void checkActiveHealth();
+  }, HEALTH_CHECK_INTERVAL_MS);
+}
+
+async function checkActiveHealth() {
+  if (
+    healthCheckInFlight ||
+    !selectedId.value ||
+    connectionStatus.value !== "connected" ||
+    document.visibilityState !== "visible" ||
+    activeTab.value?.running ||
+    activeTab.value?.inTransaction
+  ) {
+    return;
+  }
+  const connectionId = selectedId.value;
+  healthCheckInFlight = true;
+  try {
+    await api.checkConnectionHealth(connectionId);
+    if (connectionId === selectedId.value) {
+      lastHealthyAt = Date.now();
+      autoReconnectTried = false;
+    }
+  } catch (reason) {
+    if (connectionId === selectedId.value) {
+      handleConnectionLost(String(reason));
+    }
+  } finally {
+    healthCheckInFlight = false;
+  }
+}
+
+function handleConnectionLost(message: string) {
+  if (!selectedId.value) return;
+  lostConnectionError.value = message;
+  lostBannerDismissed.value = false;
+  connectionStatus.value = "lost";
+  stopHealthChecks();
+  if (activeTab.value?.running) {
+    status.value = "连接可能已断开，等待当前查询结束";
+  } else {
+    status.value = "连接可能已断开";
+  }
+  window.setTimeout(() => {
+    void maybeAttemptAutoReconnect();
+  }, 0);
+}
+
+function reportConnectionError(
+  message: string,
+  connectionId: string | null = selectedId.value,
+) {
+  if (!connectionId || connectionId !== selectedId.value) return;
+  if (!isConnectionLostError(message)) return;
+  handleConnectionLost(message);
+}
+
+async function maybeAttemptAutoReconnect() {
+  if (
+    connectionStatus.value !== "lost" ||
+    !selectedId.value ||
+    !autoReconnect.value ||
+    autoReconnectTried ||
+    reconnecting.value
+  ) {
+    return;
+  }
+  if (activeTab.value?.inTransaction || activeTab.value?.running) return;
+  autoReconnectTried = true;
+  await reconnectActiveConnection(true);
+}
+
+async function reconnectActiveConnection(auto = false) {
+  if (!selectedId.value || reconnecting.value) return;
+  if (activeTab.value?.inTransaction) {
+    status.value = "该连接有未提交事务，请先提交或回滚";
+    return;
+  }
+  if (activeTab.value?.running) {
+    status.value = "查询执行中，请先停止或等待完成";
+    return;
+  }
+  const connectionId = selectedId.value;
+  reconnecting.value = true;
+  reconnectAutoAttempt.value = auto;
+  status.value = auto ? "正在尝试自动重新连接…" : "正在重新连接…";
+  try {
+    await api.reconnectConnection(connectionId);
+    if (connectionId !== selectedId.value) return;
+    reconnecting.value = false;
+    reconnectAutoAttempt.value = false;
+    connectionStatus.value = "connected";
+    connectionError.value = "";
+    lostConnectionError.value = "";
+    lostBannerDismissed.value = false;
+    lastHealthyAt = Date.now();
+    reconnectNotice.value = "已重新连接；会话状态已重置，请重新执行刚才的语句";
+    window.clearTimeout(reconnectNoticeTimer);
+    reconnectNoticeTimer = window.setTimeout(() => {
+      reconnectNotice.value = "";
+    }, 3000);
+    await refreshTables();
+    scheduleHealthChecks();
+    status.value = "已重新连接；请重新执行刚才的语句";
+  } catch (reason) {
+    if (connectionId !== selectedId.value) return;
+    connectionStatus.value = "lost";
+    lostConnectionError.value = String(reason);
+    lostBannerDismissed.value = false;
+    status.value = `重新连接失败：${reason}`;
+  } finally {
+    reconnecting.value = false;
+    reconnectAutoAttempt.value = false;
+  }
+}
+
+function dismissLostBanner() {
+  lostBannerDismissed.value = true;
+}
+
+function onVisibilityChange() {
+  if (document.visibilityState !== "visible") return;
+  if (
+    connectionStatus.value === "connected" &&
+    Date.now() - lastHealthyAt >= HEALTH_CHECK_INTERVAL_MS
+  ) {
+    void checkActiveHealth();
+  }
+}
+
+watch(selectedConnectionId, () => {
+  stopHealthChecks();
+  lostConnectionError.value = "";
+  lostBannerDismissed.value = false;
+  reconnectNotice.value = "";
+  autoReconnectTried = false;
+  lastHealthyAt = Date.now();
+  if (connectionStatus.value === "connected") scheduleHealthChecks();
+});
+
+watch(connectionStatus, (status) => {
+  if (status === "connected") {
+    lostConnectionError.value = "";
+    lostBannerDismissed.value = false;
+    lastHealthyAt = Date.now();
+    scheduleHealthChecks();
+  } else {
+    stopHealthChecks();
   }
 });
 
@@ -1179,10 +1472,14 @@ const openConnectionIds = computed(() => {
   ) {
     ids.add(selectedId.value);
   }
+  if (isMongoConnection.value && selectedId.value) {
+    ids.add(selectedId.value);
+  }
   return ids;
 });
 
 const activeConnectionId = computed(() => {
+  if (isMongoConnection.value && selectedId.value) return selectedId.value;
   const table = activeTableTab.value;
   if (table?.connectionId) return table.connectionId;
   const er = activeErTab.value;
@@ -1196,6 +1493,9 @@ const activeConnectionId = computed(() => {
     isRedisConnection.value &&
     selectedId.value
   ) {
+    return selectedId.value;
+  }
+  if (isMongoConnection.value && selectedId.value) {
     return selectedId.value;
   }
   return null;
@@ -1242,6 +1542,11 @@ function connectionTarget(connection: ConnectionConfig): string {
       ? `db${value.padStart(2, "0")}`
       : `db${value}`;
     return `${connection.host}:${connection.port} · ${label}`;
+  }
+  if (connection.driver === "mongodb") {
+    const user = connection.username ? `${connection.username}@` : "";
+    const database = connection.database || "admin";
+    return `${user}${connection.host}:${connection.port}/${database}`;
   }
   return `${connection.username}@${connection.host}:${connection.port}/${connection.database}`;
 }
@@ -1312,6 +1617,8 @@ function createTableTab(
   schema: string | null,
   mode: "data" | "structure",
   focusedIndex: string | null = null,
+  linkedFilter: string | null = null,
+  linkedFilterLabel: string | null = null,
 ): TableTab {
   tableSequence += 1;
   return {
@@ -1322,6 +1629,10 @@ function createTableTab(
     table,
     mode,
     focusedIndex,
+    focusedColumn: null,
+    focusedColumnPulse: 0,
+    linkedFilter,
+    linkedFilterLabel,
   };
 }
 
@@ -1663,6 +1974,46 @@ async function refreshTables() {
     return;
   }
 
+  if (selected.value?.driver === "mongodb") {
+    tables.value = [];
+    tablesConnectionId.value = null;
+    databases.value = [];
+    activeDatabase.value = null;
+    schemas.value = [];
+    activeSchema.value = null;
+    for (const key of Object.keys(databaseObjects)) {
+      delete databaseObjects[key];
+    }
+    tablesLoading.value = true;
+    connectionStatus.value = "connecting";
+    connectionError.value = "";
+    try {
+      const names = await api.mongoListDatabases(connectionId);
+      if (request !== tablesRequest) return;
+      const preferred =
+        mongoDatabaseByConnection[connectionId] ??
+        normalizeScopeValue(selected.value.database) ??
+        "";
+      if (preferred && names.includes(preferred)) {
+        mongoDatabaseByConnection[connectionId] = preferred;
+      } else if (names.length && !names.includes(mongoDatabaseByConnection[connectionId])) {
+        mongoDatabaseByConnection[connectionId] = names[0];
+      }
+      connectionStatus.value = "connected";
+      status.value = `${selected.value?.name ?? "MongoDB"} · ${names.length} 个数据库`;
+    } catch (reason) {
+      if (request !== tablesRequest) return;
+      connectionStatus.value = "failed";
+      connectionError.value = String(reason);
+      status.value = connectionError.value;
+    } finally {
+      if (request === tablesRequest) {
+        tablesLoading.value = false;
+      }
+    }
+    return;
+  }
+
   if (selected.value?.driver === "mysql") {
     tablesLoading.value = true;
     connectionStatus.value = "connecting";
@@ -1795,15 +2146,22 @@ async function refreshTables() {
     tables.value = list;
     tablesConnectionId.value = connectionId;
     connectionStatus.value = "connected";
+    autoReconnectTried = false;
     closeStaleTableTab();
     status.value = `${selected.value?.name ?? "当前连接"} · ${list.length} 个对象`;
   } catch (reason) {
     if (request !== tablesRequest) return;
-    tables.value = [];
-    tablesConnectionId.value = connectionId;
-    connectionStatus.value = "failed";
-    connectionError.value = String(reason);
-    status.value = connectionError.value;
+    const message = String(reason);
+    if (isConnectionLostError(message)) {
+      connectionError.value = message;
+      handleConnectionLost(message);
+    } else {
+      tables.value = [];
+      tablesConnectionId.value = connectionId;
+      connectionStatus.value = "failed";
+      connectionError.value = message;
+      status.value = connectionError.value;
+    }
   } finally {
     if (request === tablesRequest) {
       tablesLoading.value = false;
@@ -1904,7 +2262,12 @@ async function refreshConnections(selectId?: string) {
       }
     }
     const connection = connectionFor(selectedId.value);
-    if (connection && connection.driver !== "redis" && tabs.value.length) {
+    if (
+      connection &&
+      connection.driver !== "redis" &&
+      connection.driver !== "mongodb" &&
+      tabs.value.length
+    ) {
       ensureTabForSource(true);
       if (pendingRestoredActiveTabId) {
         const restoredTab = tabs.value.find(
@@ -2126,6 +2489,10 @@ function locateActiveConnection() {
 function newQuery() {
   if (isRedisConnection.value) {
     status.value = "Redis 连接请使用命令控制台";
+    return;
+  }
+  if (isMongoConnection.value) {
+    status.value = "MongoDB 连接请使用集合浏览与 JSON 筛选";
     return;
   }
   let connectionId = selectedId.value;
@@ -2673,6 +3040,7 @@ async function handleSave(payload: SavePayload) {
     dialogOpen.value = false;
     delete databaseByConnection[saved.id];
     delete redisDatabaseByConnection[saved.id];
+    delete mongoDatabaseByConnection[saved.id];
     closeTabsForConnection(saved.id);
     await refreshConnections(saved.id);
     status.value = `已保存连接：${saved.name}`;
@@ -2694,6 +3062,7 @@ function handleDelete(connection: ConnectionConfig) {
         resetConnectionTransactions(connection.id);
         delete databaseByConnection[connection.id];
         delete schemaByConnection[connection.id];
+        delete mongoDatabaseByConnection[connection.id];
         delete redisDatabaseByConnection[connection.id];
         for (const tab of tabs.value) {
           if (tab.connectionId === connection.id) {
@@ -2775,6 +3144,10 @@ function menuRefreshConnection() {
 function openQueryForConnection(connectionId: string) {
   if (connectionFor(connectionId)?.driver === "redis") {
     status.value = "Redis 连接请使用命令控制台";
+    return;
+  }
+  if (connectionFor(connectionId)?.driver === "mongodb") {
+    status.value = "MongoDB 连接请使用集合浏览与 JSON 筛选";
     return;
   }
   selectedId.value = connectionId;
@@ -3003,6 +3376,8 @@ async function connectGroup(name: string) {
     try {
       if (connection.driver === "redis") {
         await api.redisPing(connection.id);
+      } else if (connection.driver === "mongodb") {
+        await api.mongoListDatabases(connection.id);
       } else {
         await api.listDatabases(connection.id);
       }
@@ -3069,6 +3444,7 @@ async function openTableTabAt(
   mode: "data" | "structure",
   focusedIndex: string | null = null,
   forceNew = false,
+  focusedColumn: string | null = null,
 ) {
   if (!isViewableTable(table)) {
     const labels: Record<string, string> = {
@@ -3093,11 +3469,16 @@ async function openTableTabAt(
         (item) =>
           sourceMatches(item, connectionId, database, schema) &&
           item.table.name === table.name &&
-          item.table.kind === table.kind,
+          item.table.kind === table.kind &&
+          !item.linkedFilter,
       ) ?? null);
   if (tab) {
     tab.mode = mode;
-    tab.focusedIndex = focusedIndex;
+    tab.focusedIndex = focusedColumn ? null : focusedIndex;
+    tab.focusedColumn = focusedColumn;
+    if (focusedColumn) {
+      tab.focusedColumnPulse = (tab.focusedColumnPulse ?? 0) + 1;
+    }
   } else {
     tab = createTableTab(
       table,
@@ -3105,8 +3486,10 @@ async function openTableTabAt(
       database,
       schema,
       mode,
-      focusedIndex,
+      focusedColumn ? null : focusedIndex,
     );
+    tab.focusedColumn = focusedColumn;
+    tab.focusedColumnPulse = focusedColumn ? 1 : 0;
     tableTabs.value.push(tab);
     tabOrder.value.push(tab.id);
   }
@@ -3119,6 +3502,258 @@ function openTable(table: TableInfo) {
 
 function openTableInNewTab(table: TableInfo) {
   void openTableTabAt(table, "data", null, true);
+}
+
+async function openLinkedTable(payload: {
+  table: string;
+  filter: string;
+  label: string;
+}) {
+  const connectionId = selectedId.value;
+  if (!connectionId || isRedisConnection.value) return;
+  const database = normalizeScopeValue(activeDatabase.value);
+  const schema = normalizeScopeValue(activeSchema.value);
+  const table = tables.value.find(
+    (item) => item.name === payload.table && isViewableTable(item),
+  );
+  if (!table) {
+    status.value = `目标表不存在或不在当前库 / 模式：${payload.table}`;
+    return;
+  }
+  const existing = tableTabs.value.find(
+    (tab) =>
+      sourceMatches(tab, connectionId, database, schema) &&
+      tab.table.name === table.name &&
+      tab.table.kind === table.kind &&
+      normalizeScopeValue(tab.linkedFilter) ===
+        normalizeScopeValue(payload.filter),
+  );
+  if (existing) {
+    existing.mode = "data";
+    await selectTableTab(existing);
+    status.value = `已按 ${payload.label} 跳转：${payload.filter}`;
+    return;
+  }
+  const tab = createTableTab(
+    table,
+    connectionId,
+    database,
+    schema,
+    "data",
+    null,
+    payload.filter,
+    payload.label,
+  );
+  tableTabs.value.push(tab);
+  tabOrder.value.push(tab.id);
+  await selectTableTab(tab);
+  status.value = `已按 ${payload.label} 跳转：${payload.filter}`;
+}
+
+function pinResultOnTab(tab: QueryTab) {
+  if (!tab || tab.running || tab.error || tab.batchError) {
+    status.value = tab?.running
+      ? "查询执行中，暂不能固定结果"
+      : "当前有执行失败，暂不能固定结果";
+    return;
+  }
+  const result = tab.result;
+  if (!result || !result.isQuery || !result.rows.length) {
+    status.value = "当前没有可固定的查询结果";
+    return;
+  }
+  if (tab.activePinId) {
+    status.value = "请先返回实时结果再固定";
+    return;
+  }
+  if (tab.pinnedResults.length >= MAX_PINNED_RESULTS) {
+    status.value = `每个查询标签最多固定 ${MAX_PINNED_RESULTS} 个结果，请先取消一个`;
+    return;
+  }
+  const bytes = estimateResultBytes(result);
+  if (bytes > MAX_PINNED_BYTES) {
+    status.value = "固定结果过大（超过 10 MB），请先导出或缩小结果";
+    return;
+  }
+  if (pinnedResultBytes(tab.pinnedResults) + bytes > MAX_PINNED_TOTAL_BYTES) {
+    status.value = "当前标签的固定结果总量超过 50 MB，请先取消一个";
+    return;
+  }
+  const cloned = cloneQueryResult(result);
+  if (!cloned) {
+    status.value = "固定结果失败：无法复制结果数据";
+    return;
+  }
+  const pinnedAt = Date.now();
+  const pin: PinnedQueryResult = {
+    id: nextPinId(),
+    name: uniquePinName(
+      defaultPinName(tab.resultSetIndex, tab.resultSets.length, pinnedAt),
+      tab.pinnedResults,
+    ),
+    pinnedAt,
+    sql: tab.sql,
+    connectionId: tab.connectionId ?? "",
+    database: tab.database,
+    schema: tab.schema,
+    resultSetIndex: tab.resultSetIndex,
+    result: cloned,
+    approxBytes: bytes,
+  };
+  tab.pinnedResults.push(pin);
+  tab.activePinId = pin.id;
+  status.value = `已固定结果「${pin.name}」；重新执行不会覆盖`;
+}
+
+function unpinResultOnTab(tab: QueryTab, id: string) {
+  const pin = tab?.pinnedResults.find((item) => item.id === id);
+  if (!pin) return;
+  tab.pinnedResults = tab.pinnedResults.filter((item) => item.id !== id);
+  if (tab.activePinId === id) tab.activePinId = null;
+  status.value = `已取消固定「${pin.name}」`;
+}
+
+function renameResultOnTab(tab: QueryTab, id: string, name: string) {
+  const pin = tab?.pinnedResults.find((item) => item.id === id);
+  if (!pin) return;
+  const next = uniquePinName(name, tab.pinnedResults, id);
+  if (!next) {
+    status.value = "固定结果名称不能为空";
+    return;
+  }
+  pin.name = next;
+  status.value = `已重命名固定结果为「${next}」`;
+}
+
+function selectPinnedResult(tab: QueryTab, id: string | null) {
+  if (!tab) return;
+  if (id && !tab.pinnedResults.some((pin) => pin.id === id)) {
+    tab.activePinId = null;
+    return;
+  }
+  tab.activePinId = id;
+}
+
+function pinSplitResult() {
+  if (splitView.value?.kind === "query") {
+    pinResultOnTab(splitView.value.query);
+  }
+}
+
+function unpinSplitResult(id: string) {
+  if (splitView.value?.kind === "query") {
+    unpinResultOnTab(splitView.value.query, id);
+  }
+}
+
+function renameSplitResult(id: string, name: string) {
+  if (splitView.value?.kind === "query") {
+    renameResultOnTab(splitView.value.query, id, name);
+  }
+}
+
+function selectSplitPinnedResult(id: string | null) {
+  if (splitView.value?.kind === "query") {
+    selectPinnedResult(splitView.value.query, id);
+  }
+}
+
+function navigationTable(payload: SqlNavigationPayload): TableInfo {
+  const kind = payload.tableKind ?? "table";
+  return {
+    name: payload.table ?? "",
+    kind,
+  };
+}
+
+async function handleSqlNavigate(payload: SqlNavigationPayload) {
+  if (standaloneQueryWindow) {
+    status.value = "独立查询窗口暂不支持打开表标签，请在主窗口打开对象";
+    return;
+  }
+  if (!payload.table) {
+    if (payload.reason) status.value = payload.reason;
+    return;
+  }
+  const query = activeTab.value;
+  if (
+    query &&
+    query.connectionId &&
+    query.connectionId !== selectedId.value
+  ) {
+    const switched = await activateTabSource(query);
+    if (!switched) return;
+  }
+  if (!selectedId.value || isRedisConnection.value) {
+    status.value = "当前连接不能打开表";
+    return;
+  }
+  const table = navigationTable(payload);
+  await openTableTabAt(
+    table,
+    payload.kind === "column" ? "structure" : "data",
+    null,
+    false,
+    payload.kind === "column" ? payload.column ?? null : null,
+  );
+  status.value =
+    payload.kind === "column"
+      ? `已打开表 ${table.name} 结构并定位字段 ${payload.column}`
+      : `已打开表 ${table.name}`;
+}
+
+async function handleSplitSqlNavigate(payload: SqlNavigationPayload) {
+  if (!payload.table) {
+    if (payload.reason) status.value = payload.reason;
+    return;
+  }
+  const query =
+    splitView.value?.kind === "query" ? splitView.value.query : null;
+  if (!query) {
+    status.value = "当前没有可用的查询分屏";
+    return;
+  }
+  if (query.connectionId !== selectedId.value) {
+    status.value = "分屏标签必须来自当前连接";
+    return;
+  }
+  const table = navigationTable(payload);
+  const tableMode = payload.kind === "column" ? "structure" : "data";
+  let tab = tableTabs.value.find(
+    (item) =>
+      sourceMatches(item, query.connectionId, query.database, query.schema) &&
+      item.table.name === table.name &&
+      item.table.kind === table.kind &&
+      !item.linkedFilter,
+  );
+  if (tab) {
+    tab.mode = tableMode;
+    tab.focusedIndex = null;
+    tab.focusedColumn =
+      payload.kind === "column" ? payload.column ?? null : null;
+    if (tab.focusedColumn) {
+      tab.focusedColumnPulse = (tab.focusedColumnPulse ?? 0) + 1;
+    }
+  } else {
+    tab = createTableTab(
+      table,
+      query.connectionId,
+      query.database,
+      query.schema,
+      tableMode,
+    );
+    tab.focusedColumn =
+      payload.kind === "column" ? payload.column ?? null : null;
+    tab.focusedColumnPulse = tab.focusedColumn ? 1 : 0;
+    tableTabs.value.push(tab);
+    tabOrder.value.push(tab.id);
+  }
+  splitTabId.value = tab.id;
+  historyOpen.value = false;
+  status.value =
+    payload.kind === "column"
+      ? `已在右侧打开 ${table.name} 结构并定位字段 ${payload.column}`
+      : `已在右侧打开表 ${table.name}`;
 }
 
 async function openIndex(table: TableInfo) {
@@ -3569,7 +4204,7 @@ async function loadHistory(force = false) {
 }
 
 watch(viewMode, (mode) => {
-  if (mode === "empty" && connectionsLoaded.value && !isRedisConnection.value) {
+  if (mode === "empty" && connectionsLoaded.value && !isRedisConnection.value && !isMongoConnection.value) {
     void loadHistory(true);
   }
 });
@@ -3577,6 +4212,10 @@ watch(viewMode, (mode) => {
 async function toggleHistory() {
   if (isRedisConnection.value) {
     status.value = "Redis 连接暂不支持 SQL 历史";
+    return;
+  }
+  if (isMongoConnection.value) {
+    status.value = "MongoDB 连接暂不支持 SQL 历史";
     return;
   }
   if (historyOpen.value) {
@@ -3641,12 +4280,42 @@ function handleSqlSelection(value: string) {
   if (activeTab.value) activeTab.value.selectedSql = value;
 }
 
-async function runQuery(selectedSql?: string) {
-  const tab = activeTab.value;
-  if (tab) await runQueryOnTab(tab, selectedSql);
+type QueryRunScope = "auto" | "statement" | "tab";
+
+function currentStatementForTab(tab: QueryTab): string {
+  if (
+    splitView.value?.kind === "query" &&
+    splitView.value.query.id === tab.id
+  ) {
+    return splitQueryWorkspaceRef.value?.currentStatement() ?? "";
+  }
+  if (tab.id === activeTabId.value) {
+    return queryWorkspaceRef.value?.currentStatement() ?? "";
+  }
+  return "";
 }
 
-async function runQueryOnTab(tab: QueryTab, selectedSql?: string) {
+function complexScript(sql: string): boolean {
+  const count = splitSqlStatements(sql).filter((range) =>
+    hasSqlContent(range.text),
+  ).length;
+  return (
+    count > 1 &&
+    (/(^|\n)\s*DELIMITER\b/i.test(sql) ||
+      /\bCREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b/i.test(sql))
+  );
+}
+
+async function runQuery(selectedSql?: string) {
+  const tab = activeTab.value;
+  if (tab) await runQueryOnTab(tab, selectedSql, "auto");
+}
+
+async function runQueryOnTab(
+  tab: QueryTab,
+  selectedSql?: string,
+  scope: QueryRunScope = "auto",
+) {
   if (!tab || tab.running) return;
   if (!tab.connectionId) {
     status.value = "请先选择一个数据库连接";
@@ -3657,9 +4326,36 @@ async function runQueryOnTab(tab: QueryTab, selectedSql?: string) {
     return;
   }
 
-  const candidate = (selectedSql !== undefined ? selectedSql : tab.selectedSql) ?? "";
-  const usingSelection = candidate.trim().length > 0;
-  const sqlText = usingSelection ? candidate : tab.sql;
+  let usingSelection = false;
+  let sqlText = tab.sql;
+  let scopeLabel = "执行整个标签…";
+  if (scope !== "tab") {
+    const candidate =
+      (selectedSql !== undefined ? selectedSql : tab.selectedSql) ?? "";
+    usingSelection = candidate.trim().length > 0;
+    if (usingSelection) {
+      sqlText = candidate;
+      scopeLabel = "执行选中 SQL…";
+    } else if (
+      scope === "statement" ||
+      (scope === "auto" && queryRunMode.value === "statement")
+    ) {
+      if (complexScript(tab.sql)) {
+        tab.stopNote =
+          "当前脚本包含 DELIMITER / 触发器体，无法确定当前语句；请选中后执行，或使用「文件 → 执行 SQL 文件…」";
+        status.value = tab.stopNote;
+        return;
+      }
+      const statement = currentStatementForTab(tab);
+      if (!statement.trim() || !hasSqlContent(statement)) {
+        tab.stopNote = "光标不在可执行语句内";
+        status.value = tab.stopNote;
+        return;
+      }
+      sqlText = statement;
+      scopeLabel = "执行当前语句…";
+    }
+  }
   if (dangerousConfirmEnabled.value) {
     const finding = findDangerousSql(sqlText);
     if (finding) {
@@ -3673,66 +4369,212 @@ async function runQueryOnTab(tab: QueryTab, selectedSql?: string) {
       return;
     }
   }
-  await executeSqlOnTab(tab, sqlText, usingSelection);
+  await executeSqlOnTab(tab, sqlText, usingSelection, scopeLabel);
+}
+
+async function runStatementOnTab(tab: QueryTab) {
+  await runQueryOnTab(tab, undefined, "statement");
+}
+
+async function runWholeTabOnTab(tab: QueryTab) {
+  await runQueryOnTab(tab, undefined, "tab");
+}
+
+async function runCurrentStatement() {
+  if (activeTab.value) await runStatementOnTab(activeTab.value);
+}
+
+async function runWholeTab() {
+  if (activeTab.value) await runWholeTabOnTab(activeTab.value);
 }
 
 async function executeSqlOnTab(
   tab: QueryTab,
   sqlText: string,
   usingSelection: boolean,
+  scopeLabel?: string,
 ) {
   const tabId = tab.id;
   const connectionId = tab.connectionId;
   if (!connectionId) return;
-  const operationId = newOperationId();
+  const statements = splitSqlStatements(sqlText)
+    .filter((range) => hasSqlContent(range.text))
+    .map((range) => range.text);
+  const complexScript =
+    statements.length > 1 &&
+    (/(^|\n)\s*DELIMITER\b/i.test(sqlText) ||
+      /\bCREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b/i.test(sqlText));
+  if (complexScript) {
+    const message =
+      "包含 DELIMITER 或触发器的多语句脚本请使用「文件 → 执行 SQL 文件…」运行";
+    tab.stopNote = message;
+    status.value = message;
+    return;
+  }
+
+  if (statements.length <= 1) {
+    const operationId = newOperationId();
+    tab.running = true;
+    tab.operationId = operationId;
+    tab.stopping = false;
+    tab.stopNote = null;
+    tab.error = null;
+    tab.resultSets = [];
+    tab.resultSetIndex = 0;
+    tab.batchError = null;
+    tab.explainResult = null;
+    tab.explainError = null;
+    tab.explainLoading = false;
+    tab.showExplain = false;
+    status.value =
+      scopeLabel ?? (usingSelection ? "执行选中 SQL…" : "执行中…");
+
+    try {
+      const queryResult = tab.inTransaction
+        ? await api.executeTransactionQuery(
+            connectionId,
+            tabId,
+            sqlText,
+            1000,
+            operationId,
+          )
+        : await api.executeQuery(connectionId, sqlText, 1000, operationId);
+      if (!tabs.value.some((item) => item.id === tabId)) return;
+      tab.result = queryResult;
+      if (activeTabId.value === tabId || splitTabId.value === tabId) {
+        status.value = queryResult.isQuery
+          ? `${queryResult.rows.length} 行 · ${queryResult.elapsedMs} ms${
+              queryResult.truncated ? " · 已截断" : ""
+            }${tab.inTransaction ? " · 事务未提交" : ""}`
+          : `执行完成 · 影响 ${queryResult.rowsAffected} 行 · ${queryResult.elapsedMs} ms${
+              tab.inTransaction ? " · 事务未提交" : ""
+            }`;
+      }
+    } catch (reason) {
+      if (!tabs.value.some((item) => item.id === tabId)) return;
+      tab.result = null;
+      tab.error = String(reason);
+      reportConnectionError(tab.error, connectionId);
+      if (activeTabId.value === tabId || splitTabId.value === tabId) {
+        status.value = tab.error.startsWith("查询超时")
+          ? "查询已超时"
+          : tab.error === "已取消"
+            ? "已取消"
+            : "查询失败";
+      }
+    } finally {
+      tab.running = false;
+      tab.stopping = false;
+      tab.operationId = null;
+      tab.stopNote = null;
+    }
+    return;
+  }
+
+  // Several statements: run them one by one and keep every result so the
+  // result panel can switch between them. A failure keeps the results that
+  // already completed instead of replacing the whole panel with an error.
   tab.running = true;
-  tab.operationId = operationId;
   tab.stopping = false;
   tab.stopNote = null;
   tab.error = null;
+  tab.batchError = null;
+  tab.result = null;
+  tab.resultSets = [];
+  tab.resultSetIndex = 0;
   tab.explainResult = null;
   tab.explainError = null;
   tab.explainLoading = false;
   tab.showExplain = false;
-  status.value = usingSelection ? "执行选中 SQL…" : "执行中…";
+  status.value = `执行 ${statements.length} 条语句…`;
+  let completed = 0;
+  let stopped = false;
+  let canceled = false;
 
   try {
-    const queryResult = tab.inTransaction
-      ? await api.executeTransactionQuery(
-          connectionId,
-          tabId,
-          sqlText,
-          1000,
-          operationId,
-        )
-      : await api.executeQuery(connectionId, sqlText, 1000, operationId);
-    if (!tabs.value.some((item) => item.id === tabId)) return;
-    tab.result = queryResult;
-    if (activeTabId.value === tabId || splitTabId.value === tabId) {
-      status.value = queryResult.isQuery
-        ? `${queryResult.rows.length} 行 · ${queryResult.elapsedMs} ms${
-            queryResult.truncated ? " · 已截断" : ""
-          }${tab.inTransaction ? " · 事务未提交" : ""}`
-        : `执行完成 · 影响 ${queryResult.rowsAffected} 行 · ${queryResult.elapsedMs} ms${
-            tab.inTransaction ? " · 事务未提交" : ""
-          }`;
+    for (let index = 0; index < statements.length; index += 1) {
+      if (tab.stopping) {
+        stopped = true;
+        break;
+      }
+      const operationId = newOperationId();
+      tab.operationId = operationId;
+      if (activeTabId.value === tabId || splitTabId.value === tabId) {
+        status.value = `执行中 ${index + 1}/${statements.length}…`;
+      }
+      try {
+        const queryResult = tab.inTransaction
+          ? await api.executeTransactionQuery(
+              connectionId,
+              tabId,
+              statements[index],
+              1000,
+              operationId,
+            )
+          : await api.executeQuery(
+              connectionId,
+              statements[index],
+              1000,
+              operationId,
+            );
+        if (!tabs.value.some((item) => item.id === tabId)) return;
+        completed += 1;
+        tab.resultSets = [...tab.resultSets, queryResult];
+        tab.resultSetIndex = tab.resultSets.length - 1;
+        tab.result = queryResult;
+      } catch (reason) {
+        if (!tabs.value.some((item) => item.id === tabId)) return;
+        const message = String(reason);
+        canceled =
+          message === "已取消" ||
+          message.startsWith("查询超时") ||
+          message.startsWith("查询已取消");
+        if (canceled) {
+          stopped = true;
+          tab.stopNote =
+            completed > 0
+              ? `已取消（已完成 ${completed} 条语句）`
+              : "已取消";
+          if (activeTabId.value === tabId || splitTabId.value === tabId) {
+            status.value = tab.stopNote;
+          }
+        } else if (completed === 0) {
+          tab.resultSets = [];
+          tab.result = null;
+          tab.error = `第 ${index + 1} 条语句失败：${message}`;
+          reportConnectionError(tab.error, connectionId);
+          if (activeTabId.value === tabId || splitTabId.value === tabId) {
+            status.value = "查询失败";
+          }
+        } else {
+          tab.batchError = `第 ${index + 1} 条语句失败（已完成 ${completed} 条）：${message}`;
+          if (activeTabId.value === tabId || splitTabId.value === tabId) {
+            status.value = `第 ${index + 1} 条语句失败`;
+          }
+        }
+        break;
+      } finally {
+        tab.operationId = null;
+      }
     }
-  } catch (reason) {
-    if (!tabs.value.some((item) => item.id === tabId)) return;
-    tab.result = null;
-    tab.error = String(reason);
-    if (activeTabId.value === tabId || splitTabId.value === tabId) {
-      status.value = tab.error.startsWith("查询超时")
-        ? "查询已超时"
-        : tab.error === "已取消"
-          ? "已取消"
-          : "查询失败";
+    if (
+      completed > 0 &&
+      !tab.error &&
+      !tab.batchError &&
+      !canceled &&
+      !stopped
+    ) {
+      tab.stopNote = `已完成 ${completed} 条语句`;
+      if (activeTabId.value === tabId || splitTabId.value === tabId) {
+        status.value = `已完成 ${completed} 条语句 · ${completed} 个结果`;
+      }
+    } else if (stopped && completed > 0 && !tab.stopNote) {
+      tab.stopNote = `已停止（已完成 ${completed} 条语句）`;
     }
   } finally {
     tab.running = false;
     tab.stopping = false;
     tab.operationId = null;
-    tab.stopNote = null;
   }
 }
 
@@ -5273,6 +6115,20 @@ const appActions = computed<AppAction[]>(() => {
       run: () => queryWorkspaceRef.value?.requestExport(),
     },
     {
+      id: "check-sql",
+      group: "query",
+      label: "检查 SQL",
+      icon: "check",
+      priority: 21,
+      placement: "more",
+      enabled:
+        viewMode.value === "sql" &&
+        Boolean(activeTab.value) &&
+        !isRedisConnection.value,
+      disabledReason: "请先切换到查询标签",
+      run: () => runSqlCheck(),
+    },
+    {
       id: "close-tab",
       group: "query",
       label: "关闭标签",
@@ -5369,6 +6225,7 @@ const modalBlockedActionIds = new Set([
   "editor-toggle-comment",
   "editor-format-sql",
   "editor-format-settings",
+  "check-sql",
   "settings",
   "close-window",
   "quit-app",
@@ -5409,6 +6266,15 @@ function runSqlEditorCommand(
     return;
   }
   queryWorkspaceRef.value?.runEditorCommand(command);
+}
+
+function runSqlCheck(scope: "statement" | "tab" = "statement") {
+  if (!canEditSql.value) return;
+  if (hasOpenModal.value) {
+    status.value = "请先关闭当前对话框";
+    return;
+  }
+  queryWorkspaceRef.value?.runCheck(scope);
 }
 
 const appMenus = computed<MenuBarMenu[]>(() => {
@@ -5587,6 +6453,7 @@ const appMenus = computed<MenuBarMenu[]>(() => {
           disabledReason: "请先打开查询标签",
           action: () => runSqlEditorCommand("toggle-comment"),
         },
+        fromAction("check-sql"),
         {
           id: "editor-format-sql",
           label: "格式化 SQL",
@@ -5906,11 +6773,12 @@ async function openConnectionFromPalette(id: string) {
     redisWorkspaceOpen.value = true;
     return;
   }
+  if (isMongoConnection.value) return;
   ensureTabForSource(true);
 }
 
 const paletteObjects = computed<PaletteItem[]>(() => {
-  if (!selectedId.value || isRedisConnection.value) return [];
+  if (!selectedId.value || isRedisConnection.value || isMongoConnection.value) return [];
   const items: PaletteItem[] = [];
   const source = {
     connectionId: selectedId.value,
@@ -5996,6 +6864,7 @@ const paletteActionIds = [
   "open-sql-file",
   "save-sql",
   "reopen-closed-tab",
+  "check-sql",
   "close-tab",
 ];
 
@@ -6030,6 +6899,17 @@ const paletteCommands = computed<PaletteItem[]>(() => {
     shortcut: runShortcutLabel.value,
     disabledReason: runDisabledReason.value || undefined,
     run: () => void runQuery(),
+  });
+  commands.push({
+    id: "command:run-all",
+    kind: "command",
+    label: "运行整个标签",
+    detail: runDisabledReason.value || "执行当前标签的全部 SQL",
+    badge: "命令",
+    icon: "play",
+    keywords: ["run", "execute", "sql", "all", "tab", "script"],
+    disabledReason: runDisabledReason.value || undefined,
+    run: () => void runWholeTab(),
   });
   commands.push({
     id: "command:edit-connection",
@@ -6294,6 +7174,10 @@ async function bindMenuEvents() {
       () => runSqlEditorCommand("toggle-comment"),
     ],
     [
+      "menu:check-sql",
+      () => runSqlCheck(),
+    ],
+    [
       "menu:editor-format-sql",
       () => runSqlEditorCommand("format-sql"),
     ],
@@ -6347,6 +7231,7 @@ onMounted(async () => {
   window.addEventListener("resize", closeAppContextMenu);
   window.addEventListener("resize", updateTabScroll);
   window.addEventListener("resize", updateViewportWidth);
+  document.addEventListener("visibilitychange", onVisibilityChange);
   window.addEventListener("blur", closeAppContextMenu);
   window.addEventListener("blur", closeTabMenu);
   window.addEventListener("blur", () => {
@@ -6419,6 +7304,9 @@ onBeforeUnmount(() => {
   window.removeEventListener("resize", closeAppContextMenu);
   window.removeEventListener("resize", updateTabScroll);
   window.removeEventListener("resize", updateViewportWidth);
+  document.removeEventListener("visibilitychange", onVisibilityChange);
+  stopHealthChecks();
+  window.clearTimeout(reconnectNoticeTimer);
   window.removeEventListener("blur", closeAppContextMenu);
   window.removeEventListener("blur", closeTabMenu);
   window.removeEventListener("resize", closeTabMenu);
@@ -6726,6 +7614,13 @@ onBeforeUnmount(() => {
         <div class="sidebar-footer">
           <span class="status-dot" :class="connectionStatus"></span>
           <span>{{ connectionStatusLabel }}</span>
+          <button
+            v-if="connectionStatus === 'lost' && !reconnecting"
+            class="link-button"
+            @click="reconnectActiveConnection(false)"
+          >
+            重新连接
+          </button>
           <span
             v-if="connectionError"
             class="sidebar-footer-error"
@@ -6770,6 +7665,15 @@ onBeforeUnmount(() => {
           >
             <Icon name="plus" :size="14" />
           </button>
+        </div>
+        <div v-else-if="isMongoConnection" class="workspace-tabs">
+          <div class="workspace-tab active redis-tab mongo-tab">
+            <Icon name="database" :size="14" />
+            <span class="tab-label">MongoDB</span>
+            <span v-if="selected" class="hint">
+              {{ selected.name }} · {{ mongoDatabase || "选择数据库" }}
+            </span>
+          </div>
         </div>
         <div v-else-if="connections.length" class="workspace-tabs">
           <span
@@ -6921,6 +7825,57 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
+        <div
+          v-if="
+            selected &&
+            connectionStatus === 'lost' &&
+            !lostBannerDismissed
+          "
+          class="connection-lost-bar"
+          role="alert"
+        >
+          <Icon name="warning" :size="15" />
+          <div class="connection-lost-copy">
+            <strong>连接可能已断开</strong>
+            <span
+              class="connection-lost-error"
+              :title="lostConnectionError"
+            >
+              {{ summarizeConnectionError(lostConnectionError) }}
+            </span>
+            <span class="connection-lost-hint">
+              重连只恢复连接，不会重新执行 SQL；会话临时表 / 变量会丢失。
+            </span>
+          </div>
+          <span v-if="reconnecting" class="connection-lost-progress">
+            {{ reconnectAutoAttempt ? "正在尝试自动重新连接…" : "正在重新连接…" }}
+          </span>
+          <button
+            class="button primary compact"
+            :disabled="Boolean(reconnectDisabledReason) || reconnecting"
+            :title="reconnectDisabledReason || '重新建立连接'"
+            @click="reconnectActiveConnection(false)"
+          >
+            <span v-if="reconnecting" class="spinner"></span>
+            {{ reconnecting ? "重连中…" : "重新连接" }}
+          </button>
+          <button
+            class="button ghost compact"
+            :disabled="reconnecting"
+            @click="dismissLostBanner"
+          >
+            忽略
+          </button>
+        </div>
+        <div
+          v-else-if="selected && reconnectNotice"
+          class="connection-reconnect-notice"
+          role="status"
+        >
+          <Icon name="check" :size="14" />
+          {{ reconnectNotice }}
+        </div>
+
         <div class="workspace">
           <WorkspaceStart
             v-if="connectionsLoaded && !connections.length"
@@ -6936,6 +7891,15 @@ onBeforeUnmount(() => {
             :history-loading="false"
             :command-key="commandKeyLabel"
             @new-connection="openNewConnection"
+          />
+          <MongoWorkspace
+            v-else-if="isMongoConnection && selectedId"
+            :key="selectedId"
+            :connection-id="selectedId"
+            :connection-name="selected?.name"
+            :database="mongoDatabase ?? selected?.database"
+            :read-only="Boolean(selected?.readOnly)"
+            @database-change="handleMongoDatabaseChange"
           />
           <RedisWorkspace
             v-else-if="isRedisConnection && selectedId && redisWorkspaceOpen"
@@ -7040,9 +8004,15 @@ onBeforeUnmount(() => {
             v-show="viewMode === 'sql'"
             :sql="sql"
             :tab-id="activeTabId"
+            :tab-title="activeTab?.title ?? '查询'"
             :driver="driverForConnection(activeTab?.connectionId ?? null)"
+            :database="activeTab?.database ?? null"
+            :schema="activeTab?.schema ?? null"
             :completion-tables="completionTables"
             :result="result"
+            :result-sets="activeTab?.resultSets ?? []"
+            :result-set-index="activeTab?.resultSetIndex ?? 0"
+            :batch-error="activeTab?.batchError ?? null"
             :running="running"
             :stopping="activeTab?.stopping ?? false"
             :stop-note="activeTab?.stopNote ?? null"
@@ -7054,23 +8024,41 @@ onBeforeUnmount(() => {
             :can-run="!runDisabledReason"
             :run-disabled-reason="runDisabledReason"
             :run-shortcut-label="runShortcutLabel"
+            :run-mode="queryRunMode"
             :explain-result="activeTab?.explainResult ?? null"
             :explain-error="activeTab?.explainError ?? null"
             :explain-loading="activeTab?.explainLoading ?? false"
             :show-explain="activeTab?.showExplain ?? false"
+            :pinned-results="activeTab?.pinnedResults ?? []"
+            :active-pin-id="activeTab?.activePinId ?? null"
             @update:sql="sql = $event"
             @selection="handleSqlSelection"
             @run="runQuery"
+            @run-statement="runCurrentStatement"
+            @run-tab="runWholeTab"
             @stop="stopActiveQuery"
             @open-snippets="openSnippetLibrary"
             @open-format-settings="openFormatSettings"
             @explain="explainQuery"
+            @navigate="handleSqlNavigate"
             @show-explain="setExplainView"
             @begin-transaction="beginTransaction"
             @commit-transaction="commitTransaction"
             @rollback-transaction="rollbackTransaction"
             @update:editor-ratio="layout.editorRatio = $event"
             @toggle-result="toggleResultPanel"
+            @select-result-set="selectActiveResultSet"
+            @pin-result="activeTab && pinResultOnTab(activeTab)"
+            @unpin-result="
+              activeTab && unpinResultOnTab(activeTab, $event)
+            "
+            @rename-pin="
+              activeTab &&
+                renameResultOnTab(activeTab, $event.id, $event.name)
+            "
+            @select-pin="
+              activeTab && selectPinnedResult(activeTab, $event)
+            "
           />
           <div
             v-show="viewMode === 'table'"
@@ -7118,6 +8106,11 @@ onBeforeUnmount(() => {
                 :database-label="scopeLabelFor(tab)"
                 :database="tab.database ?? undefined"
                 :schema="tab.schema"
+                :tables="tables"
+                :initial-filter="tab.linkedFilter ?? undefined"
+                :linked-filter-label="tab.linkedFilterLabel ?? undefined"
+                @open-linked-table="openLinkedTable"
+                @connection-error="reportConnectionError($event)"
                 @generate-data="
                   openGenerateData({
                     connectionId: tab.connectionId ?? '',
@@ -7138,6 +8131,8 @@ onBeforeUnmount(() => {
                 :kind="tab.table.kind"
                 :table="tab.table.name"
                 :focus-index="tab.focusedIndex"
+                :focus-column="tab.focusedColumn ?? null"
+                :focus-column-pulse="tab.focusedColumnPulse ?? 0"
                 :database-label="scopeLabelFor(tab)"
                 @refresh="refreshTables"
               />
@@ -7221,11 +8216,17 @@ onBeforeUnmount(() => {
                     ref="splitQueryWorkspaceRef"
                     :sql="splitView.query.sql"
                     :tab-id="splitView.query.id"
+                    :tab-title="splitView.query.title"
+                    :database="splitView.query.database"
+                    :schema="splitView.query.schema"
                     :driver="
                       driverForConnection(splitView.query.connectionId)
                     "
                     :completion-tables="completionTables"
                     :result="splitView.query.result"
+                    :result-sets="splitView.query.resultSets"
+                    :result-set-index="splitView.query.resultSetIndex"
+                    :batch-error="splitView.query.batchError"
                     :running="splitView.query.running"
                     :stopping="splitView.query.stopping"
                     :stop-note="splitView.query.stopNote"
@@ -7239,23 +8240,36 @@ onBeforeUnmount(() => {
                       splitView.query.connectionId ? '' : '请先选择连接'
                     "
                     run-shortcut-label="⌘/Ctrl+Enter"
+                    :run-mode="queryRunMode"
                     :explain-result="splitView.query.explainResult"
                     :explain-error="splitView.query.explainError"
                     :explain-loading="splitView.query.explainLoading"
                     :show-explain="splitView.query.showExplain"
+                    :pinned-results="splitView.query.pinnedResults"
+                    :active-pin-id="splitView.query.activePinId"
                     @update:sql="updateSplitSql"
                     @selection="updateSplitSelection"
                     @run="runSplitQuery"
+                    @run-statement="runSplitStatement"
+                    @run-tab="runSplitTab"
                     @stop="stopSplitQuery"
                     @open-snippets="openSnippetLibrary"
                     @open-format-settings="openFormatSettings"
                     @explain="explainSplitQuery"
+                    @navigate="handleSplitSqlNavigate"
                     @show-explain="setSplitExplainView"
                     @begin-transaction="beginSplitTransaction"
                     @commit-transaction="commitSplitTransaction"
                     @rollback-transaction="rollbackSplitTransaction"
                     @update:editor-ratio="layout.editorRatio = $event"
                     @toggle-result="toggleResultPanel"
+                    @select-result-set="selectSplitResultSet"
+                    @pin-result="pinSplitResult"
+                    @unpin-result="unpinSplitResult($event)"
+                    @rename-pin="
+                      renameSplitResult($event.id, $event.name)
+                    "
+                    @select-pin="selectSplitPinnedResult($event)"
                   />
                 </template>
                 <template v-else-if="splitView.kind === 'er'">
@@ -7273,10 +8287,14 @@ onBeforeUnmount(() => {
                     :table="splitView.table.table.name"
                     :table-kind="splitView.table.table.kind"
                     :read-only="true"
+                    :persist-frozen="false"
                     :driver="driverForConnection(splitView.table.connectionId)"
                     :database-label="scopeLabelFor(splitView.table)"
                     :database="splitView.table.database ?? undefined"
                     :schema="splitView.table.schema"
+                    :tables="tables"
+                    @open-linked-table="openLinkedTable"
+                    @connection-error="reportConnectionError($event)"
                   />
                   <TableStructureView
                     v-else
@@ -7287,6 +8305,8 @@ onBeforeUnmount(() => {
                     :kind="splitView.table.table.kind"
                     :table="splitView.table.table.name"
                     :focus-index="splitView.table.focusedIndex"
+                    :focus-column="splitView.table.focusedColumn ?? null"
+                    :focus-column-pulse="splitView.table.focusedColumnPulse ?? 0"
                     :database-label="scopeLabelFor(splitView.table)"
                     @refresh="refreshTables"
                   />
@@ -7297,7 +8317,7 @@ onBeforeUnmount(() => {
           </template>
 
           <ResizeHandle
-            v-if="viewMode !== 'empty' && historyOpen && !isRedisConnection"
+            v-if="viewMode !== 'empty' && historyOpen && !isRedisConnection && !isMongoConnection"
             class="resize-handle-right"
             orientation="vertical"
             invert
@@ -7309,7 +8329,7 @@ onBeforeUnmount(() => {
             @reset="layout.rightWidth = 320"
           />
           <HistoryPanel
-            v-if="viewMode !== 'empty' && !isRedisConnection"
+            v-if="viewMode !== 'empty' && !isRedisConnection && !isMongoConnection"
             :open="historyOpen"
             :entries="historyEntries"
             :loading="historyLoading"
@@ -7326,7 +8346,9 @@ onBeforeUnmount(() => {
           :database="
             isRedisConnection
               ? redisDatabase
-              : activeDatabase ?? selected?.database ?? null
+              : isMongoConnection
+                ? mongoDatabase
+                : activeDatabase ?? selected?.database ?? null
           "
           :schema="activeSchema"
           :active-label="statusActiveLabel"
@@ -7444,7 +8466,7 @@ onBeforeUnmount(() => {
         <span>打开 / 刷新对象</span>
       </button>
       <button
-        v-if="connectionMenu.connection.driver !== 'redis'"
+        v-if="connectionMenu.connection.driver !== 'redis' && connectionMenu.connection.driver !== 'mongodb'"
         class="context-menu-item"
         role="menuitem"
         @click="menuConnectionNewQuery"
@@ -7822,6 +8844,11 @@ onBeforeUnmount(() => {
     <SettingsDialog
       :open="settingsOpen"
       @close="settingsOpen = false"
+      @run-mode-change="queryRunMode = $event"
+      @auto-reconnect-change="
+        autoReconnect = $event;
+        saveAutoReconnect(autoReconnect);
+      "
       @open-format-settings="
         settingsOpen = false;
         formatSettingsOpen = true;

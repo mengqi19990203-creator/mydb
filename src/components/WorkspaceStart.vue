@@ -7,7 +7,12 @@ import type {
   TableInfo,
 } from "../lib/types";
 
-type ConnectionStatus = "idle" | "connecting" | "connected" | "failed";
+type ConnectionStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "failed"
+  | "lost";
 
 const props = defineProps<{
   connectionsCount: number;

@@ -1,7 +1,7 @@
 use super::{AppState, driver_for, ensure_writable};
 use crate::models::{
-    ColumnInfo, ColumnValue, ErDiagram, PendingTableChange, TableChangeResult, TableRows,
-    TableSort, TableStructure,
+    ColumnInfo, ColumnValue, ErDiagram, PendingTableChange, ScopeForeignKey, TableChangeResult,
+    TableRows, TableSort, TableStructure,
 };
 use crate::storage;
 use serde_json::Value;
@@ -43,6 +43,16 @@ pub async fn get_er_diagram(
 ) -> Result<ErDiagram, String> {
     let driver = driver_for(&app, &state, &connection_id).await?;
     driver.er_diagram().await
+}
+
+#[tauri::command]
+pub async fn list_scope_foreign_keys(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<Vec<ScopeForeignKey>, String> {
+    let driver = driver_for(&app, &state, &connection_id).await?;
+    driver.scope_foreign_keys().await
 }
 
 #[tauri::command]
