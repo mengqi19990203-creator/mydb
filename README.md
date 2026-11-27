@@ -8,6 +8,15 @@
 
 版本变更记录见 [CHANGELOG.md](CHANGELOG.md)；版本号只在明确要求时提升。
 
+## 下载安装包
+
+每个 GitHub Release 附带两个安装包：
+
+- **macOS**：universal `.dmg`（Apple Silicon + Intel）
+- **Windows**：NSIS 安装包 `*-setup.exe`
+
+安装包未签名：macOS 首次打开需右键「打开」，或执行 `xattr -dr com.apple.quarantine /Applications/mydb.app`；Windows 会提示 SmartScreen，选择「更多信息 → 仍要运行」。也可以在本地从源码构建。
+
 ## 界面截图
 
 ### AI SQL 助手
