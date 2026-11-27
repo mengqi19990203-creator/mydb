@@ -160,11 +160,31 @@ async function generate() {
   }
 }
 
+function looksLikeCommand(line: string): boolean {
+  return /^\s*(?:--|\/\*|\*|SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE|PRAGMA|EXPLAIN|SHOW|USE|DESCRIBE|DESC|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|VALUES|SET|db\.|sh\.|rs\.|printjson|console\.|EJSON\.|JSON\.|\{|\}|\[|\]|\(|\)|,)/i.test(
+    line,
+  );
+}
+
+function stripTrailingProse(text: string): string {
+  const all = text.split("\n");
+  const start = all.findIndex(looksLikeCommand);
+  const lines = start > 0 ? all.slice(start) : all;
+  for (let index = 1; index < lines.length; index += 1) {
+    if (lines[index].trim() !== "") continue;
+    const next = lines.slice(index + 1).find((line) => line.trim() !== "");
+    if (!next || looksLikeCommand(next)) continue;
+    const before = lines.slice(0, index).join("\n").trim();
+    if (/;\s*$/.test(before)) return before;
+  }
+  return lines.join("\n").trim();
+}
+
 function sqlForEditor(): string {
   const fences = [
     ...result.value.matchAll(/```([^\n`]*)\n([\s\S]*?)```/g),
   ];
-  if (!fences.length) return result.value.trim();
+  if (!fences.length) return stripTrailingProse(result.value);
   const preferred = new Set([
     "sql",
     "bash",

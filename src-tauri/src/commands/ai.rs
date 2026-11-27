@@ -157,7 +157,13 @@ pub async fn ai_chat(
     if user_prompt.trim().is_empty() {
         return Err("请输入需求或 SQL".to_string());
     }
-    let api_key = keychain::load(KEYCHAIN_ID, KEYCHAIN_KIND)?.unwrap_or_default();
+    // Ollama does not use an API key; skip the keychain entirely so a
+    // missing/unavailable keychain cannot block local models.
+    let api_key = if provider == "ollama" {
+        String::new()
+    } else {
+        keychain::load(KEYCHAIN_ID, KEYCHAIN_KIND)?.unwrap_or_default()
+    };
     if provider != "ollama" && api_key.is_empty() {
         return Err(format!(
             "请先在设置中填写 {} 的 API Key",
