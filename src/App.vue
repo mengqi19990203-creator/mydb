@@ -13,6 +13,8 @@ import CreateTableDialog from "./components/CreateTableDialog.vue";
 import CreateDatabaseDialog from "./components/CreateDatabaseDialog.vue";
 import CreateObjectDialog from "./components/CreateObjectDialog.vue";
 import DangerousSqlDialog from "./components/DangerousSqlDialog.vue";
+import AiSqlDialog from "./components/AiSqlDialog.vue";
+import DatasetsDialog from "./components/DatasetsDialog.vue";
 import DataSyncDialog from "./components/DataSyncDialog.vue";
 import DataTransferDialog from "./components/DataTransferDialog.vue";
 import DatabaseDocsDialog from "./components/DatabaseDocsDialog.vue";
@@ -37,6 +39,7 @@ import ServerActivityDialog from "./components/ServerActivityDialog.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import ShortcutHelpDialog from "./components/ShortcutHelpDialog.vue";
 import SqlFileExecuteDialog from "./components/SqlFileExecuteDialog.vue";
+import SqlParametersDialog from "./components/SqlParametersDialog.vue";
 import SqlFormatSettingsDialog from "./components/SqlFormatSettingsDialog.vue";
 import SqlSnippetDialog from "./components/SqlSnippetDialog.vue";
 import StatusBar from "./components/StatusBar.vue";
@@ -50,6 +53,8 @@ import {
   pushClosedTab,
   type ClosedTabSnapshot,
 } from "./lib/closed-tabs";
+import { clearMongoConsoleDraft } from "./lib/mongo-console";
+import type { DatasetSource, SavedDataset } from "./lib/datasets";
 import {
   findDangerousSql,
   loadDangerConfirm,
@@ -61,6 +66,10 @@ import {
   type QueryRunMode,
 } from "./lib/query-run-mode";
 import {
+  loadQueryScriptOptions,
+  saveQueryScriptOptions,
+} from "./lib/query-script-options";
+import {
   clearPaletteRecent,
   loadPaletteRecent,
   recordPaletteRecent,
@@ -70,6 +79,14 @@ import {
 } from "./lib/command-palette";
 import { readClipboard, writeClipboard } from "./lib/clipboard";
 import { hasSqlContent, splitSqlStatements } from "./lib/sql-statements";
+import {
+  defaultParameterValue,
+  extractSqlParameters,
+  parameterDefinitionsSignature,
+  substituteSqlParameters,
+  type SqlParameterDefinition,
+  type SqlParameterValue,
+} from "./lib/sql-parameters";
 import type {
   AppAction,
   MenuBarItem,
@@ -121,6 +138,7 @@ import type {
 interface SavePayload {
   config: ConnectionConfig;
   password?: string;
+  mongoUriSecret?: string;
   sshPassword?: string;
   sshKeyPassphrase?: string;
 }
@@ -285,6 +303,7 @@ interface QueryTab {
   /// Session-only result snapshots; never persisted to localStorage.
   pinnedResults: PinnedQueryResult[];
   activePinId: string | null;
+  parameterCount: number;
 }
 
 const connections = ref<ConnectionConfig[]>([]);
@@ -399,12 +418,43 @@ const queryBuilderOpen = ref(false);
 const databaseDocsOpen = ref(false);
 const dangerousConfirmEnabled = ref(loadDangerConfirm());
 const queryRunMode = ref<QueryRunMode>(loadQueryRunMode());
+const queryScriptOptions = ref(loadQueryScriptOptions());
 const dangerousSqlRequest = ref<{
   tabId: string;
   sql: string;
   usingSelection: boolean;
   finding: DangerFinding;
+  historySqls?: string[];
+  parameterCount?: number;
+  displaySql?: string;
 } | null>(null);
+interface ParameterDialogRequest {
+  tabId: string;
+  sql: string;
+  usingSelection: boolean;
+  scopeLabel: string;
+  definitions: SqlParameterDefinition[];
+  values: Record<string, SqlParameterValue>;
+  mode: "run" | "explain";
+  error: string | null;
+}
+const sqlParameterDialog = ref<ParameterDialogRequest | null>(null);
+const sqlParameterSnapshots = reactive<
+  Record<
+    string,
+    {
+      sql: string;
+      signature: string;
+      values: Record<string, SqlParameterValue>;
+    }
+  >
+>({});
+const parameterDialogDriver = computed(() => {
+  const request = sqlParameterDialog.value;
+  if (!request) return "sqlite" as const;
+  const tab = tabs.value.find((item) => item.id === request.tabId);
+  return driverForConnection(tab?.connectionId ?? null);
+});
 const dangerousTab = computed(
   () =>
     tabs.value.find(
@@ -421,6 +471,38 @@ const dangerousScope = computed(
       .filter(Boolean)
       .join(" / ") || "当前库 / 模式",
 );
+const datasetsOpen = ref(false);
+const aiSqlOpen = ref(false);
+const aiSchemaContext = computed(() =>
+  completionTables.value
+    .map((table) => {
+      const columns = table.columns
+        .map((column) =>
+          column.comment
+            ? `${column.name} ${column.dataType} /* ${column.comment.replaceAll("*/", "* /")} */`
+            : `${column.name} ${column.dataType}`,
+        )
+        .join(", ");
+      return `${table.kind} ${table.name} (${columns})`;
+    })
+    .slice(0, 100)
+    .join("\n"),
+);
+const datasetCurrent = computed<DatasetSource | null>(() => {
+  const tab = activeTab.value;
+  const result = tab?.result;
+  if (!tab?.connectionId || !result?.isQuery) return null;
+  return {
+    name: tab.title,
+    connectionId: tab.connectionId,
+    connectionName: connectionFor(tab.connectionId)?.name ?? "",
+    driver: driverForConnection(tab.connectionId),
+    database: tab.database,
+    schema: tab.schema,
+    sql: tab.sql,
+    result,
+  };
+});
 const objectSource = ref<{ kind: string; name: string } | null>(null);
 const createNamespaceOpen = ref(false);
 const createNamespaceMode = ref<"database" | "schema">("database");
@@ -484,6 +566,7 @@ function createQueryTab(
     transactionBusy: false,
     pinnedResults: [],
     activePinId: null,
+    parameterCount: 0,
   };
 }
 
@@ -1544,6 +1627,14 @@ function connectionTarget(connection: ConnectionConfig): string {
     return `${connection.host}:${connection.port} · ${label}`;
   }
   if (connection.driver === "mongodb") {
+    if (connection.mongoUriMode) {
+      const uri = connection.mongoUri ?? "";
+      const rest = uri.includes("://") ? uri.split("://")[1] : uri;
+      const authority = rest.split(/[/?#]/)[0] || "MongoDB";
+      return authority.includes("@")
+        ? authority.slice(authority.lastIndexOf("@") + 1)
+        : authority;
+    }
     const user = connection.username ? `${connection.username}@` : "";
     const database = connection.database || "admin";
     return `${user}${connection.host}:${connection.port}/${database}`;
@@ -1994,7 +2085,9 @@ async function refreshTables() {
         mongoDatabaseByConnection[connectionId] ??
         normalizeScopeValue(selected.value.database) ??
         "";
-      if (preferred && names.includes(preferred)) {
+      if (preferred) {
+        // MongoDB allows an initial database that does not exist yet; keep
+        // the URI / form path even when listDatabases does not return it.
         mongoDatabaseByConnection[connectionId] = preferred;
       } else if (names.length && !names.includes(mongoDatabaseByConnection[connectionId])) {
         mongoDatabaseByConnection[connectionId] = names[0];
@@ -2486,6 +2579,40 @@ function locateActiveConnection() {
   status.value = `已定位连接：${connection.name}`;
 }
 
+function insertAiSql(sql: string) {
+  const tab = activeTab.value;
+  if (!tab) return;
+  const base = tab.sql.trimEnd();
+  tab.sql = base ? `${base}\n${sql}` : sql;
+  tab.selectedSql = "";
+  status.value = "已将 AI 生成结果插入编辑器（未执行）";
+}
+
+function replaceAiSql(sql: string) {
+  const tab = activeTab.value;
+  if (!tab) return;
+  const selected = tab.selectedSql.trim();
+  tab.sql = selected ? tab.sql.replace(selected, sql) : sql;
+  tab.selectedSql = "";
+  status.value = "已用 AI 结果替换编辑器 SQL（未执行）";
+}
+
+function openDatasetFromDialog(dataset: SavedDataset) {
+  const tab = createQueryTab(
+    dataset.connectionId,
+    dataset.database || null,
+    dataset.schema || null,
+  );
+  tab.title = dataset.name;
+  tab.sql = dataset.sql;
+  tabs.value.push(tab);
+  tabOrder.value.push(tab.id);
+  activeTabId.value = tab.id;
+  activeWorkspaceTabId.value = tab.id;
+  datasetsOpen.value = false;
+  status.value = `已打开数据集：${dataset.name}`;
+}
+
 function newQuery() {
   if (isRedisConnection.value) {
     status.value = "Redis 连接请使用命令控制台";
@@ -2841,6 +2968,10 @@ function closeQueryTab(id: string) {
 function closeQueryTabNow(id: string) {
   const index = tabs.value.findIndex((tab) => tab.id === id);
   if (index < 0) return;
+  delete sqlParameterSnapshots[id];
+  if (sqlParameterDialog.value?.tabId === id) {
+    sqlParameterDialog.value = null;
+  }
 
   const closing = tabs.value[index];
   if (closing.running && closing.operationId) {
@@ -3033,6 +3164,7 @@ async function handleSave(payload: SavePayload) {
     const saved = await api.saveConnection(
       payload.config,
       payload.password,
+      payload.mongoUriSecret,
       payload.sshPassword,
       payload.sshKeyPassphrase,
     );
@@ -3064,6 +3196,7 @@ function handleDelete(connection: ConnectionConfig) {
         delete schemaByConnection[connection.id];
         delete mongoDatabaseByConnection[connection.id];
         delete redisDatabaseByConnection[connection.id];
+        clearMongoConsoleDraft(connection.id);
         for (const tab of tabs.value) {
           if (tab.connectionId === connection.id) {
             tab.connectionId = null;
@@ -4306,9 +4439,196 @@ function complexScript(sql: string): boolean {
   );
 }
 
+function setScriptContinueOnError(value: boolean) {
+  queryScriptOptions.value = { ...queryScriptOptions.value, continueOnError: value };
+  saveQueryScriptOptions(queryScriptOptions.value);
+  status.value = value ? "脚本执行：出错继续" : "脚本执行：遇错停止";
+}
+
+function setScriptWrapInTransaction(value: boolean) {
+  queryScriptOptions.value = { ...queryScriptOptions.value, wrapInTransaction: value };
+  saveQueryScriptOptions(queryScriptOptions.value);
+  status.value = value ? "脚本执行：事务包裹" : "脚本执行：不自动包裹事务";
+}
+
 async function runQuery(selectedSql?: string) {
   const tab = activeTab.value;
   if (tab) await runQueryOnTab(tab, selectedSql, "auto");
+}
+
+interface PreparedSqlParameters {
+  sql: string;
+  historySqls?: string[];
+  parameterCount: number;
+  displaySql?: string;
+}
+
+function prepareParameterExecution(
+  tab: QueryTab,
+  sqlText: string,
+  usingSelection: boolean,
+  scopeLabel: string,
+  mode: "run" | "explain",
+): PreparedSqlParameters | null {
+  const driver = driverForConnection(tab.connectionId);
+  const extracted = extractSqlParameters(sqlText, driver);
+  if (extracted.errors.length) {
+    status.value = `SQL 参数错误：${extracted.errors[0]}`;
+    return null;
+  }
+  if (!extracted.definitions.length) {
+    return { sql: sqlText, parameterCount: 0 };
+  }
+  const signature = parameterDefinitionsSignature(extracted.definitions);
+  const snapshot = sqlParameterSnapshots[tab.id];
+  if (snapshot && snapshot.sql === sqlText && snapshot.signature === signature) {
+    const substituted = substituteSqlParameters(sqlText, snapshot.values, driver);
+    if (!substituted.errors.length && !substituted.missing.length) {
+      const redacted = substituteSqlParameters(
+        sqlText,
+        snapshot.values,
+        driver,
+        true,
+      );
+      return {
+        sql: substituted.sql,
+        historySqls: splitSqlStatements(sqlText)
+          .filter((range) => hasSqlContent(range.text))
+          .map((range) => range.text),
+        parameterCount: substituted.applied,
+        displaySql: redacted.sql,
+      };
+    }
+    sqlParameterDialog.value = {
+      tabId: tab.id,
+      sql: sqlText,
+      usingSelection,
+      scopeLabel,
+      definitions: extracted.definitions,
+      values: snapshot.values,
+      mode,
+      error: substituted.errors[0] ?? null,
+    };
+    status.value = "请填写 SQL 参数";
+    return null;
+  }
+  const values: Record<string, SqlParameterValue> = {};
+  for (const definition of extracted.definitions) {
+    values[definition.key] = defaultParameterValue(definition);
+  }
+  sqlParameterDialog.value = {
+    tabId: tab.id,
+    sql: sqlText,
+    usingSelection,
+    scopeLabel,
+    definitions: extracted.definitions,
+    values,
+    mode,
+    error: null,
+  };
+  status.value = "请填写 SQL 参数";
+  return null;
+}
+
+async function runPreparedQueryOnTab(
+  tab: QueryTab,
+  sqlText: string,
+  usingSelection: boolean,
+  scopeLabel: string,
+  historySqls?: string[],
+  parameterCount = 0,
+  displaySql?: string,
+) {
+  if (dangerousConfirmEnabled.value) {
+    const finding = findDangerousSql(sqlText);
+    if (finding) {
+      dangerousSqlRequest.value = {
+        tabId: tab.id,
+        sql: sqlText,
+        usingSelection,
+        finding,
+        historySqls,
+        parameterCount,
+        displaySql,
+      };
+      status.value = "危险 SQL：请确认后执行";
+      return;
+    }
+  }
+  await executeSqlOnTab(
+    tab,
+    sqlText,
+    usingSelection,
+    scopeLabel,
+    historySqls,
+    parameterCount,
+  );
+}
+
+function cancelSqlParameters() {
+  sqlParameterDialog.value = null;
+  status.value = "已取消执行 SQL 参数";
+}
+
+async function confirmSqlParameters(values: Record<string, SqlParameterValue>) {
+  const request = sqlParameterDialog.value;
+  if (!request) return;
+  const tab = tabs.value.find((item) => item.id === request.tabId);
+  if (!tab) {
+    sqlParameterDialog.value = null;
+    return;
+  }
+  const driver = driverForConnection(tab.connectionId);
+  const substituted = substituteSqlParameters(request.sql, values, driver);
+  if (substituted.errors.length || substituted.missing.length) {
+    sqlParameterDialog.value = {
+      ...request,
+      values,
+      error: substituted.errors[0] ?? "参数未填写",
+    };
+    return;
+  }
+  sqlParameterSnapshots[request.tabId] = {
+    sql: request.sql,
+    signature: parameterDefinitionsSignature(request.definitions),
+    values,
+  };
+  sqlParameterDialog.value = null;
+  const historySqls = splitSqlStatements(request.sql)
+    .filter((range) => hasSqlContent(range.text))
+    .map((range) => range.text);
+  const redacted = substituteSqlParameters(request.sql, values, driver, true);
+  if (request.mode === "explain") {
+    await runExplainOnTab(
+      tab,
+      substituted.sql,
+      historySqls[0] ?? request.sql,
+    );
+    return;
+  }
+  await runPreparedQueryOnTab(
+    tab,
+    substituted.sql,
+    request.usingSelection,
+    request.scopeLabel,
+    historySqls,
+    substituted.applied,
+    redacted.sql,
+  );
+}
+
+function openParametersForActive() {
+  const tab = activeTab.value;
+  if (!tab) return;
+  delete sqlParameterSnapshots[tab.id];
+  void runQueryOnTab(tab, undefined, "auto");
+}
+
+function openParametersForSplit() {
+  const view = splitView.value;
+  if (view?.kind !== "query") return;
+  delete sqlParameterSnapshots[view.query.id];
+  void runQueryOnTab(view.query, undefined, "auto");
 }
 
 async function runQueryOnTab(
@@ -4356,20 +4676,23 @@ async function runQueryOnTab(
       scopeLabel = "执行当前语句…";
     }
   }
-  if (dangerousConfirmEnabled.value) {
-    const finding = findDangerousSql(sqlText);
-    if (finding) {
-      dangerousSqlRequest.value = {
-        tabId: tab.id,
-        sql: sqlText,
-        usingSelection,
-        finding,
-      };
-      status.value = "危险 SQL：请确认后执行";
-      return;
-    }
-  }
-  await executeSqlOnTab(tab, sqlText, usingSelection, scopeLabel);
+  const prepared = prepareParameterExecution(
+    tab,
+    sqlText,
+    usingSelection,
+    scopeLabel,
+    "run",
+  );
+  if (!prepared) return;
+  await runPreparedQueryOnTab(
+    tab,
+    prepared.sql,
+    usingSelection,
+    scopeLabel,
+    prepared.historySqls,
+    prepared.parameterCount,
+    prepared.displaySql,
+  );
 }
 
 async function runStatementOnTab(tab: QueryTab) {
@@ -4393,10 +4716,16 @@ async function executeSqlOnTab(
   sqlText: string,
   usingSelection: boolean,
   scopeLabel?: string,
+  historySqls?: string[],
+  parameterCount = 0,
 ) {
   const tabId = tab.id;
   const connectionId = tab.connectionId;
   if (!connectionId) return;
+  tab.parameterCount = parameterCount;
+  const parameterSuffix = parameterCount
+    ? ` · 已应用 ${parameterCount} 个参数`
+    : "";
   const statements = splitSqlStatements(sqlText)
     .filter((range) => hasSqlContent(range.text))
     .map((range) => range.text);
@@ -4437,18 +4766,25 @@ async function executeSqlOnTab(
             sqlText,
             1000,
             operationId,
+            historySqls?.[0],
           )
-        : await api.executeQuery(connectionId, sqlText, 1000, operationId);
+        : await api.executeQuery(
+            connectionId,
+            sqlText,
+            1000,
+            operationId,
+            historySqls?.[0],
+          );
       if (!tabs.value.some((item) => item.id === tabId)) return;
       tab.result = queryResult;
       if (activeTabId.value === tabId || splitTabId.value === tabId) {
         status.value = queryResult.isQuery
           ? `${queryResult.rows.length} 行 · ${queryResult.elapsedMs} ms${
               queryResult.truncated ? " · 已截断" : ""
-            }${tab.inTransaction ? " · 事务未提交" : ""}`
+            }${tab.inTransaction ? " · 事务未提交" : ""}${parameterSuffix}`
           : `执行完成 · 影响 ${queryResult.rowsAffected} 行 · ${queryResult.elapsedMs} ms${
               tab.inTransaction ? " · 事务未提交" : ""
-            }`;
+            }${parameterSuffix}`;
       }
     } catch (reason) {
       if (!tabs.value.some((item) => item.id === tabId)) return;
@@ -4487,11 +4823,28 @@ async function executeSqlOnTab(
   tab.explainLoading = false;
   tab.showExplain = false;
   status.value = `执行 ${statements.length} 条语句…`;
+  const scriptStarted = Date.now();
+  const transactionRequested = queryScriptOptions.value.wrapInTransaction;
+  const ownsTransaction = transactionRequested && !tab.inTransaction;
+  const continueOnError = queryScriptOptions.value.continueOnError && !ownsTransaction;
   let completed = 0;
+  let failed = 0;
   let stopped = false;
   let canceled = false;
+  const failures: string[] = [];
 
   try {
+    if (ownsTransaction) {
+      try {
+        await api.beginTransaction(connectionId, tabId);
+        tab.inTransaction = true;
+        tab.transactionBusy = true;
+      } catch (reason) {
+        tab.error = `事务开始失败：${reason}`;
+        status.value = tab.error;
+        return;
+      }
+    }
     for (let index = 0; index < statements.length; index += 1) {
       if (tab.stopping) {
         stopped = true;
@@ -4510,12 +4863,14 @@ async function executeSqlOnTab(
               statements[index],
               1000,
               operationId,
+              historySqls?.[index],
             )
           : await api.executeQuery(
               connectionId,
               statements[index],
               1000,
               operationId,
+              historySqls?.[index],
             );
         if (!tabs.value.some((item) => item.id === tabId)) return;
         completed += 1;
@@ -4538,42 +4893,88 @@ async function executeSqlOnTab(
           if (activeTabId.value === tabId || splitTabId.value === tabId) {
             status.value = tab.stopNote;
           }
-        } else if (completed === 0) {
-          tab.resultSets = [];
-          tab.result = null;
-          tab.error = `第 ${index + 1} 条语句失败：${message}`;
-          reportConnectionError(tab.error, connectionId);
-          if (activeTabId.value === tabId || splitTabId.value === tabId) {
-            status.value = "查询失败";
-          }
         } else {
-          tab.batchError = `第 ${index + 1} 条语句失败（已完成 ${completed} 条）：${message}`;
+          failed += 1;
+          failures.push(`第 ${index + 1} 条：${message}`);
+          if (completed === 0 && !continueOnError) {
+            tab.resultSets = [];
+            tab.result = null;
+            tab.error = `第 ${index + 1} 条语句失败：${message}`;
+            reportConnectionError(tab.error, connectionId);
+          } else {
+            tab.batchError = failures.join("；");
+          }
           if (activeTabId.value === tabId || splitTabId.value === tabId) {
             status.value = `第 ${index + 1} 条语句失败`;
           }
+          if (!continueOnError) break;
         }
-        break;
       } finally {
         tab.operationId = null;
       }
     }
-    if (
-      completed > 0 &&
-      !tab.error &&
-      !tab.batchError &&
-      !canceled &&
-      !stopped
-    ) {
-      tab.stopNote = `已完成 ${completed} 条语句`;
-      if (activeTabId.value === tabId || splitTabId.value === tabId) {
-        status.value = `已完成 ${completed} 条语句 · ${completed} 个结果`;
+    const elapsed = Date.now() - scriptStarted;
+    const skipped = Math.max(0, statements.length - completed - failed);
+    let rolledBack = false;
+    let committed = false;
+    if (ownsTransaction) {
+      tab.transactionBusy = false;
+      if (failed > 0 || stopped || canceled) {
+        try {
+          await api.rollbackTransaction(connectionId, tabId);
+        } catch {
+          // Preserve the original execution failure; rollback best-effort.
+        }
+        tab.inTransaction = false;
+        rolledBack = true;
+        tab.resultSets = [];
+        tab.result = null;
+      } else if (completed > 0) {
+        try {
+          await api.commitTransaction(connectionId, tabId);
+          tab.inTransaction = false;
+          committed = true;
+        } catch (reason) {
+          tab.inTransaction = false;
+          tab.error = `事务提交失败：${reason}`;
+          rolledBack = true;
+        }
+      } else {
+        tab.inTransaction = false;
       }
-    } else if (stopped && completed > 0 && !tab.stopNote) {
-      tab.stopNote = `已停止（已完成 ${completed} 条语句）`;
+    }
+    if (failed > 0) {
+      tab.batchError = failures.join("；");
+      if (completed === 0 && !continueOnError) tab.error = tab.batchError;
+    }
+    if (failed > 0 || stopped || canceled || rolledBack) {
+      tab.stopNote = `脚本：${completed} 成功 / ${failed} 失败 / ${skipped} 未执行 · ${elapsed} ms${
+        rolledBack ? " · 事务已回滚" : committed ? " · 事务已提交" : ""
+      }`;
+    } else if (completed > 0) {
+      tab.stopNote = `已完成 ${completed} 条语句 · ${elapsed} ms${
+        committed ? " · 事务已提交" : ""
+      }`;
+    }
+    if (activeTabId.value === tabId || splitTabId.value === tabId) {
+      if (failed > 0 || stopped || canceled) {
+        status.value = tab.stopNote ?? "脚本执行结束";
+      } else if (completed > 0) {
+        status.value = `${tab.stopNote} · ${completed} 个结果${parameterSuffix}`;
+      }
     }
   } finally {
+    if (ownsTransaction && tab.inTransaction) {
+      try {
+        await api.rollbackTransaction(connectionId, tabId);
+      } catch {
+        // Best-effort cleanup after cancellation or an unexpected error.
+      }
+      tab.inTransaction = false;
+    }
     tab.running = false;
     tab.stopping = false;
+    tab.transactionBusy = false;
     tab.operationId = null;
   }
 }
@@ -4584,7 +4985,14 @@ function confirmDangerousSql() {
   if (!request) return;
   const tab = tabs.value.find((item) => item.id === request.tabId);
   if (!tab) return;
-  void executeSqlOnTab(tab, request.sql, request.usingSelection);
+  void executeSqlOnTab(
+    tab,
+    request.sql,
+    request.usingSelection,
+    undefined,
+    request.historySqls,
+    request.parameterCount ?? 0,
+  );
 }
 
 function cancelDangerousSql() {
@@ -4675,6 +5083,26 @@ async function explainQueryOnTab(tab: QueryTab, rawStatement: string) {
   }
   const driver = driverForConnection(tab.connectionId);
   if (!driver) return;
+  const prepared = prepareParameterExecution(
+    tab,
+    statement,
+    false,
+    "",
+    "explain",
+  );
+  if (!prepared) return;
+  await runExplainOnTab(
+    tab,
+    prepared.sql,
+    prepared.historySqls?.[0] ?? statement,
+  );
+}
+
+async function runExplainOnTab(
+  tab: QueryTab,
+  statement: string,
+  historySql: string,
+) {
   const tabId = tab.id;
   tab.explainLoading = true;
   tab.running = true;
@@ -4682,7 +5110,7 @@ async function explainQueryOnTab(tab: QueryTab, rawStatement: string) {
   tab.showExplain = true;
   status.value = "正在生成执行计划…";
   try {
-    const plan = await api.explainQuery(tab.connectionId, statement);
+    const plan = await api.explainQuery(tab.connectionId!, statement, historySql);
     if (!tabs.value.some((item) => item.id === tabId)) return;
     tab.explainResult = plan;
     status.value = `执行计划 · ${plan.driver} · ${plan.format} · ${plan.result.rows.length} 行`;
@@ -7900,6 +8328,8 @@ onBeforeUnmount(() => {
             :database="mongoDatabase ?? selected?.database"
             :read-only="Boolean(selected?.readOnly)"
             @database-change="handleMongoDatabaseChange"
+            @status="status = $event"
+            @open-settings="settingsOpen = true"
           />
           <RedisWorkspace
             v-else-if="isRedisConnection && selectedId && redisWorkspaceOpen"
@@ -7909,6 +8339,7 @@ onBeforeUnmount(() => {
             :database="redisDatabase ?? selected?.database"
             :read-only="Boolean(selected?.readOnly)"
             @database-change="handleRedisDatabaseChange"
+            @open-settings="settingsOpen = true"
           />
           <WorkspaceStart
             v-else-if="isRedisConnection && selectedId"
@@ -8031,6 +8462,9 @@ onBeforeUnmount(() => {
             :show-explain="activeTab?.showExplain ?? false"
             :pinned-results="activeTab?.pinnedResults ?? []"
             :active-pin-id="activeTab?.activePinId ?? null"
+            :parameter-count="activeTab?.parameterCount ?? 0"
+            :script-continue-on-error="queryScriptOptions.continueOnError"
+            :script-wrap-in-transaction="queryScriptOptions.wrapInTransaction"
             @update:sql="sql = $event"
             @selection="handleSqlSelection"
             @run="runQuery"
@@ -8039,6 +8473,11 @@ onBeforeUnmount(() => {
             @stop="stopActiveQuery"
             @open-snippets="openSnippetLibrary"
             @open-format-settings="openFormatSettings"
+            @open-parameters="openParametersForActive"
+            @update:script-continue-on-error="setScriptContinueOnError"
+            @update:script-wrap-in-transaction="setScriptWrapInTransaction"
+            @open-datasets="datasetsOpen = true"
+            @open-ai="aiSqlOpen = true"
             @explain="explainQuery"
             @navigate="handleSqlNavigate"
             @show-explain="setExplainView"
@@ -8247,6 +8686,9 @@ onBeforeUnmount(() => {
                     :show-explain="splitView.query.showExplain"
                     :pinned-results="splitView.query.pinnedResults"
                     :active-pin-id="splitView.query.activePinId"
+                    :parameter-count="splitView.query.parameterCount ?? 0"
+                    :script-continue-on-error="queryScriptOptions.continueOnError"
+                    :script-wrap-in-transaction="queryScriptOptions.wrapInTransaction"
                     @update:sql="updateSplitSql"
                     @selection="updateSplitSelection"
                     @run="runSplitQuery"
@@ -8255,6 +8697,11 @@ onBeforeUnmount(() => {
                     @stop="stopSplitQuery"
                     @open-snippets="openSnippetLibrary"
                     @open-format-settings="openFormatSettings"
+                    @open-parameters="openParametersForSplit"
+                    @update:script-continue-on-error="setScriptContinueOnError"
+                    @update:script-wrap-in-transaction="setScriptWrapInTransaction"
+                    @open-datasets="datasetsOpen = true"
+                    @open-ai="aiSqlOpen = true"
                     @explain="explainSplitQuery"
                     @navigate="handleSplitSqlNavigate"
                     @show-explain="setSplitExplainView"
@@ -8770,9 +9217,42 @@ onBeforeUnmount(() => {
       @imported="handleImportedData"
     />
 
+    <AiSqlDialog
+      :open="aiSqlOpen"
+      :sql="activeTab?.sql ?? ''"
+      :selected-sql="activeTab?.selectedSql ?? ''"
+      :driver="driverForConnection(activeTab?.connectionId ?? null)"
+      :database="activeTab?.database ?? null"
+      :schema="activeTab?.schema ?? null"
+      :schema-context="aiSchemaContext"
+      :error="activeTab?.error ?? queryError"
+      @close="aiSqlOpen = false"
+      @insert="insertAiSql"
+      @replace="replaceAiSql"
+      @open-settings="settingsOpen = true"
+    />
+
+    <DatasetsDialog
+      :open="datasetsOpen"
+      :current="datasetCurrent"
+      @close="datasetsOpen = false"
+      @open-dataset="openDatasetFromDialog"
+    />
+
+    <SqlParametersDialog
+      :open="Boolean(sqlParameterDialog)"
+      :sql="sqlParameterDialog?.sql ?? ''"
+      :driver="parameterDialogDriver"
+      :definitions="sqlParameterDialog?.definitions ?? []"
+      :initial-values="sqlParameterDialog?.values"
+      :error="sqlParameterDialog?.error ?? null"
+      @cancel="cancelSqlParameters"
+      @run="confirmSqlParameters"
+    />
+
     <DangerousSqlDialog
       :open="Boolean(dangerousSqlRequest)"
-      :sql="dangerousSqlRequest?.sql ?? ''"
+      :sql="dangerousSqlRequest?.displaySql ?? dangerousSqlRequest?.sql ?? ''"
       :message="dangerousSqlRequest?.finding.message ?? ''"
       :high-risk="dangerousSqlRequest?.finding.highRisk ?? false"
       :connection-name="dangerousConnectionName"

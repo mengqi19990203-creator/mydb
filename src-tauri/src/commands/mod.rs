@@ -1,3 +1,4 @@
+mod ai;
 mod backup;
 mod connections;
 mod context;
@@ -11,6 +12,7 @@ mod generate;
 mod history;
 mod import_wizard;
 mod mongo;
+mod mongo_console;
 mod query;
 mod query_cancel;
 mod redis;
@@ -24,6 +26,7 @@ mod window;
 mod xlsx;
 
 pub use self::redis::*;
+pub use ai::*;
 pub use backup::*;
 pub use connections::*;
 pub use context::*;
@@ -37,6 +40,7 @@ pub use generate::*;
 pub use history::*;
 pub use import_wizard::*;
 pub use mongo::*;
+pub use mongo_console::*;
 pub use query::*;
 pub use query_cancel::*;
 pub use script::*;
@@ -93,6 +97,8 @@ pub struct AppState {
     /// SSH tunnels forwarding MongoDB traffic, kept alive with the cached client.
     pub mongo_tunnels: Mutex<HashMap<String, SshTunnel>>,
     pub passwords: Mutex<HashMap<String, String>>,
+    /// Full MongoDB connection strings, kept apart from the database password.
+    pub mongo_uri_secrets: Mutex<HashMap<String, String>>,
     pub ssh_passwords: Mutex<HashMap<String, String>>,
     pub ssh_key_passphrases: Mutex<HashMap<String, String>>,
     pub export_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,

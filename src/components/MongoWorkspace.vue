@@ -1,8 +1,16 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import AiSqlDialog from "./AiSqlDialog.vue";
 import ConfirmDialog from "./ConfirmDialog.vue";
 import Icon from "./Icon.vue";
+import MongoCollectionStatsDialog from "./MongoCollectionStatsDialog.vue";
+import MongoConsole from "./MongoConsole.vue";
+import MongoCreateDatabaseDialog from "./MongoCreateDatabaseDialog.vue";
+import MongoDropDatabaseDialog from "./MongoDropDatabaseDialog.vue";
+import MongoGridFsPanel from "./MongoGridFsPanel.vue";
+import MongoRenameCollectionDialog from "./MongoRenameCollectionDialog.vue";
+import MongoUsersDialog from "./MongoUsersDialog.vue";
 import PromptDialog from "./PromptDialog.vue";
 import * as api from "../lib/api";
 import { detectDelimiter, parseDelimitedText } from "../lib/clipboard-table";
@@ -21,6 +29,8 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   "database-change": [database: string];
+  status: [message: string];
+  "open-settings": [];
 }>();
 
 const databases = ref<string[]>([]);
@@ -31,7 +41,20 @@ const collectionSearch = ref("");
 const collectionsLoading = ref(false);
 const collectionsError = ref("");
 const selectedCollection = ref<MongoCollectionInfo | null>(null);
-const mode = ref<"documents" | "aggregation" | "indexes">("documents");
+const mode = ref<"documents" | "console" | "aggregation" | "indexes" | "gridfs">("documents");
+const vFocus = {
+  mounted: (element: HTMLInputElement) => element.focus(),
+};
+interface PendingMongoDocument {
+  id: unknown;
+  updates: Record<string, unknown>;
+  deleted: boolean;
+}
+const pendingMongo = reactive<Record<string, PendingMongoDocument>>({});
+const gridEdit = ref<{ key: string; field: string; value: string } | null>(null);
+const pendingPreviewOpen = ref(false);
+const pendingSaving = ref(false);
+const pendingError = ref("");
 
 const filterDraft = ref("{}");
 const projectionDraft = ref("");
@@ -67,6 +90,28 @@ const docError = ref("");
 const deleteDoc = ref<Record<string, unknown> | null>(null);
 const deleteCollection = ref<MongoCollectionInfo | null>(null);
 const createCollectionOpen = ref(false);
+const collectionMenu = ref<{
+  x: number;
+  y: number;
+  item: MongoCollectionInfo;
+} | null>(null);
+const databaseMenu = ref<{ x: number; y: number } | null>(null);
+const createDatabaseOpen = ref(false);
+const createDatabaseBusy = ref(false);
+const createDatabaseError = ref("");
+const dropDatabaseOpen = ref(false);
+const dropDatabaseCount = ref<number | null>(null);
+const dropDatabaseBusy = ref(false);
+const dropDatabaseError = ref("");
+const renameTarget = ref<MongoCollectionInfo | null>(null);
+const renameBusy = ref(false);
+const renameError = ref("");
+const statsTarget = ref<MongoCollectionInfo | null>(null);
+const usersOpen = ref(false);
+const consoleRef = ref<InstanceType<typeof MongoConsole> | null>(null);
+const aiOpen = ref(false);
+const mongoAiSql = ref("");
+const pendingMongoAi = ref<{ text: string; replace: boolean } | null>(null);
 const indexDialogOpen = ref(false);
 const indexKeys = ref('{ "field": 1 }');
 const indexName = ref("");
@@ -127,9 +172,75 @@ const hasNext = computed(
 );
 const selectedName = computed(() => selectedCollection.value?.name ?? "");
 const canEdit = computed(() => !props.readOnly);
+const mongoAiContext = computed(() => {
+  const collectionNames = collections.value.map((item) => item.name).slice(0, 100);
+  return [
+    `数据库：${database.value || "—"}`,
+    `集合：${collectionNames.join(", ") || "—"}`,
+    selectedCollection.value
+      ? `当前集合：${selectedCollection.value.name}`
+      : "",
+    fields.value.length ? `已知字段：${fields.value.slice(0, 120).join(", ")}` : "",
+    "不要读取或发送文档内容；只根据集合 / 字段结构生成命令。",
+  ]
+    .filter(Boolean)
+    .join("\n");
+});
+
+function openMongoAi() {
+  mongoAiSql.value = consoleRef.value?.currentScript() ?? "";
+  aiOpen.value = true;
+}
+
+async function applyMongoAi(text: string, replace: boolean) {
+  if (mode.value !== "console") {
+    pendingMongoAi.value = { text, replace };
+    await switchMode("console");
+    await nextTick();
+    // The console mounts its CodeMirror view on its own next tick; wait for
+    // the ready event. Fall back to one more tick for already-mounted views.
+    if (!flushPendingMongoAi()) {
+      await nextTick();
+      flushPendingMongoAi();
+    }
+    return;
+  }
+  const applied = replace
+    ? consoleRef.value?.replaceScript(text)
+    : consoleRef.value?.insertScript(text);
+  if (!applied) {
+    pendingMongoAi.value = { text, replace };
+    flashToast("正在打开 MongoDB 查询控制台…");
+  }
+}
+
+function insertMongoAi(text: string) {
+  void applyMongoAi(text, false);
+}
+
+function replaceMongoAi(text: string) {
+  void applyMongoAi(text, true);
+}
+
+function flushPendingMongoAi(): boolean {
+  const pending = pendingMongoAi.value;
+  if (!pending || !consoleRef.value) return false;
+  const applied = pending.replace
+    ? consoleRef.value.replaceScript(pending.text)
+    : consoleRef.value.insertScript(pending.text);
+  if (applied) {
+    pendingMongoAi.value = null;
+    flashToast(pending.replace ? "已替换 MongoDB 控制台命令" : "已插入 MongoDB 控制台命令");
+  }
+  return applied;
+}
+const isSystemDatabase = computed(() =>
+  ["admin", "local", "config"].includes(database.value),
+);
 
 function flashToast(message: string) {
   toast.value = message;
+  emit("status", message);
   window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => {
     toast.value = "";
@@ -146,8 +257,13 @@ async function loadDatabases() {
     const result = await api.mongoListDatabases(props.connectionId);
     databases.value = result;
     const preferred = normalizeDatabase(props.database);
-    if (preferred && result.includes(preferred)) {
+    if (preferred) {
+      // The URI / form database may not exist yet; MongoDB creates it on the
+      // first write, so keep it instead of silently switching to another DB.
       database.value = preferred;
+      if (!result.includes(preferred)) {
+        databases.value = [preferred, ...result];
+      }
     } else if (!result.includes(database.value)) {
       database.value = result[0] ?? "";
     }
@@ -200,6 +316,7 @@ async function loadCollections() {
 
 function changeDatabase(event: Event) {
   const value = (event.target as HTMLSelectElement).value;
+  discardPendingMongo();
   database.value = value;
   selectedCollection.value = null;
   page.value = null;
@@ -209,7 +326,187 @@ function changeDatabase(event: Event) {
   void loadCollections();
 }
 
+async function handleConsoleDatabaseChange(next: string) {
+  if (next === database.value) return;
+  discardPendingMongo();
+  database.value = next;
+  selectedCollection.value = null;
+  page.value = null;
+  aggregationPage.value = null;
+  indexes.value = [];
+  skip.value = 0;
+  emit("database-change", next);
+  await loadCollections();
+}
+
+async function refreshAfterConsoleWrite() {
+  await loadCollections();
+}
+
+function closeManagementMenus() {
+  collectionMenu.value = null;
+  databaseMenu.value = null;
+}
+
+function toggleDatabaseMenu(event: MouseEvent) {
+  if (databaseMenu.value) {
+    databaseMenu.value = null;
+    return;
+  }
+  const target = event.currentTarget as HTMLElement | null;
+  const rect = target?.getBoundingClientRect();
+  collectionMenu.value = null;
+  databaseMenu.value = {
+    x: Math.max(8, (rect?.right ?? 260) - 200),
+    y: (rect?.bottom ?? 60) + 4,
+  };
+}
+
+function openCollectionMenu(event: MouseEvent, item: MongoCollectionInfo) {
+  databaseMenu.value = null;
+  collectionMenu.value = {
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - 210)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 190)),
+    item,
+  };
+}
+
+function openCreateDatabase() {
+  closeManagementMenus();
+  createDatabaseError.value = "";
+  createDatabaseOpen.value = true;
+}
+
+async function refreshDatabaseList() {
+  try {
+    const result = await api.mongoListDatabases(props.connectionId);
+    databases.value = result;
+    if (database.value && !result.includes(database.value)) {
+      database.value = result[0] ?? "";
+      selectedCollection.value = null;
+      page.value = null;
+      emit("database-change", database.value);
+      await loadCollections();
+    }
+  } catch (reason) {
+    docsError.value = String(reason);
+  }
+}
+
+function openDropDatabase() {
+  closeManagementMenus();
+  dropDatabaseError.value = "";
+  dropDatabaseCount.value = null;
+  dropDatabaseOpen.value = true;
+  void api
+    .mongoListCollections(props.connectionId, database.value)
+    .then((items) => {
+      dropDatabaseCount.value = items.length;
+    })
+    .catch(() => {
+      dropDatabaseCount.value = null;
+    });
+}
+
+function openRenameCollection(item: MongoCollectionInfo) {
+  closeManagementMenus();
+  if (props.readOnly || item.kind !== "collection") return;
+  renameError.value = "";
+  renameTarget.value = item;
+}
+
+function openCollectionStats(item: MongoCollectionInfo) {
+  closeManagementMenus();
+  statsTarget.value = item;
+}
+
+async function confirmCreateDatabase(databaseName: string, firstCollection: string) {
+  createDatabaseBusy.value = true;
+  createDatabaseError.value = "";
+  try {
+    await api.mongoCreateDatabase(
+      props.connectionId,
+      databaseName,
+      firstCollection,
+    );
+    createDatabaseOpen.value = false;
+    const result = await api.mongoListDatabases(props.connectionId);
+    databases.value = result.includes(databaseName)
+      ? result
+      : [databaseName, ...result];
+    database.value = databaseName;
+    selectedCollection.value = null;
+    page.value = null;
+    emit("database-change", databaseName);
+    await loadCollections();
+    const created = collections.value.find((item) => item.name === firstCollection);
+    if (created) {
+      await selectCollection(created);
+    }
+    flashToast(`已创建数据库 ${databaseName} 和集合 ${firstCollection}`);
+  } catch (reason) {
+    createDatabaseError.value = String(reason);
+  } finally {
+    createDatabaseBusy.value = false;
+  }
+}
+
+async function confirmDropDatabase(confirmName: string) {
+  dropDatabaseBusy.value = true;
+  dropDatabaseError.value = "";
+  try {
+    await api.mongoDropDatabase(
+      props.connectionId,
+      database.value,
+      confirmName,
+    );
+    const dropped = database.value;
+    dropDatabaseOpen.value = false;
+    const result = await api.mongoListDatabases(props.connectionId);
+    databases.value = result;
+    database.value = result[0] ?? "";
+    selectedCollection.value = null;
+    page.value = null;
+    aggregationPage.value = null;
+    indexes.value = [];
+    emit("database-change", database.value);
+    await loadCollections();
+    flashToast(`已删除数据库 ${dropped}`);
+  } catch (reason) {
+    dropDatabaseError.value = String(reason);
+  } finally {
+    dropDatabaseBusy.value = false;
+  }
+}
+
+async function confirmRenameCollection(to: string) {
+  const source = renameTarget.value;
+  if (!source || !database.value) return;
+  renameBusy.value = true;
+  renameError.value = "";
+  try {
+    await api.mongoRenameCollection(
+      props.connectionId,
+      database.value,
+      source.name,
+      to,
+    );
+    renameTarget.value = null;
+    await loadCollections();
+    const renamed = collections.value.find((item) => item.name === to);
+    if (renamed) {
+      await selectCollection(renamed);
+    }
+    flashToast(`已重命名集合 ${source.name} → ${to}`);
+  } catch (reason) {
+    renameError.value = String(reason);
+  } finally {
+    renameBusy.value = false;
+  }
+}
+
 async function selectCollection(collection: MongoCollectionInfo) {
+  discardPendingMongo();
   selectedCollection.value = collection;
   mode.value = "documents";
   skip.value = 0;
@@ -535,7 +832,9 @@ async function loadIndexes() {
   }
 }
 
-async function switchMode(next: "documents" | "aggregation" | "indexes") {
+async function switchMode(
+  next: "documents" | "console" | "aggregation" | "indexes" | "gridfs",
+) {
   mode.value = next;
   if (next === "indexes") await loadIndexes();
 }
@@ -545,11 +844,189 @@ function formatDocument(document: Record<string, unknown>): string {
 }
 
 function cellText(document: Record<string, unknown>, field: string): string {
-  const value = document[field];
+  const value = cellValue(document, field);
   if (value === undefined) return "";
   if (value === null) return "NULL";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
+}
+
+function documentKey(document: Record<string, unknown>): string {
+  if (document._id === undefined) return "";
+  try {
+    return JSON.stringify(document._id);
+  } catch {
+    return String(document._id);
+  }
+}
+
+function pendingDocument(document: Record<string, unknown>): PendingMongoDocument | null {
+  const key = documentKey(document);
+  return key ? pendingMongo[key] ?? null : null;
+}
+
+function cellValue(document: Record<string, unknown>, field: string): unknown {
+  const pending = pendingDocument(document);
+  if (pending && Object.prototype.hasOwnProperty.call(pending.updates, field)) {
+    return pending.updates[field];
+  }
+  return document[field];
+}
+
+const canEditGrid = computed(
+  () =>
+    canEdit.value &&
+    mode.value === "documents" &&
+    selectedCollection.value?.kind === "collection" &&
+    !projectionDraft.value.trim(),
+);
+
+function pendingItems(): PendingMongoDocument[] {
+  return Object.values(pendingMongo) as PendingMongoDocument[];
+}
+
+const pendingCount = computed(() =>
+  pendingItems().reduce(
+    (total, item) => total + (item.deleted ? 1 : Object.keys(item.updates).length),
+    0,
+  ),
+);
+
+function pendingPreview(): string {
+  if (!selectedCollection.value) return "";
+  const name = selectedCollection.value.name.replaceAll('"', '\\"');
+  const lines: string[] = [];
+  for (const item of pendingItems()) {
+    const id = JSON.stringify(item.id);
+    if (item.deleted) {
+      lines.push(
+        `db.getCollection("${name}").deleteOne({ "_id": ${id} })`,
+      );
+      continue;
+    }
+    if (!Object.keys(item.updates).length) continue;
+    const set = JSON.stringify(item.updates);
+    lines.push(
+      `db.getCollection("${name}").updateOne({ "_id": ${id} }, { "$set": ${set} })`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function startGridEdit(document: Record<string, unknown>, field: string) {
+  if (!canEditGrid.value || field === "_id") return;
+  const pending = pendingDocument(document);
+  if (pending?.deleted) return;
+  const value = cellValue(document, field);
+  if (value !== null && typeof value === "object") return;
+  const key = documentKey(document);
+  if (!key) return;
+  gridEdit.value = {
+    key,
+    field,
+    value: value === null || value === undefined ? "" : String(value),
+  };
+}
+
+function parseGridInput(text: string, original: unknown): unknown {
+  if (text === "") return null;
+  if (typeof original === "number") {
+    const number = Number(text);
+    return Number.isFinite(number) ? number : text;
+  }
+  if (typeof original === "boolean") {
+    if (text.toLowerCase() === "true") return true;
+    if (text.toLowerCase() === "false") return false;
+    return text;
+  }
+  return text;
+}
+
+function commitGridEdit() {
+  const edit = gridEdit.value;
+  gridEdit.value = null;
+  if (!edit) return;
+  const document = displayPage.value?.documents.find(
+    (item) => documentKey(item) === edit.key,
+  );
+  if (!document) return;
+  const pending = pendingMongo[edit.key];
+  const original =
+    pending && Object.prototype.hasOwnProperty.call(pending.updates, edit.field)
+      ? pending.updates[edit.field]
+      : document[edit.field];
+  const value = parseGridInput(edit.value, original);
+  if (value === original || (value === null && original === null)) {
+    if (pending) {
+      delete pending.updates[edit.field];
+      if (!Object.keys(pending.updates).length && !pending.deleted) {
+        delete pendingMongo[edit.key];
+      }
+    }
+    return;
+  }
+  const next = pending ?? { id: document._id, updates: {}, deleted: false };
+  next.updates[edit.field] = value;
+  pendingMongo[edit.key] = next;
+}
+
+function togglePendingDelete(document: Record<string, unknown>) {
+  if (!canEditGrid.value) return;
+  const key = documentKey(document);
+  if (!key) return;
+  const existing = pendingMongo[key];
+  if (existing?.deleted) {
+    delete pendingMongo[key];
+    return;
+  }
+  pendingMongo[key] = { id: document._id, updates: {}, deleted: true };
+  if (gridEdit.value?.key === key) gridEdit.value = null;
+}
+
+function discardPendingMongo() {
+  for (const key of Object.keys(pendingMongo)) delete pendingMongo[key];
+  gridEdit.value = null;
+  pendingError.value = "";
+}
+
+async function commitPendingMongo() {
+  if (!selectedCollection.value || !database.value || pendingSaving.value) return;
+  pendingPreviewOpen.value = false;
+  pendingSaving.value = true;
+  pendingError.value = "";
+  let changed = 0;
+  try {
+    for (const [key, item] of Object.entries({ ...pendingMongo }) as Array<
+      [string, PendingMongoDocument]
+    >) {
+      if (item.deleted) {
+        await api.mongoDeleteDocument(
+          props.connectionId,
+          database.value,
+          selectedCollection.value.name,
+          item.id,
+        );
+      } else if (Object.keys(item.updates).length) {
+        await api.mongoUpdateDocumentFields(
+          props.connectionId,
+          database.value,
+          selectedCollection.value.name,
+          item.id,
+          item.updates,
+        );
+      }
+      delete pendingMongo[key];
+      changed += 1;
+    }
+    flashToast(`已提交 ${changed} 项 MongoDB 变更`);
+    await loadDocuments();
+  } catch (reason) {
+    pendingError.value = String(reason);
+    docsError.value = pendingError.value;
+    await loadDocuments();
+  } finally {
+    pendingSaving.value = false;
+  }
 }
 
 function openInsert() {
@@ -625,6 +1102,7 @@ async function saveDocument() {
 
 function askDeleteDocument(document: Record<string, unknown>) {
   if (!canEdit.value) return;
+  docDialogOpen.value = false;
   deleteDoc.value = document;
 }
 
@@ -721,18 +1199,20 @@ watch(
   (value) => {
     const preferred = normalizeDatabase(value);
     if (!preferred || preferred === database.value) return;
-    if (databases.value.includes(preferred)) {
-      database.value = preferred;
-      void loadCollections();
-    }
+    database.value = preferred;
+    void loadCollections();
   },
 );
 
 onMounted(() => {
+  document.addEventListener("click", closeManagementMenus);
+  document.addEventListener("contextmenu", closeManagementMenus);
   void loadDatabases();
 });
 
 onBeforeUnmount(() => {
+  document.removeEventListener("click", closeManagementMenus);
+  document.removeEventListener("contextmenu", closeManagementMenus);
   window.clearTimeout(toastTimer);
 });
 </script>
@@ -765,6 +1245,14 @@ onBeforeUnmount(() => {
             {{ item }}
           </option>
         </select>
+        <button
+          class="icon-button"
+          title="数据库操作"
+          aria-label="数据库操作"
+          @click.stop="toggleDatabaseMenu"
+        >
+          <Icon name="more" :size="13" />
+        </button>
       </div>
       <div class="mongo-collection-search">
         <Icon name="search" :size="12" />
@@ -807,9 +1295,7 @@ onBeforeUnmount(() => {
             class="mongo-collection-row"
             :class="{ active: selectedCollection?.name === item.name }"
             @click="selectCollection(item)"
-            @contextmenu.prevent="
-              canEdit && (deleteCollection = item)
-            "
+            @contextmenu.prevent.stop="openCollectionMenu($event, item)"
           >
             <Icon
               :name="item.kind === 'view' ? 'view' : 'table'"
@@ -825,26 +1311,116 @@ onBeforeUnmount(() => {
         </li>
       </ul>
       <footer class="mongo-sidebar-foot">
-        <span v-if="readOnly">只读连接</span>
-        <span v-else>右键集合可删除</span>
+        <span v-if="readOnly">只读连接 · 右键可查看统计</span>
+        <span v-else>右键集合可管理</span>
         <span>{{ connectionName }}</span>
       </footer>
     </aside>
+
+    <div
+      v-if="databaseMenu"
+      class="context-menu mongo-management-menu"
+      :style="{ left: `${databaseMenu.x}px`, top: `${databaseMenu.y}px` }"
+      @click.stop
+    >
+      <button
+        class="context-menu-item"
+        :disabled="readOnly"
+        @click="openCreateDatabase"
+      >
+        <Icon name="plus" :size="12" /> 新建数据库…
+      </button>
+      <button
+        class="context-menu-item danger"
+        :disabled="readOnly || isSystemDatabase || !database"
+        @click="openDropDatabase"
+      >
+        <Icon name="trash" :size="12" /> 删除当前数据库…
+      </button>
+      <button class="context-menu-item" @click="refreshDatabaseList(); closeManagementMenus()">
+        <Icon name="refresh" :size="12" /> 刷新数据库列表
+      </button>
+      <button
+        class="context-menu-item"
+        :disabled="!database"
+        @click="closeManagementMenus(); usersOpen = true"
+      >
+        <Icon name="list" :size="12" /> 用户与角色…
+      </button>
+      <p v-if="isSystemDatabase" class="context-menu-hint">
+        系统数据库 admin / local / config 不可删除
+      </p>
+      <p v-else-if="readOnly" class="context-menu-hint">
+        只读连接不能新建或删除数据库
+      </p>
+    </div>
+
+    <div
+      v-if="collectionMenu"
+      class="context-menu mongo-management-menu"
+      :style="{ left: `${collectionMenu.x}px`, top: `${collectionMenu.y}px` }"
+      @click.stop
+    >
+      <button
+        class="context-menu-item"
+        :disabled="readOnly || collectionMenu.item.kind !== 'collection'"
+        @click="openRenameCollection(collectionMenu.item)"
+      >
+        <Icon name="edit" :size="12" /> 重命名集合…
+      </button>
+      <button
+        class="context-menu-item"
+        @click="openCollectionStats(collectionMenu.item)"
+      >
+        <Icon name="structure" :size="12" /> 集合统计…
+      </button>
+      <button
+        class="context-menu-item danger"
+        :disabled="readOnly"
+        @click="deleteCollection = collectionMenu.item; closeManagementMenus()"
+      >
+        <Icon name="trash" :size="12" /> 删除集合…
+      </button>
+      <p
+        v-if="readOnly"
+        class="context-menu-hint"
+      >
+        只读连接不能重命名或删除集合
+      </p>
+      <p
+        v-else-if="collectionMenu.item.kind !== 'collection'"
+        class="context-menu-hint"
+      >
+        视图 / 时间序列集合暂不支持从此处重命名
+      </p>
+    </div>
 
     <main class="mongo-main">
       <header class="mongo-toolbar">
         <div class="mongo-toolbar-title">
           <Icon
-            :name="selectedCollection?.kind === 'view' ? 'view' : 'table'"
+            :name="
+              mode === 'console'
+                ? 'code'
+                : selectedCollection?.kind === 'view'
+                  ? 'view'
+                  : 'table'
+            "
             :size="14"
           />
-          <strong>{{ selectedName || "选择一个集合" }}</strong>
+          <strong>
+            {{
+              mode === "console"
+                ? "MongoDB 查询控制台"
+                : selectedName || "选择一个集合"
+            }}
+          </strong>
           <span v-if="selectedCollection" class="mongo-scope">
             {{ database }} · {{ selectedCollection.kind }}
           </span>
         </div>
         <div class="mongo-toolbar-actions">
-          <span v-if="displayPage && mode !== 'indexes'" class="hint">
+          <span v-if="displayPage && mode !== 'indexes' && mode !== 'console' && mode !== 'gridfs'" class="hint">
             {{
               mode === "aggregation"
                 ? `${displayPage.documents.length} 个结果`
@@ -853,6 +1429,15 @@ onBeforeUnmount(() => {
             · {{ displayElapsedMs }} ms
           </span>
           <button
+            class="button ghost compact"
+            title="AI 助手（基于集合 / 字段结构，不发送文档内容）"
+            @click="openMongoAi"
+          >
+            <Icon name="bolt" :size="13" />
+            AI
+          </button>
+          <button
+            v-if="mode !== 'console' && mode !== 'gridfs'"
             class="button ghost compact"
             :disabled="
               !selectedCollection ||
@@ -874,7 +1459,7 @@ onBeforeUnmount(() => {
             刷新
           </button>
           <button
-            v-if="mode !== 'indexes'"
+            v-if="mode !== 'indexes' && mode !== 'console' && mode !== 'gridfs'"
             class="button ghost compact"
             :disabled="!selectedCollection || importing"
             title="从 JSON 或 CSV 文件批量插入文档"
@@ -884,7 +1469,7 @@ onBeforeUnmount(() => {
             导入…
           </button>
           <button
-            v-if="mode !== 'indexes'"
+            v-if="mode !== 'indexes' && mode !== 'console' && mode !== 'gridfs'"
             class="button ghost compact"
             :disabled="!displayPage?.documents.length"
             title="导出当前筛选 / 聚合结果（最多 10,000 个文档）"
@@ -894,6 +1479,7 @@ onBeforeUnmount(() => {
             导出…
           </button>
           <button
+            v-if="mode !== 'console' && mode !== 'gridfs'"
             class="button primary compact"
             :disabled="!canEdit || !selectedCollection"
             :title="
@@ -909,12 +1495,23 @@ onBeforeUnmount(() => {
         </div>
       </header>
 
-      <div v-if="!selectedCollection" class="mongo-empty">
+      <div
+        v-if="!selectedCollection && mode !== 'console' && mode !== 'gridfs'"
+        class="mongo-empty"
+      >
         <Icon name="database" :size="24" />
         <strong>选择左侧集合开始浏览</strong>
         <span>
           MongoDB 文档按动态字段展示；支持 JSON 筛选、投影、排序和分页。
         </span>
+        <button class="button ghost compact" @click="switchMode('console')">
+          <Icon name="code" :size="13" />
+          打开查询控制台
+        </button>
+        <button class="button ghost compact" @click="switchMode('gridfs')">
+          <Icon name="upload" :size="13" />
+          打开 GridFS
+        </button>
         <span v-if="docsError" class="mongo-empty-error">{{ docsError }}</span>
       </div>
 
@@ -928,6 +1525,15 @@ onBeforeUnmount(() => {
             @click="switchMode('documents')"
           >
             文档
+          </button>
+          <button
+            class="segment"
+            :class="{ active: mode === 'console' }"
+            role="tab"
+            :aria-selected="mode === 'console'"
+            @click="switchMode('console')"
+          >
+            查询
           </button>
           <button
             class="segment"
@@ -947,9 +1553,43 @@ onBeforeUnmount(() => {
           >
             索引
           </button>
+          <button
+            class="segment"
+            :class="{ active: mode === 'gridfs' }"
+            role="tab"
+            :aria-selected="mode === 'gridfs'"
+            @click="switchMode('gridfs')"
+          >
+            GridFS
+          </button>
         </div>
 
-        <template v-if="mode === 'documents'">
+        <template v-if="mode === 'console'">
+          <MongoConsole
+            ref="consoleRef"
+            :connection-id="connectionId"
+            :database="database"
+            :databases="databases"
+            :collections="collections"
+            :fields="fields"
+            :read-only="readOnly"
+            @database-change="handleConsoleDatabaseChange"
+            @ready="flushPendingMongoAi"
+            @refresh-collections="refreshAfterConsoleWrite"
+            @notice="flashToast"
+          />
+        </template>
+
+        <template v-else-if="mode === 'gridfs'">
+          <MongoGridFsPanel
+            :connection-id="connectionId"
+            :database="database"
+            :read-only="readOnly"
+            @status="flashToast"
+          />
+        </template>
+
+        <template v-else-if="mode === 'documents'">
           <div class="mongo-filterbar">
             <label class="mongo-filter-field">
               <span>筛选 JSON</span>
@@ -1017,9 +1657,45 @@ onBeforeUnmount(() => {
           </div>
         </template>
 
-        <template v-if="mode !== 'indexes'">
+        <template v-if="mode !== 'indexes' && mode !== 'console'">
           <p v-if="displayError" class="data-message warning mongo-error">
             {{ displayError }}
+          </p>
+          <div
+            v-if="mode === 'documents' && pendingCount"
+            class="mongo-pending-bar"
+          >
+            <span>
+              待提交 <strong>{{ pendingCount }}</strong> 项变更
+              <span v-if="projectionDraft.trim()" class="hint">
+                （使用投影时不可网格编辑）
+              </span>
+            </span>
+            <span class="spacer"></span>
+            <button
+              class="button ghost compact"
+              :disabled="pendingSaving"
+              @click="pendingPreviewOpen = true"
+            >
+              查看变更
+            </button>
+            <button
+              class="button ghost compact"
+              :disabled="pendingSaving"
+              @click="discardPendingMongo"
+            >
+              放弃
+            </button>
+            <button
+              class="button primary compact"
+              :disabled="pendingSaving"
+              @click="pendingPreviewOpen = true"
+            >
+              {{ pendingSaving ? "提交中…" : "提交变更" }}
+            </button>
+          </div>
+          <p v-if="pendingError" class="data-message warning mongo-error">
+            {{ pendingError }}
           </p>
           <div class="mongo-grid-wrap">
             <table class="mongo-grid">
@@ -1057,9 +1733,9 @@ onBeforeUnmount(() => {
                     v-for="(document, index) in displayPage.documents"
                     :key="String(document._id ?? index)"
                     class="mongo-doc-row"
-                    @dblclick="
-                      openDocument(document, canEdit && mode === 'documents')
-                    "
+                    :class="{
+                      'mongo-doc-deleted': pendingDocument(document)?.deleted,
+                    }"
                   >
                     <td class="mongo-index-col">
                       {{
@@ -1070,12 +1746,42 @@ onBeforeUnmount(() => {
                       v-for="field in fields"
                       :key="field"
                       :class="{
-                        'mongo-null': document[field] === null,
-                        mono: typeof document[field] !== 'string',
+                        'mongo-null': cellValue(document, field) === null,
+                        mono: typeof cellValue(document, field) !== 'string',
+                        'mongo-cell-modified':
+                          pendingDocument(document) &&
+                          Object.prototype.hasOwnProperty.call(
+                            pendingDocument(document)?.updates ?? {},
+                            field,
+                          ),
+                        'mongo-cell-editable':
+                          canEditGrid &&
+                          field !== '_id' &&
+                          typeof cellValue(document, field) !== 'object' &&
+                          !pendingDocument(document)?.deleted,
                       }"
                       :title="cellText(document, field)"
+                      @dblclick.stop="startGridEdit(document, field)"
                     >
-                      {{ cellText(document, field) || (document[field] === '' ? "(空串)" : "—") }}
+                      <input
+                        v-if="
+                          gridEdit &&
+                          gridEdit.key === documentKey(document) &&
+                          gridEdit.field === field
+                        "
+                        v-model="gridEdit.value"
+                        v-focus
+                        class="mongo-cell-input"
+                        @keydown.enter.prevent="commitGridEdit"
+                        @keydown.esc.prevent="gridEdit = null"
+                        @blur="commitGridEdit"
+                      />
+                      <template v-else>
+                        {{
+                          cellText(document, field) ||
+                          (cellValue(document, field) === "" ? "(空串)" : "—")
+                        }}
+                      </template>
                     </td>
                     <td class="mongo-actions-col">
                       <button
@@ -1096,13 +1802,26 @@ onBeforeUnmount(() => {
                         <Icon name="edit" :size="12" />
                       </button>
                       <button
-                        v-if="canEdit && mode === 'documents' && document._id !== undefined"
+                        v-if="
+                          canEditGrid &&
+                          document._id !== undefined &&
+                          !pendingDocument(document)?.deleted
+                        "
                         class="icon-button danger"
-                        title="删除文档"
-                        aria-label="删除文档"
-                        @click="askDeleteDocument(document)"
+                        title="标记删除（提交前可放弃）"
+                        aria-label="标记删除文档"
+                        @click="togglePendingDelete(document)"
                       >
                         <Icon name="trash" :size="12" />
+                      </button>
+                      <button
+                        v-if="pendingDocument(document)?.deleted"
+                        class="icon-button"
+                        title="取消标记删除"
+                        aria-label="取消标记删除"
+                        @click="togglePendingDelete(document)"
+                      >
+                        <Icon name="undo" :size="12" />
                       </button>
                     </td>
                   </tr>
@@ -1153,7 +1872,7 @@ onBeforeUnmount(() => {
           </footer>
         </template>
 
-        <template v-else>
+        <template v-else-if="mode === 'indexes'">
           <div class="mongo-index-toolbar">
             <span class="hint">
               索引只作用于当前集合；删除默认 _id 索引会被后端拒绝。
@@ -1294,6 +2013,14 @@ onBeforeUnmount(() => {
             编辑
           </button>
           <button
+            v-if="docOriginal && canEdit && docDialogMode !== 'insert'"
+            class="button ghost danger-text"
+            @click="askDeleteDocument(docOriginal)"
+          >
+            <Icon name="trash" :size="13" />
+            删除文档…
+          </button>
+          <button
             v-if="docDialogMode !== 'view'"
             class="button primary"
             :disabled="docSaving"
@@ -1322,8 +2049,8 @@ onBeforeUnmount(() => {
     <ConfirmDialog
       :open="Boolean(deleteCollection)"
       title="删除 MongoDB 集合"
-      :message="`确定删除集合「${deleteCollection?.name ?? ''}」？`"
-      detail="集合及其全部文档会被删除，此操作不可撤销。"
+      :message="`确定删除${deleteCollection?.kind === 'view' ? '视图' : deleteCollection?.kind === 'timeseries' ? '时间序列集合' : '集合'}「${deleteCollection?.name ?? ''}」？`"
+      :detail="`集合类型：${deleteCollection?.kind ?? 'collection'}；集合及其全部文档和索引会被删除，此操作不可撤销。`"
       confirm-text="删除集合"
       danger
       @confirm="confirmDropCollection"
@@ -1401,6 +2128,80 @@ onBeforeUnmount(() => {
         </footer>
       </div>
     </div>
+
+    <AiSqlDialog
+      :open="aiOpen"
+      :sql="mongoAiSql"
+      selected-sql=""
+      driver="mongodb"
+      :database="database"
+      :schema="null"
+      :schema-context="mongoAiContext"
+      language="mongodb"
+      :error="docsError || aggregationError"
+      @close="aiOpen = false"
+      @insert="insertMongoAi"
+      @replace="replaceMongoAi"
+      @open-settings="emit('open-settings')"
+    />
+
+    <MongoUsersDialog
+      :open="usersOpen"
+      :connection-id="connectionId"
+      :database="database"
+      :read-only="readOnly"
+      @close="usersOpen = false"
+      @status="flashToast"
+    />
+
+    <MongoCreateDatabaseDialog
+      :open="createDatabaseOpen"
+      :busy="createDatabaseBusy"
+      :error="createDatabaseError"
+      @cancel="createDatabaseOpen = false"
+      @confirm="confirmCreateDatabase"
+    />
+
+    <MongoDropDatabaseDialog
+      :open="dropDatabaseOpen"
+      :database="database"
+      :collection-count="dropDatabaseCount"
+      :busy="dropDatabaseBusy"
+      :error="dropDatabaseError"
+      @cancel="dropDatabaseOpen = false"
+      @confirm="confirmDropDatabase"
+    />
+
+    <MongoRenameCollectionDialog
+      :open="Boolean(renameTarget)"
+      :database="database"
+      :from="renameTarget?.name ?? ''"
+      :existing="collections.map((item) => item.name)"
+      :busy="renameBusy"
+      :error="renameError"
+      @cancel="renameTarget = null"
+      @confirm="confirmRenameCollection"
+    />
+
+    <MongoCollectionStatsDialog
+      :open="Boolean(statsTarget)"
+      :connection-id="connectionId"
+      :database="database"
+      :collection="statsTarget?.name ?? ''"
+      :kind="statsTarget?.kind"
+      @close="statsTarget = null"
+    />
+
+    <ConfirmDialog
+      :open="pendingPreviewOpen"
+      title="提交 MongoDB 待提交变更"
+      :message="`将执行 ${pendingCount} 项 updateOne / deleteOne 操作。`"
+      :detail="pendingPreview() || '没有待提交变更'"
+      :confirm-text="pendingSaving ? '提交中…' : '提交变更'"
+      danger
+      @confirm="commitPendingMongo"
+      @cancel="pendingPreviewOpen = false"
+    />
 
     <ConfirmDialog
       :open="Boolean(importPending)"

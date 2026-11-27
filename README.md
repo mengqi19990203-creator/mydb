@@ -1,6 +1,6 @@
 # mydb
 
-轻量、跨平台的数据库客户端。当前是 **v0.12.0**：支持 SQLite / MySQL / PostgreSQL / MongoDB / Redis、SSH 隧道与 Redis TLS、MySQL 库级与 PostgreSQL 模式级对象树、统一的查询 / 表 / ER 多标签、结果固定与对比、结果剖析、表数据与结构视图、结构同步与行级数据同步、手动事务、新建表设计器、数据导入和执行历史。
+轻量、跨平台的数据库客户端。当前是 **v0.13.0**：支持 SQLite / MySQL / PostgreSQL / MongoDB / Redis、SSH 隧道与 Redis TLS、MySQL 库级与 PostgreSQL 模式级对象树、统一的查询 / 表 / ER 多标签、结果固定与对比、结果剖析、表数据与结构视图、结构同步与行级数据同步、手动事务、新建表设计器、数据导入和执行历史。
 
 技术栈参考 [DBX](https://github.com/t8y2/dbx)：**Tauri 2 + Rust + Vue 3 + TypeScript**，SQL 编辑器使用 CodeMirror 6，数据库访问使用 SQLx。
 
@@ -10,7 +10,7 @@
 
 ## 当前功能
 
-- **SQLite**、**MySQL / MariaDB**、**PostgreSQL**、**MongoDB** 与 **Redis** 连接
+- **SQLite**、**MySQL / MariaDB**、**PostgreSQL**、**MongoDB** 与 **Redis** 连接；MongoDB 支持单 host 字段表单和 `mongodb://` / `mongodb+srv://` 完整连接串（多 host、副本集与 URI 参数）
 - 连接的新建、编辑、删除，配置持久化到应用配置目录
 - MySQL 支持 host / port / user / password / 可选默认数据库 / SSL 模式；SSL 支持禁用、优先、必须、verify-ca、verify-full，并可指定 CA 与客户端证书 / 私钥；不填数据库时自动连接 `mysql` 系统库
 - MySQL 对象浏览器按「数据库 → 表 / 视图 / 存储过程 / 函数 / 触发器 / 事件 / 序列 → 字段」展开；每类对象都会显示数量（包括 0）。连接建立后一次性读取全部数据库的对象与数量，切换数据库不会重连。
@@ -22,7 +22,14 @@
 - **对象右键菜单**：表 / 视图 / 物化视图可打开数据、查看结构、在新标签打开、生成 SQL（SELECT / INSERT / UPDATE / DELETE / DDL，直接在查询标签打开）、复制 DDL / 名称 / 带引号限定名、导出、重命名、删除、刷新；表支持「复制为新表」（结构 + 全部数据）、清空表 / 截断表；视图支持「复制为新视图」和「快照为新表」（可选是否包含数据）；存储过程 / 函数 / 触发器 / 事件 / 序列 / 索引按当前驱动能力提供复制 DDL、重命名与删除；数据库和模式节点提供切换、新建表、刷新、复制名称；表右键支持「导入数据」（CSV / JSON）
 - **对象树多选**：表 / 视图 / 例程行支持复选框、⌘/Ctrl 点击与 Shift 范围选择；批量操作栏可导出选中对象 DDL、刷新、清空 / 截断表或删除对象，写入前二次确认并列出对象名，失败停止后可继续剩余对象
 - SQLite 对象树同样固定显示表 / 视图 / 索引 / 触发器及各自数量
-- **MongoDB 工作区**：连接支持 host / port、用户名 / 密码、认证数据库（authSource）、TLS、SSH 隧道与只读模式；工作区左侧按数据库列出集合 / 视图并支持搜索与新建 / 删除集合，右侧按动态字段展示文档，支持 JSON 筛选 / 投影 / 排序、分页与总数、文档 JSON 查看 / 插入 / 替换 / 删除、只读 aggregation pipeline、JSON / CSV 批量导入与导出，以及索引列表 / 创建 / 删除。文档使用 MongoDB Extended JSON 展示与编辑（如 `{"$oid":"..."}`），编辑时保持 `_id` 不变；不提供 SQL 编辑器。
+- **SQL 脚本**：多语句标签显示「脚本模式（N 条）」并可开启「多语句出错继续」与「脚本事务包裹」，逐条保留结果并统计成功 / 失败 / 未执行与总耗时；事务失败整体回滚，成功一次提交，已有手动事务不自动提交。
+- **SQL 参数**：查询编辑器支持 `:name` 与 SQLite / MySQL 单语句 `?`，运行 / 解释前填写字符串、数字、布尔、NULL 或经确认的原始 SQL；参数值只保留在当前标签会话，执行历史保存原始模板，不保存参数值。
+- **AI 助手**：SQL 查询工具栏、MongoDB 工作区、Redis 键面板 / 命令控制台均提供「AI」，可生成 / 解释 / 优化 / 修复 SQL、Redis 命令和 mongosh 命令，并支持多轮追问；设置中心配置 Claude、OpenAI、DeepSeek、Ollama 或自定义 OpenAI 兼容服务，API Key 存钥匙串，生成结果只进入编辑器不自动执行，默认不发送结果行。
+- **SQL 用户授权**：服务器活动 → 用户 / 角色可生成并执行 MySQL / PostgreSQL 的 GRANT / REVOKE，支持全局 / 库 / 模式 / 表范围和白名单权限；只读连接禁用。
+- **列定位与空列隐藏**：查询结果 / 表数据新增列面板，可按列名或注释搜索列，手动显示 / 隐藏，或按「全 NULL」「全 NULL / 空串」自动隐藏空列；自动隐藏为会话状态，不写入命名视图。
+- **数据集与报表**：查询结果面板的「数据集」可保存当前结果快照（本地 localStorage）、打开原 SQL 重跑，或导出带打印样式的独立 HTML 报表；报表只反映保存时快照。
+- **列显示格式**：查询结果与表数据列头右键可为日期 / 数字 / JSON 路径 / 脱敏 / 模板设置显示规则，列头显示 `fx`；只改变网格显示与查找文本，复制原始值、编辑、筛选、统计、图表和导出仍使用原始值。查询结果规则只保留在当前结果会话，表数据规则按连接 / 库 / 表持久化到 `mydb.columnFormatters.v1`。
+- **MongoDB 工作区**：连接支持 host / port、用户名 / 密码、认证数据库（authSource）、TLS、SSH 隧道与只读模式，也支持 URI / SRV 连接方式；URI 模式的多 host、`replicaSet`、`tlsCAFile`、`readPreference`、`retryWrites` 等参数由 MongoDB 驱动解析，完整连接串只保存在钥匙串，`connections.json` 仅保留脱敏地址，URI 模式不使用 SSH 隧道；工作区左侧按数据库列出集合 / 视图并支持搜索、新建 / 删除 / 重命名集合、集合统计与数据库新建 / 删除、用户与角色管理，右侧按动态字段展示文档，支持双击标量单元格待提交编辑、标记删除与 `updateOne` / `deleteOne` 预览；新增 GridFS 模式，可浏览 bucket、上传 / 下载 / 删除文件，支持 JSON 筛选 / 投影 / 排序、分页与总数、文档 JSON 查看 / 插入 / 替换 / 删除、只读 aggregation pipeline、命令式查询控制台（`use` / `show`、find / findOne / count / distinct / aggregate、单条 CRUD 与常用状态命令，Extended JSON、补全、历史和写安全确认）、JSON / CSV 批量导入与导出，以及索引列表 / 创建 / 删除。文档使用 MongoDB Extended JSON 展示与编辑（如 `{"$oid":"..."}`），编辑时保持 `_id` 不变；不提供 SQL 编辑器。
 - Redis 支持 host / port / 可选用户名 / 密码 / 数据库编号，以及 **SSH 隧道**和 **TLS**（对话框中选择「必须使用（TLS）」后按 `rediss` 连接）；左侧 SCAN 键列表支持游标「加载更多」、模式匹配与逻辑库切换，右侧查看 string / hash / list / set / zset / stream，并支持 TTL 设置 / 永久、重命名（覆盖确认）、string 值编辑、hash 字段增删改、list 左右插入 / 按索引修改 / 按值删除、set 成员增删、zset score 修改与成员增删；可删除键并执行任意 Redis 命令；工作区和状态栏显示当前数据库编号（如 `db01`）；主页面 `dbNN` 徽标可点击展开逻辑库下拉框，列表显示各库键数量，选中后立即切换并在重连后保持所选库；检测到 Redis Cluster 时下拉框里只包含 `db00`；控制台标签可关闭，关闭后回到「主工作区」，点标签栏 `+` 或重新选择连接恢复
 - 数据库密码可选保存到系统钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service）；不勾选时仅当前运行有效
 - MySQL / PostgreSQL / MongoDB / Redis 支持 **SSH 隧道**：私钥或密码认证，私钥可填写口令并保存到系统钥匙串（独立凭据），首次连接自动写入 `~/.ssh/known_hosts`（TOFU），之后检测主机密钥变化
@@ -219,12 +226,13 @@ mydb/
 - **v0.6**：PostgreSQL 驱动，按「数据库 → 模式 → 表 / 视图 / 物化视图 / 存储过程 / 函数 / 触发器 / 序列 → 字段」浏览
 - **v0.7**：ER 图、表结构 ALTER、结构差异对比与迁移 SQL、按主键的行级数据同步
 - **v0.8**：SQL 编辑器手动事务、对象树键盘导航与索引聚焦、建表设计器默认值 / 复合主键 / 注释、树级 CSV / JSON 导入（当前）
-- **后续**：达梦 / 金仓 / 神通等国产库的 JDBC 桥接、AI 助手、MCP
+- **后续**：达梦 / 金仓 / 神通等国产库的 JDBC 桥接、MCP
 
 ## 已知限制
 
 - 当前支持 SQLite、MySQL / MariaDB、PostgreSQL、MongoDB 与 Redis。
-- MongoDB 首版覆盖连接、库 / 集合 / 视图浏览、文档筛选 / 投影 / 排序 / 分页、文档增删改、只读 aggregation、批量导入导出和索引管理；暂不支持 mongosh 语法控制台、数据库创建 / 删除、用户 / 角色权限、SRV URI（`mongodb+srv://`）和 MongoDB 事务；aggregation pipeline 禁止 `$out` / `$merge`，结果最多 500 条。批量导入 / 导出单次上限 10,000 个文档，CSV 导出使用顶层字段并保留空值；聚合视图导出只包含当前已加载的聚合结果。集合在 JSON 网格中以动态字段并集展示，嵌套文档 / 数组显示为 JSON 文本；编辑使用 Extended JSON，单文档替换不会修改 `_id`。MongoDB 的写操作不经过待提交缓冲，保存后立即生效。当前开发环境没有可用的 MongoDB 实例，MongoDB 驱动的真实服务器回归（认证 / TLS / SSH / CRUD / 索引）仍待补；连接与界面已用模拟后端和 Rust 单元测试验证。
+- MongoDB 支持字段表单和 URI / SRV 两种连接方式；URI 模式完整串存独立钥匙串凭据槽（`mongo-uri`），编辑显示脱敏串，连接列表只显示 host 摘要，导入导出不含密文。
+- MongoDB 覆盖连接（字段表单与 URI / SRV）、库 / 集合 / 视图浏览、文档筛选 / 投影 / 排序 / 分页、文档增删改、只读 aggregation、批量导入导出、索引管理、GridFS、数据库 / 集合管理、用户 / 角色管理和 mongosh 风格查询控制台（含 `help` 命令目录与分片 / 复制集诊断）；暂不支持完整 mongosh JavaScript 语法、MongoDB 事务和分片写命令；查询控制台和 aggregation pipeline 都禁止 `$out` / `$merge`，单条结果最多 500 条，控制台单次最多 20 条命令，参数使用 Extended JSON。批量导入 / 导出单次上限 10,000 个文档，CSV 导出使用顶层字段并保留空值；聚合视图导出只包含当前已加载的聚合结果。集合在 JSON 网格中以动态字段并集展示，嵌套文档 / 数组显示为 JSON 文本；编辑使用 Extended JSON，单文档替换不会修改 `_id`。MongoDB 的写操作不经过待提交缓冲，保存后立即生效。MongoDB 已对真实服务器做过认证连接、CRUD、聚合、索引和 URI 连接回归；TLS / SSH 隧道与 SRV DNS 场景仍需按网络环境单独验证，URI 回归测试可用 `MYDB_TEST_MONGO_URI` 门控运行。
 - Redis 支持 TLS（`rediss`，使用系统 / WebPKI 受信任根证书校验主机名，暂不支持自签名证书、自定义 CA 与客户端证书）；MySQL 的存储过程 / 函数目前只列出名称，查看定义尚未实现。
 - 查询标签按「连接 + 数据库 / 模式」记录来源，标签栏显示连接名和库 / 模式；SQL、标题和来源保存在 WebView localStorage（`mydb.queryTabs.v1`），重启后恢复，结果、事务状态和选中文本不保存。删除连接会同时移除其查询标签。切换标签时如果目标库 / 模式与当前连接不同，会先切换连接上下文；该连接有未提交事务时会阻止切换。右侧查询分屏必须与当前连接和库 / 模式一致；独立查询窗口使用自己的内存标签与结果，不会同步主窗口的连接列表或标签。独立窗口使用同一连接的驱动上下文，因此窗口打开期间会锁定该连接的库 / 模式切换，关闭窗口后恢复。
 - MySQL 切换数据库不会重建连接：驱动持有当前数据库并在执行用户 SQL 前 `USE`，元数据与表操作使用全限定名；切换数据库会关闭当前表标签。SQL 编辑器中未限定库名的语句会作用于切换后的库。

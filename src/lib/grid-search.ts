@@ -37,7 +37,10 @@ export function findGridMatches(
   rows: readonly (readonly unknown[])[],
   columns: readonly GridSearchColumn[],
   query: string,
-  options: { caseSensitive?: boolean } = {},
+  options: {
+    caseSensitive?: boolean;
+    display?: (value: unknown, columnIndex: number) => string;
+  } = {},
 ): GridMatch[] {
   if (!query.trim() || !columns.length) return [];
   const needle = options.caseSensitive ? query : query.toLowerCase();
@@ -45,7 +48,9 @@ export function findGridMatches(
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
     const row = rows[rowIndex];
     for (const column of columns) {
-      const haystack = formatGridCell(row[column.index]);
+      const haystack = options.display
+        ? options.display(row[column.index], column.index)
+        : formatGridCell(row[column.index]);
       const text = options.caseSensitive ? haystack : haystack.toLowerCase();
       let from = 0;
       while (from <= text.length - needle.length) {

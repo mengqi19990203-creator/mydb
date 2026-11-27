@@ -9786,3 +9786,1479 @@ input:focus-visible {
   align-items: center;
   gap: 6px;
 }
+
+/* ===== MongoDB command console ===== */
+.mongo-console {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.mongo-console-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.mongo-console-mode,
+.mongo-console-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.mongo-console-runmode {
+  height: 26px;
+  font-size: 10.5px;
+}
+
+.mongo-console-scope {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+.mongo-console-write-note {
+  padding: 1px 7px;
+  border: 1px solid rgba(253, 214, 99, 0.26);
+  border-radius: 999px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+.mongo-console-write-note.readonly {
+  border-color: var(--border);
+  background: var(--panel-3);
+  color: var(--muted);
+}
+
+.mongo-console-examples {
+  position: relative;
+}
+
+.mongo-console-examples summary {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 10.5px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.mongo-console-examples summary::-webkit-details-marker {
+  display: none;
+}
+
+.mongo-console-example-menu {
+  position: absolute;
+  top: 30px;
+  right: 0;
+  z-index: 20;
+  min-width: 170px;
+}
+
+.mongo-console-history-wrap {
+  position: relative;
+}
+
+.mongo-console-history-menu {
+  position: absolute;
+  top: 31px;
+  right: 0;
+  z-index: 20;
+  width: min(440px, 70vw);
+  max-height: 320px;
+  overflow: auto;
+}
+
+.mongo-console-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 9px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.mongo-console-history-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  border-bottom: 1px solid var(--border-subtle);
+  text-align: left;
+}
+
+.mongo-console-history-item.failed {
+  color: var(--danger);
+}
+
+.mongo-console-history-command {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mongo-console-history-empty {
+  margin: 0;
+  padding: 10px;
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.mongo-console-editor {
+  flex: 0 0 38%;
+  min-height: 150px;
+  max-height: 45%;
+  overflow: hidden;
+  border-bottom: 1px solid var(--border);
+  background: var(--code-bg);
+}
+
+.mongo-console-editor .cm-editor {
+  height: 100%;
+  color: var(--code-text);
+  background: transparent;
+}
+
+.mongo-console-editor .cm-gutters {
+  background: var(--panel);
+  border-right: 1px solid var(--border-subtle);
+  color: var(--faint);
+}
+
+.mongo-console-editor .cm-activeLine,
+.mongo-console-editor .cm-activeLineGutter {
+  background: var(--bg-hover);
+}
+
+.mongo-console-results {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  overflow: auto;
+  padding: 7px 10px 10px;
+}
+
+.mongo-console-tabs {
+  display: flex;
+  gap: 3px;
+  overflow-x: auto;
+  padding-bottom: 5px;
+}
+
+.mongo-console-tab {
+  display: inline-flex;
+  flex: 0 0 auto;
+  max-width: 280px;
+  align-items: baseline;
+  gap: 5px;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 9.5px;
+  cursor: pointer;
+}
+
+.mongo-console-tab.active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.mongo-console-tab span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mongo-console-tab em {
+  flex: none;
+  color: var(--faint);
+  font-style: normal;
+}
+
+.mongo-console-result {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.mongo-console-result-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.mongo-console-message {
+  margin: 0;
+}
+
+.mongo-console-warning {
+  margin: 0;
+}
+
+.mongo-console-value-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  padding: 5px 7px;
+}
+
+.mongo-console-value-list > div {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-height: 19px;
+}
+
+.mongo-console-value-list code {
+  color: var(--text);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.mongo-console-grid-wrap {
+  min-height: 80px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+
+.mongo-console-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 7px 9px;
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-sm);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+
+.mongo-console-empty {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 7px;
+  min-height: 140px;
+  color: var(--faint);
+  text-align: center;
+  font-size: 10.5px;
+}
+
+.mongo-console-empty strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.mongo-console-empty span {
+  max-width: 520px;
+}
+
+.mongo-console-confirm {
+  width: min(680px, calc(100vw - 40px));
+  max-height: min(82vh, 720px);
+  overflow: auto;
+}
+
+.mongo-console-confirm-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 8px 18px;
+}
+
+.mongo-console-confirm-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 9px;
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-sm);
+  background: var(--danger-soft);
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.mongo-console-confirm-item strong {
+  color: var(--danger);
+}
+
+.mongo-console-confirm-item code {
+  max-height: 90px;
+  overflow: auto;
+  padding: 3px 5px;
+  border-radius: 3px;
+  background: var(--surface-well);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: pre-wrap;
+}
+
+.mongo-console-confirm-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 5px 18px 12px;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.mongo-console-confirm .modal-actions {
+  padding: 0 18px 15px;
+}
+
+@media (max-width: 720px) {
+  .mongo-console-editor {
+    flex-basis: 45%;
+  }
+
+  .mongo-console-toolbar {
+    padding: 6px;
+  }
+
+  .mongo-console-write-note {
+    white-space: normal;
+  }
+}
+
+/* MongoDB URI connection mode */
+.uri-mode-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.uri-mode-label {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.uri-mode-row .segmented {
+  flex: 0 0 auto;
+}
+.mongo-uri-field input {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+}
+.uri-secret-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* MongoDB database / collection management */
+.mongo-management-menu {
+  min-width: 200px;
+}
+.mongo-management-menu .context-menu-item:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+.mongo-database-row .icon-button {
+  flex: 0 0 auto;
+}
+.mongo-manage-dialog {
+  width: min(520px, calc(100vw - 32px));
+}
+.mongo-manage-form {
+  display: grid;
+  gap: 12px;
+  padding: 4px 0 8px;
+}
+.mongo-manage-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.mongo-manage-form input,
+.mongo-drop-confirm-input {
+  width: 100%;
+  height: 32px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  color: var(--text);
+  font-size: 12px;
+}
+.mongo-manage-form input:focus,
+.mongo-drop-confirm-input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.mongo-drop-confirm-input {
+  margin: 8px 0 12px;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.confirm-modal .button.danger {
+  border-color: color-mix(in srgb, var(--danger, #f85149) 55%, transparent);
+  background: color-mix(in srgb, var(--danger, #f85149) 18%, transparent);
+  color: var(--danger, #f85149);
+}
+.mongo-stats-dialog {
+  width: min(720px, calc(100vw - 32px));
+  max-height: min(82vh, 760px);
+  display: flex;
+  flex-direction: column;
+}
+.mongo-stats-body {
+  overflow: auto;
+  min-height: 120px;
+  padding: 4px 2px 12px;
+}
+.mongo-stats-loading {
+  padding: 36px 0;
+  color: var(--muted);
+  text-align: center;
+}
+.mongo-stats-error {
+  padding-top: 4px;
+}
+.mongo-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 12px 0;
+}
+.mongo-stats-grid > div {
+  display: grid;
+  gap: 3px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-well);
+}
+.mongo-stats-grid span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.mongo-stats-grid strong {
+  font-size: 15px;
+  font-weight: 650;
+}
+.mongo-stats-grid small {
+  color: var(--faint);
+  font-size: 10px;
+}
+.mongo-stats-section {
+  margin-top: 14px;
+}
+.mongo-stats-section h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 650;
+}
+.mongo-stats-dl {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 6px 12px;
+  margin: 0;
+  font-size: 12px;
+}
+.mongo-stats-dl dt { color: var(--muted); }
+.mongo-stats-dl dd { margin: 0; }
+.mongo-stats-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.mongo-stats-table th,
+.mongo-stats-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+.mongo-stats-table th {
+  color: var(--muted);
+  font-weight: 600;
+}
+.mongo-stats-table td:nth-child(2),
+.mongo-stats-table td:nth-child(3) {
+  white-space: nowrap;
+  text-align: right;
+}
+.mongo-stats-table th:nth-child(2),
+.mongo-stats-table th:nth-child(3) {
+  text-align: right;
+}
+.mongo-stats-json {
+  max-height: 180px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-well);
+  color: var(--text);
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+@media (max-width: 640px) {
+  .mongo-stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* Column display formats */
+.column-format-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 14px;
+  padding: 0 3px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 3px;
+  color: var(--accent);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.03em;
+}
+.format-cell-warning {
+  position: relative;
+}
+.format-cell-warning::after {
+  content: "!";
+  position: absolute;
+  top: 2px;
+  right: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--warning, #d29922) 25%, transparent);
+  color: var(--warning, #d29922);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+.column-format-dialog {
+  width: min(720px, calc(100vw - 32px));
+  max-height: min(86vh, 820px);
+  display: flex;
+  flex-direction: column;
+}
+.column-format-body {
+  overflow: auto;
+  padding: 4px 2px 10px;
+}
+.column-format-type {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 12px 0;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-well);
+}
+.column-format-type .segment {
+  flex: 1 1 auto;
+  min-width: 92px;
+}
+.column-format-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+  padding: 2px 0 8px;
+}
+.column-format-fields label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.column-format-fields label.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  align-self: end;
+  min-height: 28px;
+}
+.column-format-fields input:not([type="checkbox"]),
+.column-format-fields select {
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  color: var(--text);
+  font-size: 12px;
+}
+.column-format-fields input[type="number"] {
+  max-width: 120px;
+}
+.column-format-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  grid-column: 1 / -1;
+}
+.column-format-presets .button {
+  font-size: 10px;
+}
+.column-format-preview {
+  margin-top: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.column-format-preview h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 650;
+}
+.column-format-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 11px;
+}
+.column-format-preview th,
+.column-format-preview td {
+  padding: 5px 7px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.column-format-preview th {
+  color: var(--muted);
+  font-weight: 600;
+}
+.column-format-preview th:first-child,
+.column-format-preview td:first-child {
+  width: 48%;
+  color: var(--muted);
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.column-format-clear {
+  margin-right: auto;
+  color: var(--warning, #d29922);
+}
+.format-warning-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--warning, #d29922) 25%, transparent);
+  color: var(--warning, #d29922);
+  font-size: 9px;
+  font-weight: 700;
+}
+@media (max-width: 620px) {
+  .column-format-fields { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* SQL parameters */
+.sql-parameter-badge {
+  white-space: nowrap;
+}
+.sql-parameters-dialog {
+  width: min(820px, calc(100vw - 32px));
+  max-height: min(88vh, 860px);
+  display: flex;
+  flex-direction: column;
+}
+.sql-parameters-body {
+  overflow: auto;
+  padding: 4px 2px 10px;
+}
+.sql-parameter-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+.sql-parameter-row {
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-well);
+}
+.sql-parameter-row.has-error {
+  border-color: color-mix(in srgb, var(--warning, #d29922) 60%, transparent);
+}
+.sql-parameter-label {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.sql-parameter-label code {
+  color: var(--accent);
+  font-size: 12px;
+}
+.sql-parameter-controls {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.sql-parameter-controls > select {
+  height: 30px;
+  min-width: 100px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 11px;
+}
+.sql-parameter-controls > textarea {
+  flex: 1 1 280px;
+  min-height: 30px;
+  max-height: 120px;
+  resize: vertical;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+}
+.sql-parameter-controls > textarea.mono {
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.sql-parameter-sensitive {
+  flex: 0 0 auto;
+  min-height: 30px !important;
+  font-size: 10px !important;
+}
+.sql-parameter-empty {
+  font-size: 10px !important;
+}
+.sql-parameter-null {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+}
+.sql-parameter-raw-confirm {
+  font-size: 11px;
+}
+.sql-parameter-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+.sql-parameter-preview {
+  max-height: 220px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-well);
+  color: var(--text);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.result-parameter-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/* MongoDB GridFS */
+.mongo-gridfs {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  padding: 12px 14px;
+  overflow: auto;
+}
+.mongo-gridfs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.mongo-gridfs-bucket {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.mongo-gridfs-bucket select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  color: var(--text);
+  font-size: 11px;
+}
+.mongo-gridfs-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 200px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  color: var(--faint);
+}
+.mongo-gridfs-search input {
+  height: 28px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  outline: none;
+}
+.mongo-gridfs-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  padding: 54px 20px;
+  color: var(--muted);
+  text-align: center;
+}
+.mongo-gridfs-empty strong {
+  color: var(--text);
+  font-size: 13px;
+}
+.mongo-gridfs-table-wrap {
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.mongo-gridfs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.mongo-gridfs-table th,
+.mongo-gridfs-table td {
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+.mongo-gridfs-table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-weight: 600;
+}
+.mongo-gridfs-name {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mongo-gridfs-name svg {
+  margin-right: 4px;
+  vertical-align: -2px;
+}
+.mongo-gridfs-actions {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+}
+.danger-text {
+  color: var(--danger, #f85149) !important;
+}
+
+/* MongoDB pending grid edits */
+.mongo-pending-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface-well));
+  color: var(--text);
+  font-size: 11px;
+}
+.mongo-pending-bar strong {
+  color: var(--accent);
+}
+.mongo-doc-deleted td {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+.mongo-cell-modified {
+  background: color-mix(in srgb, var(--warning, #d29922) 12%, transparent) !important;
+}
+.mongo-cell-editable {
+  cursor: text;
+}
+.mongo-cell-input {
+  width: 100%;
+  min-width: 80px;
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+}
+
+/* MongoDB users and roles */
+.mongo-users-dialog {
+  width: min(880px, calc(100vw - 32px));
+  max-height: min(86vh, 820px);
+  display: flex;
+  flex-direction: column;
+}
+.mongo-users-body {
+  overflow: auto;
+  padding: 4px 2px 10px;
+}
+.mongo-users-table {
+  width: 100%;
+  margin: 8px 0;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.mongo-users-table th,
+.mongo-users-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+.mongo-users-table th {
+  color: var(--muted);
+  font-weight: 600;
+}
+.mongo-user-roles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.mongo-role-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.mongo-role-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+  max-height: 140px;
+  overflow: auto;
+}
+.mongo-user-form {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.mongo-user-form h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.mongo-user-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* Datasets and reports */
+.datasets-dialog {
+  width: min(880px, calc(100vw - 32px));
+  max-height: min(86vh, 820px);
+  display: flex;
+  flex-direction: column;
+}
+.datasets-body {
+  overflow: auto;
+  padding: 4px 2px 10px;
+}
+.datasets-save {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-well);
+}
+.datasets-save strong {
+  font-size: 12px;
+}
+.datasets-save p {
+  margin: 3px 0 0;
+}
+.datasets-save-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.datasets-save-actions input {
+  width: 220px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 11px;
+}
+.datasets-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+.dataset-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.dataset-card-main {
+  min-width: 0;
+}
+.dataset-card-main strong {
+  font-size: 12px;
+}
+.dataset-card-main p {
+  margin: 3px 0 6px;
+}
+.dataset-sql {
+  max-height: 56px;
+  overflow: hidden;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface-well);
+  color: var(--muted);
+  font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.dataset-card-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 3px;
+}
+@media (max-width: 680px) {
+  .datasets-save { align-items: stretch; flex-direction: column; }
+  .datasets-save-actions input { flex: 1; width: auto; }
+  .dataset-card { grid-template-columns: minmax(0, 1fr); }
+  .dataset-card-actions { flex-direction: row; flex-wrap: wrap; }
+}
+
+/* Column visibility panel */
+.column-visibility-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  background: rgba(0, 0, 0, 0.28);
+}
+.column-visibility-panel {
+  position: absolute;
+  top: 76px;
+  right: 20px;
+  bottom: 24px;
+  display: flex;
+  flex-direction: column;
+  width: min(360px, calc(100vw - 40px));
+  padding: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--panel-2);
+  box-shadow: var(--shadow-overlay);
+}
+.column-visibility-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.column-visibility-head strong {
+  display: block;
+  font-size: 13px;
+}
+.column-visibility-head .hint {
+  display: block;
+  margin-top: 2px;
+}
+.column-visibility-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  color: var(--faint);
+}
+.column-visibility-search input {
+  flex: 1;
+  height: 28px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  outline: none;
+  font-size: 11px;
+}
+.column-visibility-list {
+  flex: 1;
+  min-height: 80px;
+  overflow: auto;
+  margin-top: 6px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.column-visibility-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 27px;
+  padding: 3px 4px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  text-align: left;
+}
+.column-visibility-row:hover {
+  background: var(--bg-hover);
+}
+.column-visibility-row.hidden {
+  opacity: 0.58;
+}
+.column-visibility-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.column-visibility-badge {
+  flex: 0 0 auto;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--muted) 15%, transparent);
+  color: var(--muted);
+  font-size: 9px;
+}
+.column-visibility-badge.auto {
+  background: color-mix(in srgb, var(--warning, #d29922) 16%, transparent);
+  color: var(--warning, #d29922);
+}
+.column-visibility-comment {
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.column-visibility-empty {
+  padding: 16px 4px;
+  text-align: center;
+}
+.column-visibility-auto {
+  display: grid;
+  gap: 5px;
+  padding: 10px 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.column-visibility-auto label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text);
+}
+.column-visibility-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 8px;
+}
+.result-grid-column-tools {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 4px 4px;
+}
+.run-script-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/* SQL grants */
+.server-user-grant-actions {
+  display: flex;
+  gap: 5px;
+  margin: 4px 0 8px;
+}
+.server-grant-dialog {
+  width: min(720px, calc(100vw - 32px));
+}
+.server-grant-body {
+  display: grid;
+  gap: 12px;
+  padding: 4px 2px 10px;
+}
+.server-grant-privileges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-well);
+  font-size: 11px;
+}
+.server-grant-privileges > span {
+  color: var(--muted);
+}
+.server-grant-privileges label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.server-grant-preview {
+  display: grid;
+  gap: 5px;
+}
+.server-grant-preview > span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.server-grant-preview pre {
+  margin: 0;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-well);
+  color: var(--text);
+  font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* AI SQL assistant */
+.ai-sql-dialog {
+  width: min(900px, calc(100vw - 32px));
+  max-height: min(90vh, 880px);
+  display: flex;
+  flex-direction: column;
+}
+.ai-sql-body {
+  overflow: auto;
+  padding: 4px 2px 10px;
+}
+.ai-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.ai-mode-card {
+  display: grid;
+  gap: 3px;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-well);
+  color: var(--text);
+  text-align: left;
+}
+.ai-mode-card strong {
+  font-size: 12px;
+}
+.ai-mode-card span {
+  color: var(--muted);
+  font-size: 10px;
+}
+.ai-mode-card.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface-well));
+}
+.ai-request-field {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.ai-request-field textarea {
+  min-height: 90px;
+  resize: vertical;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  color: var(--text);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12px;
+}
+.ai-context-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 10px 0;
+  font-size: 11px;
+}
+.ai-context-row .link-button {
+  margin-left: auto;
+}
+.ai-run-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0;
+}
+.ai-result-loading {
+  padding: 28px;
+  color: var(--muted);
+  text-align: center;
+}
+.ai-result {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.ai-result header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-well);
+  font-size: 11px;
+}
+.ai-result pre {
+  max-height: 380px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px;
+  color: var(--text);
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ai-settings-section {
+  border-top: 1px solid var(--border);
+}
+.ai-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+  margin: 8px 0;
+}
+.ai-settings-grid label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.ai-settings-grid input,
+.ai-settings-grid select {
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-well);
+  color: var(--text);
+  font-size: 11px;
+}
+.ai-settings-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+@media (max-width: 720px) {
+  .ai-mode-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ai-settings-grid { grid-template-columns: minmax(0, 1fr); }
+}

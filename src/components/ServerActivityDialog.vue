@@ -310,6 +310,7 @@ onBeforeUnmount(() => {
           ref="usersPanel"
           :connection-id="connectionId"
           :driver="driver"
+          :read-only="readOnly"
           active
         />
 

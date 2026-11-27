@@ -7,6 +7,8 @@ interface SyncScopeOptions {
   sourceId: Ref<string>;
   targetId: Ref<string>;
   onError?: (message: string) => void;
+  /// Allow a target connection with a different SQL driver (data transfer).
+  crossDriver?: boolean;
 }
 
 const MYSQL_SYSTEM_DATABASES = new Set([
@@ -50,20 +52,27 @@ export function useSyncScope(options: SyncScopeOptions) {
   let targetSchemaToken = 0;
 
   const available = computed(() =>
-    options.connections.value.filter((connection) => connection.driver !== "redis"),
+    options.connections.value.filter((connection) =>
+      ["sqlite", "mysql", "postgres"].includes(connection.driver),
+    ),
   );
   const sourceConnection = computed(
     () => available.value.find((item) => item.id === options.sourceId.value) ?? null,
   );
   const driver = computed(() => sourceConnection.value?.driver ?? "");
+  const targetConnection = computed(
+    () => available.value.find((item) => item.id === options.targetId.value) ?? null,
+  );
+  const targetDriver = computed(() => targetConnection.value?.driver ?? "");
   const sameConnectionSupported = computed(
     () => driver.value === "mysql" || driver.value === "postgres",
   );
   const targetOptions = computed(() => {
     const others = available.value.filter(
       (connection) =>
-        connection.driver === sourceConnection.value?.driver &&
-        connection.id !== options.sourceId.value,
+        connection.id !== options.sourceId.value &&
+        (options.crossDriver ||
+          connection.driver === sourceConnection.value?.driver),
     );
     if (sameConnectionSupported.value && sourceConnection.value) {
       return [...others, sourceConnection.value];
@@ -100,16 +109,16 @@ export function useSyncScope(options: SyncScopeOptions) {
   const targetScopeValid = computed(() => {
     if (!options.targetId.value) return false;
     if (options.targetId.value !== options.sourceId.value) {
-      if (driver.value === "mysql") return Boolean(targetDatabase.value);
-      if (driver.value === "postgres") {
+      if (targetDriver.value === "mysql") return Boolean(targetDatabase.value);
+      if (targetDriver.value === "postgres") {
         return Boolean(targetDatabase.value) && Boolean(targetSchema.value);
       }
       return true;
     }
-    if (driver.value === "mysql") {
+    if (targetDriver.value === "mysql") {
       return Boolean(targetDatabase.value);
     }
-    if (driver.value === "postgres") {
+    if (targetDriver.value === "postgres") {
       return Boolean(targetDatabase.value) && Boolean(targetSchema.value);
     }
     return false;
@@ -124,10 +133,10 @@ export function useSyncScope(options: SyncScopeOptions) {
   const targetContextDiffers = computed(() => {
     const context = targetContext.value;
     if (!context) return false;
-    if (driver.value === "mysql") {
+    if (targetDriver.value === "mysql") {
       return targetDatabase.value !== (context.database ?? "");
     }
-    if (driver.value === "postgres") {
+    if (targetDriver.value === "postgres") {
       return (
         targetDatabase.value !== (context.database ?? "") ||
         targetSchema.value !== (context.schema ?? "")
@@ -181,7 +190,7 @@ export function useSyncScope(options: SyncScopeOptions) {
   async function loadTargetSchemas() {
     const currentToken = ++targetSchemaToken;
     const targetId = options.targetId.value;
-    if (driver.value !== "postgres" || !targetDatabase.value || !targetId) {
+    if (targetDriver.value !== "postgres" || !targetDatabase.value || !targetId) {
       targetSchemas.value = [];
       targetSchema.value = "";
       return;
@@ -281,11 +290,11 @@ export function useSyncScope(options: SyncScopeOptions) {
         const targetCtx = await api.getConnectionContext(targetId);
         if (currentToken !== refreshToken) return;
         targetContext.value = targetCtx;
-        if (driver.value === "mysql") {
+        if (targetDriver.value === "mysql") {
           const allDatabases = await api.listDatabases(targetId);
           if (currentToken !== refreshToken) return;
           const databases = visibleDatabases(
-            driver.value,
+            targetDriver.value,
             allDatabases,
             targetCtx.database,
           );
@@ -298,7 +307,7 @@ export function useSyncScope(options: SyncScopeOptions) {
                 ? targetCtx.database
                 : databases[0] ?? "";
           }
-        } else if (driver.value === "postgres") {
+        } else if (targetDriver.value === "postgres") {
           const databases = await api.listDatabases(targetId);
           if (currentToken !== refreshToken) return;
           targetDatabases.value = databases;
@@ -319,7 +328,7 @@ export function useSyncScope(options: SyncScopeOptions) {
       }
 
       targetContext.value = context;
-      if (driver.value === "mysql") {
+      if (targetDriver.value === "mysql") {
         targetDatabases.value = sourceDatabases.value;
         targetSchemas.value = [];
         targetSchema.value = "";
@@ -331,7 +340,7 @@ export function useSyncScope(options: SyncScopeOptions) {
             targetDatabases.value[0] ??
             "";
         }
-      } else if (driver.value === "postgres") {
+      } else if (targetDriver.value === "postgres") {
         targetDatabases.value = sourceDatabases.value;
         if (!targetDatabases.value.includes(targetDatabase.value)) {
           targetDatabase.value = targetDatabases.value.includes(
@@ -393,7 +402,7 @@ export function useSyncScope(options: SyncScopeOptions) {
   });
 
   watch(sourceSchema, () => {
-    if (usesSameConnection.value && driver.value === "postgres") {
+    if (usesSameConnection.value && targetDriver.value === "postgres") {
       void loadTargetSchemas();
     }
   });
@@ -407,6 +416,7 @@ export function useSyncScope(options: SyncScopeOptions) {
     sourceContext,
     targetContext,
     driver,
+    targetDriver,
     sourceDatabases,
     sourceSchemas,
     sourceDatabase,

@@ -46,8 +46,12 @@ import type {
   TableChangeResult,
   TableDataDiff,
   MongoCollectionInfo,
+  MongoCollectionStats,
   MongoDocumentPage,
+  MongoGridFsFile,
   MongoIndexInfo,
+  MongoRoleInfo,
+  MongoUserInfo,
   TableInfo,
   TableRows,
   TableSort,
@@ -65,12 +69,14 @@ export function listConnections(): Promise<ConnectionConfig[]> {
 export function saveConnection(
   config: ConnectionConfig,
   password?: string,
+  mongoUriSecret?: string,
   sshPassword?: string,
   sshKeyPassphrase?: string,
 ): Promise<ConnectionConfig> {
   return invoke("save_connection", {
     config,
     password: password ?? null,
+    mongoUriSecret: mongoUriSecret ?? null,
     sshPassword: sshPassword ?? null,
     sshKeyPassphrase: sshKeyPassphrase ?? null,
   });
@@ -78,7 +84,7 @@ export function saveConnection(
 
 export function clearConnectionSecret(
   id: string,
-  kind: "db" | "ssh" | "ssh-key",
+  kind: "db" | "mongo-uri" | "ssh" | "ssh-key",
 ): Promise<void> {
   return invoke("clear_connection_secret", { id, kind });
 }
@@ -155,12 +161,14 @@ export function moveConnectionToGroup(
 export function testConnection(
   config: ConnectionConfig,
   password?: string,
+  mongoUriSecret?: string,
   sshPassword?: string,
   sshKeyPassphrase?: string,
 ): Promise<void> {
   return invoke("test_connection", {
     config,
     password: password ?? null,
+    mongoUriSecret: mongoUriSecret ?? null,
     sshPassword: sshPassword ?? null,
     sshKeyPassphrase: sshKeyPassphrase ?? null,
   });
@@ -279,12 +287,14 @@ export function executeQuery(
   sql: string,
   maxRows = 1000,
   operationId?: string,
+  historySql?: string,
 ): Promise<QueryResult> {
   return invoke("execute_query", {
     connectionId,
     sql,
     maxRows,
     operationId: operationId ?? null,
+    historySql: historySql ?? null,
   });
 }
 
@@ -295,8 +305,13 @@ export function cancelQuery(operationId: string): Promise<CancelQueryResult> {
 export function explainQuery(
   connectionId: string,
   sql: string,
+  historySql?: string,
 ): Promise<ExplainResult> {
-  return invoke("explain_query", { connectionId, sql });
+  return invoke("explain_query", {
+    connectionId,
+    sql,
+    historySql: historySql ?? null,
+  });
 }
 
 export function searchScopeObjects(
@@ -319,6 +334,7 @@ export function executeTransactionQuery(
   sql: string,
   maxRows = 1000,
   operationId?: string,
+  historySql?: string,
 ): Promise<QueryResult> {
   return invoke("execute_transaction_query", {
     connectionId,
@@ -326,6 +342,7 @@ export function executeTransactionQuery(
     sql,
     maxRows,
     operationId: operationId ?? null,
+    historySql: historySql ?? null,
   });
 }
 
@@ -1206,6 +1223,22 @@ export function mongoReplaceDocument(
   });
 }
 
+export function mongoUpdateDocumentFields(
+  connectionId: string,
+  database: string,
+  collection: string,
+  id: unknown,
+  fields: Record<string, unknown>,
+): Promise<boolean> {
+  return invoke("mongo_update_document_fields", {
+    connectionId,
+    database,
+    collection,
+    id,
+    fields,
+  });
+}
+
 export function mongoDeleteDocument(
   connectionId: string,
   database: string,
@@ -1263,6 +1296,203 @@ export function mongoCreateCollection(
   return invoke("mongo_create_collection", { connectionId, database, name });
 }
 
+export function mongoCreateDatabase(
+  connectionId: string,
+  database: string,
+  firstCollection: string,
+): Promise<void> {
+  return invoke("mongo_create_database", {
+    connectionId,
+    database,
+    firstCollection,
+  });
+}
+
+export function mongoDropDatabase(
+  connectionId: string,
+  database: string,
+  confirmName: string,
+): Promise<void> {
+  return invoke("mongo_drop_database", { connectionId, database, confirmName });
+}
+
+export function mongoRenameCollection(
+  connectionId: string,
+  database: string,
+  from: string,
+  to: string,
+): Promise<void> {
+  return invoke("mongo_rename_collection", {
+    connectionId,
+    database,
+    from,
+    to,
+  });
+}
+
+export function mongoCollectionStats(
+  connectionId: string,
+  database: string,
+  collection: string,
+): Promise<MongoCollectionStats> {
+  return invoke("mongo_collection_stats", {
+    connectionId,
+    database,
+    collection,
+  });
+}
+
+export function aiSaveApiKey(key: string): Promise<void> {
+  return invoke("ai_save_api_key", { key });
+}
+
+export function aiHasApiKey(): Promise<boolean> {
+  return invoke("ai_has_api_key");
+}
+
+export function aiChat(payload: {
+  provider: string;
+  baseUrl: string;
+  model: string;
+  systemPrompt: string;
+  userPrompt: string;
+  maxTokens?: number;
+  history?: Array<{ role: "user" | "assistant"; content: string }>;
+}): Promise<string> {
+  return invoke("ai_chat", {
+    provider: payload.provider,
+    baseUrl: payload.baseUrl,
+    model: payload.model,
+    systemPrompt: payload.systemPrompt,
+    userPrompt: payload.userPrompt,
+    maxTokens: payload.maxTokens ?? 2048,
+    history: payload.history ?? [],
+  });
+}
+
+export function mongoListUsers(
+  connectionId: string,
+  database: string,
+): Promise<MongoUserInfo[]> {
+  return invoke("mongo_list_users", { connectionId, database });
+}
+
+export function mongoListRoles(
+  connectionId: string,
+  database: string,
+): Promise<MongoRoleInfo[]> {
+  return invoke("mongo_list_roles", { connectionId, database });
+}
+
+export function mongoCreateUser(
+  connectionId: string,
+  database: string,
+  username: string,
+  password: string,
+  roles: string[],
+): Promise<void> {
+  return invoke("mongo_create_user", {
+    connectionId,
+    database,
+    username,
+    password,
+    roles,
+  });
+}
+
+export function mongoUpdateUserRoles(
+  connectionId: string,
+  database: string,
+  username: string,
+  roles: string[],
+): Promise<void> {
+  return invoke("mongo_update_user_roles", {
+    connectionId,
+    database,
+    username,
+    roles,
+  });
+}
+
+export function mongoDropUser(
+  connectionId: string,
+  database: string,
+  username: string,
+): Promise<void> {
+  return invoke("mongo_drop_user", { connectionId, database, username });
+}
+
+export function mongoListGridFsBuckets(
+  connectionId: string,
+  database: string,
+): Promise<string[]> {
+  return invoke("mongo_list_gridfs_buckets", { connectionId, database });
+}
+
+export function mongoListGridFsFiles(
+  connectionId: string,
+  database: string,
+  bucket: string,
+  search: string,
+  skip: number,
+  limit: number,
+): Promise<MongoGridFsFile[]> {
+  return invoke("mongo_list_gridfs_files", {
+    connectionId,
+    database,
+    bucket,
+    search,
+    skip,
+    limit,
+  });
+}
+
+export function mongoUploadGridFsFile(
+  connectionId: string,
+  database: string,
+  bucket: string,
+  path: string,
+  filename?: string,
+): Promise<MongoGridFsFile> {
+  return invoke("mongo_upload_gridfs_file", {
+    connectionId,
+    database,
+    bucket,
+    path,
+    filename: filename ?? null,
+  });
+}
+
+export function mongoDownloadGridFsFile(
+  connectionId: string,
+  database: string,
+  bucket: string,
+  id: unknown,
+  destination: string,
+): Promise<void> {
+  return invoke("mongo_download_gridfs_file", {
+    connectionId,
+    database,
+    bucket,
+    id,
+    destination,
+  });
+}
+
+export function mongoDeleteGridFsFile(
+  connectionId: string,
+  database: string,
+  bucket: string,
+  id: unknown,
+): Promise<void> {
+  return invoke("mongo_delete_gridfs_file", {
+    connectionId,
+    database,
+    bucket,
+    id,
+  });
+}
+
 export function mongoDropCollection(
   connectionId: string,
   database: string,
@@ -1298,5 +1528,19 @@ export function mongoInsertDocuments(
     database,
     collection,
     documents,
+  });
+}
+
+export function mongoConsoleExecute(
+  connectionId: string,
+  database: string,
+  script: string,
+  confirmed: boolean,
+): Promise<import("./types").MongoConsoleResponse> {
+  return invoke("mongo_console_execute", {
+    connectionId,
+    database,
+    script,
+    confirmed,
   });
 }

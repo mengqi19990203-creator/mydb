@@ -11,12 +11,14 @@ pub async fn explain_query(
     state: State<'_, AppState>,
     connection_id: String,
     sql: String,
+    history_sql: Option<String>,
 ) -> Result<ExplainResult, String> {
     let statements = split_sql_script(&sql)?;
     if statements.len() != 1 {
         return Err("一次只能解释一条语句".to_string());
     }
     let statement = statements[0].sql.trim().to_string();
+    let history_sql = history_sql.as_deref().unwrap_or(&sql).to_string();
     let keyword = first_keyword(&statement).to_ascii_lowercase();
     if keyword == "explain" {
         return Err("请选中原始查询，不要重复 EXPLAIN".to_string());
@@ -45,7 +47,7 @@ pub async fn explain_query(
     if config.driver == "mysql" {
         match driver.execute(&explain_sql, 100).await {
             Ok(result) => {
-                record_query_history(&app, &connection_id, &explain_sql, &Ok(result.clone()));
+                record_query_history(&app, &connection_id, &history_sql, &Ok(result.clone()));
                 Ok(ExplainResult {
                     driver: config.driver,
                     statement,
@@ -57,7 +59,7 @@ pub async fn explain_query(
             Err(_) => {
                 let fallback = format!("EXPLAIN {statement}");
                 let outcome = driver.execute(&fallback, 200).await;
-                record_query_history(&app, &connection_id, &fallback, &outcome);
+                record_query_history(&app, &connection_id, &history_sql, &outcome);
                 outcome.map(|result| ExplainResult {
                     driver: config.driver,
                     statement,
@@ -69,7 +71,7 @@ pub async fn explain_query(
         }
     } else {
         let outcome = driver.execute(&explain_sql, 200).await;
-        record_query_history(&app, &connection_id, &explain_sql, &outcome);
+        record_query_history(&app, &connection_id, &history_sql, &outcome);
         outcome.map(|result| ExplainResult {
             driver: config.driver,
             statement,

@@ -3,6 +3,11 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import Icon from "./Icon.vue";
 import { writeClipboard } from "../lib/clipboard";
 import { formatGridCell } from "../lib/grid-search";
+import {
+  formatColumnKeys,
+  formatDisplayValue,
+  type ColumnFormatEntry,
+} from "../lib/column-format";
 import type { ChartData } from "../lib/result-chart";
 
 const MAX_TRANSPOSE_ROWS = 500;
@@ -11,6 +16,7 @@ const MAX_TRANSPOSE_COLUMNS = 100;
 const props = defineProps<{
   data: ChartData;
   title: string;
+  formats?: ColumnFormatEntry[];
 }>();
 
 interface TransposeMenu {
@@ -37,6 +43,21 @@ const columnTruncated = computed(
 
 function value(rowIndex: number, columnIndex: number): unknown {
   return rows.value[rowIndex]?.[columnIndex] ?? null;
+}
+
+const columnKeys = computed(() =>
+  formatColumnKeys(props.data.columns.map((name) => ({ name }))),
+);
+
+function ruleForColumn(columnIndex: number) {
+  const key = columnKeys.value[columnIndex] ?? "";
+  return props.formats?.find((entry) => entry.columnKey === key)?.rule ?? null;
+}
+
+function displayValue(rowIndex: number, columnIndex: number): string {
+  const valueHere = value(rowIndex, columnIndex);
+  const rule = ruleForColumn(columnIndex);
+  return rule ? formatDisplayValue(valueHere, rule).text : formatGridCell(valueHere);
 }
 
 function showToast(message: string) {
@@ -88,6 +109,20 @@ async function copyValue() {
       formatGridCell(value(current.rowIndex, column.index)),
     );
     showToast("已复制值");
+  } catch (reason) {
+    showToast(`复制失败：${reason}`);
+  }
+}
+
+async function copyDisplayValue() {
+  const current = menu.value;
+  closeMenu();
+  if (!current || current.rowIndex === null || current.columnIndex === null) return;
+  const column = columns.value[current.columnIndex];
+  if (!column) return;
+  try {
+    await writeClipboard(displayValue(current.rowIndex, column.index));
+    showToast("已复制显示值");
   } catch (reason) {
     showToast(`复制失败：${reason}`);
   }
@@ -204,10 +239,10 @@ onBeforeUnmount(() => {
                 null: value(rowIndex, column.index) === null,
                 num: typeof value(rowIndex, column.index) === 'number',
               }"
-              :title="formatGridCell(value(rowIndex, column.index))"
+              :title="displayValue(rowIndex, column.index)"
               @contextmenu="openCellMenu($event, rowIndex, columnIndex)"
             >
-              {{ formatGridCell(value(rowIndex, column.index)) }}
+              {{ displayValue(rowIndex, column.index) }}
             </td>
           </tr>
         </tbody>
@@ -228,6 +263,18 @@ onBeforeUnmount(() => {
       >
         <Icon name="copy" :size="14" />
         复制值
+      </button>
+      <button
+        v-if="
+          menu.rowIndex !== null &&
+          menu.columnIndex !== null &&
+          ruleForColumn(columns[menu.columnIndex]?.index ?? -1)
+        "
+        class="context-menu-item"
+        @click="copyDisplayValue"
+      >
+        <Icon name="copy" :size="14" />
+        复制显示值
       </button>
       <button
         v-if="menu.columnIndex !== null"

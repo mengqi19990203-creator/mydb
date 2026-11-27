@@ -19,6 +19,8 @@ export interface ConnectionConfig {
   username: string;
   database: string;
   mongoAuthSource?: string;
+  mongoUriMode?: boolean;
+  mongoUri?: string;
   sslMode: SslMode;
   sslCaPath: string;
   sslClientCertPath: string;
@@ -34,6 +36,7 @@ export interface ConnectionConfig {
   saveSshKeyPassphrase: boolean;
   readOnly: boolean;
   hasPassword: boolean;
+  hasMongoUriSecret?: boolean;
   hasSshPassword: boolean;
   hasSshKeyPassphrase: boolean;
 }
@@ -80,6 +83,54 @@ export interface MongoIndexInfo {
   unique: boolean;
   sparse: boolean;
   expireAfterSeconds: number | null;
+}
+
+export interface MongoIndexSize {
+  name: string;
+  size: number;
+}
+
+export interface MongoUserInfo {
+  username: string;
+  database: string;
+  roles: string[];
+}
+
+export interface MongoRoleInfo {
+  name: string;
+  database: string;
+  builtin: boolean;
+}
+
+export interface MongoGridFsFile {
+  id: unknown;
+  filename: string;
+  length: number;
+  chunkSize: number;
+  uploadDate: string;
+  metadata: unknown;
+}
+
+export interface MongoTimeseriesInfo {
+  timeField: string | null;
+  metaField: string | null;
+  granularity: string | null;
+}
+
+export interface MongoCollectionStats {
+  namespace: string;
+  kind: "collection" | "timeseries" | "view" | string;
+  capped: boolean;
+  count: number | null;
+  size: number | null;
+  storageSize: number | null;
+  avgObjSize: number | null;
+  nindexes: number | null;
+  totalIndexSize: number | null;
+  indexSizes: MongoIndexSize[];
+  timeseries: MongoTimeseriesInfo | null;
+  validator: unknown;
+  readOnly: boolean | null;
 }
 
 
@@ -778,4 +829,38 @@ export interface RedisDatabases {
   databases: RedisDatabaseInfo[];
   count: number;
   cluster: boolean;
+}
+
+export interface MongoConsoleOutcome {
+  index: number;
+  statement: string;
+  kind: "documents" | "document" | "scalar" | "values" | "write" | "empty" | string;
+  database: string;
+  collection: string | null;
+  documents: Record<string, unknown>[];
+  values: unknown[];
+  elapsedMs: number;
+  truncated: boolean;
+  error: string | null;
+  message: string | null;
+  warnings: string[];
+}
+
+export interface MongoConsoleConfirmation {
+  index: number;
+  database: string;
+  collection: string;
+  method: string;
+  reason: string;
+  estimatedCount: number | null;
+  preview: string;
+}
+
+export interface MongoConsoleResponse {
+  outcomes: MongoConsoleOutcome[];
+  confirmations: MongoConsoleConfirmation[];
+  database: string;
+  refreshCollections: boolean;
+  error: string | null;
+  errorIndex: number | null;
 }

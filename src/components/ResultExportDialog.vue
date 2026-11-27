@@ -244,6 +244,9 @@ onBeforeUnmount(() => {
         />
       </div>
 
+      <p class="result-export-hint">
+        显示格式不会写入导出文件：CSV / JSON / XLSX / Markdown / SQL INSERT 均使用原始值。
+      </p>
       <p v-if="format === 'json'" class="result-export-hint">
         导出为对象数组，保留数字 / 布尔 / null 类型。
       </p>

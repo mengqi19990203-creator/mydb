@@ -18,6 +18,7 @@ const emit = defineEmits<{
     payload: {
       config: ConnectionConfig;
       password?: string;
+      mongoUriSecret?: string;
       sshPassword?: string;
       sshKeyPassphrase?: string;
     },
@@ -47,6 +48,8 @@ const form = reactive<{
   password: string;
   database: string;
   mongoAuthSource: string;
+  mongoUriMode: boolean;
+  mongoUri: string;
   sslMode: SslMode;
   sslCaPath: string;
   sslClientCertPath: string;
@@ -76,6 +79,8 @@ const form = reactive<{
   password: "",
   database: "",
   mongoAuthSource: "admin",
+  mongoUriMode: false,
+  mongoUri: "",
   sslMode: "disabled",
   sslCaPath: "",
   sslClientCertPath: "",
@@ -98,12 +103,22 @@ const testing = ref(false);
 const testMessage = ref("");
 const error = ref("");
 const keyPassphraseSaved = ref(false);
+const mongoUriSecretSaved = ref(false);
+const mongoUriDirty = ref(false);
+const modeSnapshot = ref("");
 
 const passwordPlaceholder = computed(() => {
   if (props.editing?.hasPassword) return "已保存，留空保持不变";
   if (form.driver === "redis") return "Redis 密码（可选）";
   if (form.driver === "mongodb") return "MongoDB 密码（可选）";
   return "数据库密码";
+});
+
+const mongoUriPlaceholder = computed(() => {
+  if (mongoUriSecretSaved.value && !mongoUriDirty.value) {
+    return "已保存连接串，留空保持不变";
+  }
+  return "mongodb://user:password@127.0.0.1:27017/mydb?authSource=admin";
 });
 
 const sshPasswordPlaceholder = computed(() =>
@@ -123,6 +138,11 @@ const passwordStorageLabel = computed(() =>
   devLocalCredentials
     ? "保存密码到本机凭据文件（开发版，仅当前用户可读）"
     : "保存密码到系统钥匙串",
+);
+const mongoUriStorageLabel = computed(() =>
+  devLocalCredentials
+    ? "保存连接串到本机凭据文件（开发版，仅当前用户可读）"
+    : "保存连接串到系统钥匙串",
 );
 const sshPasswordStorageLabel = computed(() =>
   devLocalCredentials
@@ -155,6 +175,8 @@ watch(
       form.password = "";
       form.database = editing.database;
       form.mongoAuthSource = editing.mongoAuthSource || "admin";
+      form.mongoUriMode = editing.mongoUriMode ?? false;
+      form.mongoUri = editing.mongoUri ?? "";
       form.sslMode = editing.sslMode;
       form.sslCaPath = editing.sslCaPath ?? "";
       form.sslClientCertPath = editing.sslClientCertPath ?? "";
@@ -172,6 +194,12 @@ watch(
       form.sshPassword = "";
       form.saveSshPassword = editing.saveSshPassword;
       form.readOnly = editing.readOnly;
+      mongoUriSecretSaved.value = Boolean(
+        editing.hasMongoUriSecret ||
+          (editing.savePassword && editing.mongoUri?.includes("******")),
+      );
+      mongoUriDirty.value = false;
+      if (form.mongoUriMode) form.sshEnabled = false;
     } else {
       form.id = "";
       form.name = "";
@@ -185,6 +213,8 @@ watch(
       form.password = "";
       form.database = "";
       form.mongoAuthSource = "admin";
+      form.mongoUriMode = false;
+      form.mongoUri = "";
       form.sslMode = "disabled";
       form.sslCaPath = "";
       form.sslClientCertPath = "";
@@ -202,7 +232,10 @@ watch(
       form.sshPassword = "";
       form.saveSshPassword = true;
       form.readOnly = false;
+      mongoUriSecretSaved.value = false;
+      mongoUriDirty.value = false;
     }
+    modeSnapshot.value = modeFieldsSnapshot();
   },
   { immediate: true },
 );
@@ -234,6 +267,9 @@ watch(
       }
       if (!form.mongoAuthSource.trim()) form.mongoAuthSource = "admin";
     }
+    // Changing the database type resets the form defaults; do not treat those
+    // automatic changes as unsaved user input for the connection-method prompt.
+    modeSnapshot.value = modeFieldsSnapshot();
   },
 );
 
@@ -251,6 +287,83 @@ watch(
   },
   { deep: true },
 );
+
+function modeFieldsSnapshot(): string {
+  return JSON.stringify({
+    host: form.host,
+    port: form.port,
+    username: form.username,
+    password: form.password,
+    database: form.database,
+    mongoAuthSource: form.mongoAuthSource,
+    sslMode: form.sslMode,
+    mongoUri: form.mongoUri,
+  });
+}
+
+function setMongoUriMode(next: boolean) {
+  if (form.mongoUriMode === next) return;
+  if (
+    modeSnapshot.value &&
+    modeFieldsSnapshot() !== modeSnapshot.value &&
+    !window.confirm("切换连接方式会清空当前方式的未保存输入。继续切换？")
+  ) {
+    return;
+  }
+  form.mongoUriMode = next;
+  testMessage.value = "";
+  if (next) {
+    form.sshEnabled = false;
+  } else if (!form.mongoUri.trim() && props.editing?.mongoUri) {
+    form.mongoUri = props.editing.mongoUri;
+  }
+  modeSnapshot.value = modeFieldsSnapshot();
+}
+
+function uriHasSecret(uri: string): boolean {
+  const rest = uri.includes("://") ? uri.split("://")[1] ?? "" : uri;
+  const authority = rest.split(/[/?#]/)[0] ?? "";
+  const at = authority.lastIndexOf("@");
+  if (at >= 0 && authority.slice(0, at).includes(":")) return true;
+  const query = rest.split("?")[1]?.split("#")[0] ?? "";
+  return query.split("&").some((pair) => {
+    const [key, value] = pair.split("=");
+    if (!value) return false;
+    return ["password", "secret", "token", "key"].some((needle) =>
+      (key ?? "").toLowerCase().includes(needle),
+    );
+  });
+}
+
+function currentMongoUriSecret(): string | undefined {
+  if (form.driver !== "mongodb" || !form.mongoUriMode) return undefined;
+  const value = form.mongoUri.trim();
+  if (!value || value.includes("******")) return undefined;
+  if (!mongoUriDirty.value && !form.id) return value;
+  if (!mongoUriDirty.value) return undefined;
+  return value;
+}
+
+async function clearMongoUriSecret() {
+  const id = props.editing?.id;
+  if (!id) return;
+  if (
+    !window.confirm(
+      "清除已保存的连接串密码后，连接需要重新输入完整连接串。继续？",
+    )
+  ) {
+    return;
+  }
+  try {
+    await api.clearConnectionSecret(id, "mongo-uri");
+    mongoUriSecretSaved.value = false;
+    mongoUriDirty.value = false;
+    form.savePassword = false;
+    testMessage.value = "已清除保存的连接串";
+  } catch (reason) {
+    error.value = String(reason);
+  }
+}
 
 function onKeydown(event: KeyboardEvent) {
   if (props.open && event.key === "Escape") {
@@ -287,11 +400,14 @@ function toConfig(): ConnectionConfig {
     username: form.username.trim(),
     database: form.database.trim(),
     mongoAuthSource: form.mongoAuthSource.trim(),
+    mongoUriMode: form.driver === "mongodb" && form.mongoUriMode,
+    mongoUri: form.driver === "mongodb" ? form.mongoUri.trim() : "",
     sslMode: form.sslMode,
     sslCaPath: form.sslCaPath.trim(),
     sslClientCertPath: form.sslClientCertPath.trim(),
     sslClientKeyPath: form.sslClientKeyPath.trim(),
-    sshEnabled: form.sshEnabled,
+    sshEnabled:
+      form.driver === "mongodb" && form.mongoUriMode ? false : form.sshEnabled,
     sshHost: form.sshHost.trim(),
     sshPort: Number(form.sshPort) || 22,
     sshUsername: form.sshUsername.trim(),
@@ -308,6 +424,7 @@ function toConfig(): ConnectionConfig {
         : false,
     readOnly: form.readOnly,
     hasPassword: props.editing?.hasPassword ?? false,
+    hasMongoUriSecret: mongoUriSecretSaved.value,
     hasSshPassword: props.editing?.hasSshPassword ?? false,
     hasSshKeyPassphrase: keyPassphraseSaved.value,
   };
@@ -396,7 +513,39 @@ function validate(): boolean {
       return false;
     }
   }
-  if (form.driver === "mongodb" && !form.host.trim()) {
+  if (form.driver === "mongodb" && form.mongoUriMode) {
+    const uri = form.mongoUri.trim();
+    if (!uri && !(mongoUriSecretSaved.value && props.editing)) {
+      error.value = "请输入 MongoDB 连接串";
+      return false;
+    }
+    if (uri.length > 2048) {
+      error.value = "连接串不能超过 2048 个字符";
+      return false;
+    }
+    const lower = uri.toLowerCase();
+    if (mongoUriDirty.value && uri.includes("******")) {
+      error.value =
+        "修改连接串时请重新输入完整连接串（含密码）；也可以先清除已保存连接串";
+      return false;
+    }
+    if (
+      uri &&
+      !lower.startsWith("mongodb://") &&
+      !lower.startsWith("mongodb+srv://")
+    ) {
+      error.value =
+        "连接串只支持 mongodb:// 或 mongodb+srv://，例如 mongodb://user:password@127.0.0.1:27017/mydb?authSource=admin";
+      return false;
+    }
+    if (
+      lower.startsWith("mongodb+srv://") &&
+      lower.replace(/\s/g, "").includes("directconnection=true")
+    ) {
+      error.value = "mongodb+srv 与 directConnection=true 不兼容，请移除该参数";
+      return false;
+    }
+  } else if (form.driver === "mongodb" && !form.host.trim()) {
     error.value = "请输入主机地址";
     return false;
   }
@@ -427,10 +576,14 @@ async function test() {
     await api.testConnection(
       toConfig(),
       form.password || undefined,
+      currentMongoUriSecret(),
       form.sshPassword || undefined,
       form.sshKeyPassphrase || undefined,
     );
-    testMessage.value = "连接成功";
+    testMessage.value =
+      form.driver === "mongodb" && form.mongoUriMode
+        ? "连接成功 · TLS / SRV 由连接串控制"
+        : "连接成功";
   } catch (reason) {
     error.value = String(reason);
   } finally {
@@ -455,10 +608,24 @@ async function clearKeyPassphrase() {
 function submit() {
   error.value = "";
   if (!validate()) return;
+  const uriSecret = currentMongoUriSecret();
+  if (
+    form.driver === "mongodb" &&
+    form.mongoUriMode &&
+    uriSecret &&
+    mongoUriSecretSaved.value &&
+    !uriHasSecret(uriSecret) &&
+    !window.confirm(
+      "新连接串没有密码，继续将清除已保存的连接串密码。确定保存？",
+    )
+  ) {
+    return;
+  }
 
   emit("save", {
     config: toConfig(),
     password: form.password || undefined,
+    mongoUriSecret: uriSecret,
     sshPassword: form.sshPassword || undefined,
     sshKeyPassphrase: form.sshKeyPassphrase || undefined,
   });
@@ -512,6 +679,28 @@ function submit() {
             </select>
           </label>
 
+          <div v-if="form.driver === 'mongodb'" class="span-2 uri-mode-row">
+            <span class="uri-mode-label">连接方式</span>
+            <div class="segmented compact-segmented">
+              <button
+                type="button"
+                class="segment"
+                :class="{ active: !form.mongoUriMode }"
+                @click="setMongoUriMode(false)"
+              >
+                主机 / 端口
+              </button>
+              <button
+                type="button"
+                class="segment"
+                :class="{ active: form.mongoUriMode }"
+                @click="setMongoUriMode(true)"
+              >
+                连接串（URI / SRV）
+              </button>
+            </div>
+          </div>
+
           <label v-if="form.driver === 'sqlite'" class="span-2">
             数据库文件
             <div class="file-row">
@@ -519,6 +708,45 @@ function submit() {
               <button class="button ghost" @click="browse">选择文件</button>
             </div>
           </label>
+
+          <template v-else-if="form.driver === 'mongodb' && form.mongoUriMode">
+            <label class="span-2 mongo-uri-field">
+              MongoDB 连接串
+              <input
+                v-model="form.mongoUri"
+                type="text"
+                spellcheck="false"
+                autocomplete="off"
+                :placeholder="mongoUriPlaceholder"
+                @input="mongoUriDirty = true"
+              />
+            </label>
+            <p class="hint span-2">
+              支持 mongodb:// 多 host 与 mongodb+srv://。完整连接串只保存在钥匙串，配置文件中仅保留脱敏地址；URI / SRV 连接不能使用 SSH 隧道。
+            </p>
+            <p
+              v-if="mongoUriSecretSaved && !mongoUriDirty"
+              class="hint span-2"
+            >
+              已保存连接串，留空保持不变；修改连接串会替换已保存内容。
+            </p>
+            <div
+              v-if="props.editing?.id && mongoUriSecretSaved"
+              class="span-2 uri-secret-actions"
+            >
+              <button
+                type="button"
+                class="button ghost"
+                @click="clearMongoUriSecret"
+              >
+                清除已保存连接串
+              </button>
+            </div>
+            <label class="checkbox-row span-2">
+              <input v-model="form.savePassword" type="checkbox" />
+              {{ mongoUriStorageLabel }}
+            </label>
+          </template>
 
           <template v-else>
             <label>
@@ -688,7 +916,14 @@ function submit() {
             </div>
           </label>
 
-          <template v-if="form.driver === 'mysql' || form.driver === 'postgres' || form.driver === 'redis' || form.driver === 'mongodb'">
+          <p
+            v-if="form.driver === 'mongodb' && form.mongoUriMode"
+            class="hint span-2"
+          >
+            URI / SRV 连接请直接访问数据库；需要堡垒机时请使用主机 / 端口模式。
+          </p>
+
+          <template v-if="(form.driver === 'mysql' || form.driver === 'postgres' || form.driver === 'redis' || form.driver === 'mongodb') && !(form.driver === 'mongodb' && form.mongoUriMode)">
             <label class="checkbox-row span-2 ssh-toggle">
               <input v-model="form.sshEnabled" type="checkbox" />
               通过 SSH 隧道连接

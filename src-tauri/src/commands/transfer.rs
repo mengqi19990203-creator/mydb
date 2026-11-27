@@ -18,6 +18,122 @@ fn quote(name: &str, driver: &str) -> String {
     }
 }
 
+fn cross_driver_type(source_type: &str, target: &str, auto_increment: bool) -> String {
+    let source = source_type.to_ascii_uppercase();
+    if source.contains("INT") || source.contains("SERIAL") {
+        return match target {
+            "postgres" if auto_increment => "BIGSERIAL".to_string(),
+            "postgres" => "BIGINT".to_string(),
+            "mysql" => "BIGINT".to_string(),
+            _ => "INTEGER".to_string(),
+        };
+    }
+    if source.contains("BOOL") {
+        return match target {
+            "postgres" => "BOOLEAN".to_string(),
+            "mysql" => "TINYINT(1)".to_string(),
+            _ => "INTEGER".to_string(),
+        };
+    }
+    if source.contains("REAL")
+        || source.contains("FLOAT")
+        || source.contains("DOUBLE")
+        || source.contains("DECIMAL")
+        || source.contains("NUMERIC")
+        || source.contains("MONEY")
+    {
+        return match target {
+            "postgres" => "DOUBLE PRECISION".to_string(),
+            "mysql" => "DOUBLE".to_string(),
+            _ => "REAL".to_string(),
+        };
+    }
+    if source.contains("DATE") || source.contains("TIME") {
+        return match target {
+            "postgres" => "TIMESTAMP".to_string(),
+            "mysql" => "DATETIME".to_string(),
+            _ => "TEXT".to_string(),
+        };
+    }
+    if source.contains("JSON") {
+        return match target {
+            "postgres" => "JSONB".to_string(),
+            "mysql" => "JSON".to_string(),
+            _ => "TEXT".to_string(),
+        };
+    }
+    if source.contains("BLOB")
+        || source.contains("BINARY")
+        || source.contains("BYTEA")
+        || source.contains("IMAGE")
+    {
+        return match target {
+            "postgres" => "BYTEA".to_string(),
+            "mysql" => "LONGBLOB".to_string(),
+            _ => "BLOB".to_string(),
+        };
+    }
+    match target {
+        "postgres" => "TEXT".to_string(),
+        "mysql" => "TEXT".to_string(),
+        _ => "TEXT".to_string(),
+    }
+}
+
+fn cross_driver_create_table(
+    columns: &[crate::models::ColumnInfo],
+    target_table: &str,
+    target: &str,
+) -> Result<String, String> {
+    if columns.is_empty() {
+        return Err("源表没有字段，无法创建目标表".to_string());
+    }
+    let primary_keys = columns
+        .iter()
+        .filter(|column| column.primary_key)
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    let single_auto = primary_keys.len() == 1
+        && columns
+            .iter()
+            .any(|column| column.primary_key && column.auto_increment);
+    let inline_primary = single_auto && matches!(target, "sqlite" | "mysql");
+    let mut definitions = Vec::new();
+    for column in columns {
+        let mut definition = format!(
+            "{} {}",
+            quote(&column.name, target),
+            cross_driver_type(&column.data_type, target, column.auto_increment)
+        );
+        if column.primary_key && column.auto_increment && inline_primary {
+            definition.push_str(" PRIMARY KEY");
+            if target == "sqlite" {
+                definition.push_str(" AUTOINCREMENT");
+            } else {
+                definition.push_str(" AUTO_INCREMENT");
+            }
+        } else if !column.nullable {
+            definition.push_str(" NOT NULL");
+        }
+        definitions.push(definition);
+    }
+    if !inline_primary && !primary_keys.is_empty() {
+        definitions.push(format!(
+            "PRIMARY KEY ({})",
+            primary_keys
+                .iter()
+                .map(|name| quote(name, target))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(format!(
+        "CREATE TABLE {} ({})",
+        quote(target_table, target),
+        definitions.join(", ")
+    ))
+}
+
 async fn resolve_driver(
     app: &AppHandle,
     state: &AppState,
@@ -84,13 +200,14 @@ pub async fn transfer_table_data(
         .iter()
         .find(|item| item.id == target_connection_id)
         .ok_or_else(|| "目标连接不存在".to_string())?;
-    if source_config.driver != target_config.driver {
-        return Err("数据传输第一版只支持同类型数据库".to_string());
+    let source_kind = source_config.driver.clone();
+    let target_kind = target_config.driver.clone();
+    if !["sqlite", "mysql", "postgres"].contains(&source_kind.as_str()) {
+        return Err("源连接不是支持表数据传输的 SQL 数据库".to_string());
     }
-    if source_config.driver == "redis" {
-        return Err("Redis 不支持表数据传输".to_string());
+    if !["sqlite", "mysql", "postgres"].contains(&target_kind.as_str()) {
+        return Err("目标连接不是支持表数据传输的 SQL 数据库".to_string());
     }
-    let driver_kind = source_config.driver.clone();
     let mode = options.mode.to_ascii_lowercase();
     if !matches!(mode.as_str(), "append" | "upsert" | "truncate") {
         return Err("未知传输模式".to_string());
@@ -152,9 +269,20 @@ pub async fn transfer_table_data(
                 if !options.create_missing {
                     return Err(format!("目标表 {} 不存在", table.target_table));
                 }
-                let ddl = source.dump_table_ddl(&table.source_table).await?;
-                let renamed = rename_ddl_object(&ddl, &quote(&table.target_table, &driver_kind))?;
-                target.execute(&renamed, 1).await?;
+                if source_kind == target_kind {
+                    let ddl = source.dump_table_ddl(&table.source_table).await?;
+                    let renamed =
+                        rename_ddl_object(&ddl, &quote(&table.target_table, &target_kind))?;
+                    target.execute(&renamed, 1).await?;
+                } else {
+                    let columns = source.list_columns(&table.source_table).await?;
+                    let ddl = cross_driver_create_table(
+                        &columns,
+                        &table.target_table,
+                        &target_kind,
+                    )?;
+                    target.execute(&ddl, 1).await?;
+                }
             }
 
             let target_columns = target
@@ -176,7 +304,7 @@ pub async fn transfer_table_data(
             if mode == "truncate" {
                 target
                     .execute(
-                        &format!("DELETE FROM {}", quote(&table.target_table, &driver_kind)),
+                        &format!("DELETE FROM {}", quote(&table.target_table, &target_kind)),
                         1,
                     )
                     .await?;
@@ -296,4 +424,42 @@ pub async fn cancel_data_transfer(
         flag.store(true, Ordering::Relaxed);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ColumnInfo;
+
+    fn column(name: &str, data_type: &str, primary_key: bool, auto: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable: !primary_key,
+            primary_key,
+            auto_increment: auto,
+            default_value: None,
+            comment: None,
+        }
+    }
+
+    #[test]
+    fn creates_cross_driver_tables_from_source_columns() {
+        let columns = vec![
+            column("id", "INTEGER", true, true),
+            column("name", "VARCHAR(80)", false, false),
+            column("payload", "BLOB", false, false),
+        ];
+        let postgres = cross_driver_create_table(&columns, "events", "postgres").unwrap();
+        assert!(postgres.contains("\"id\" BIGSERIAL"));
+        assert!(postgres.contains("\"name\" TEXT"));
+        assert!(postgres.contains("\"payload\" BYTEA"));
+        assert!(postgres.contains("PRIMARY KEY (\"id\")"));
+
+        let mysql = cross_driver_create_table(&columns, "events", "mysql").unwrap();
+        assert!(mysql.contains("`id` BIGINT PRIMARY KEY AUTO_INCREMENT"));
+
+        let sqlite = cross_driver_create_table(&columns, "events", "sqlite").unwrap();
+        assert!(sqlite.contains("\"id\" INTEGER PRIMARY KEY AUTOINCREMENT"));
+    }
 }

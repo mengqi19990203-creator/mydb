@@ -61,12 +61,19 @@ const {
   onError: (value) => {
     error.value = value;
   },
+  crossDriver: true,
 });
 
 const targetConnection = computed(
   () => props.connections.find((item) => item.id === targetId.value) ?? null,
 );
 const targetReadOnly = computed(() => Boolean(targetConnection.value?.readOnly));
+const crossDriver = computed(
+  () =>
+    Boolean(targetConnection.value) &&
+    targetConnection.value?.driver !==
+      props.connections.find((item) => item.id === sourceId.value)?.driver,
+);
 const sameTarget = computed(
   () =>
     sourceId.value === targetId.value &&
@@ -195,11 +202,14 @@ watch(
   () => props.open,
   (open) => {
     if (!open) return;
+    const sqlConnections = props.connections.filter((item) =>
+      ["sqlite", "mysql", "postgres"].includes(item.driver),
+    );
     sourceId.value =
-      props.connections.find(
-        (item) => item.id === props.currentConnectionId,
-      )?.id ??
-      props.connections.find((item) => item.driver !== "redis")?.id ??
+      (sqlConnections.some((item) => item.id === props.currentConnectionId)
+        ? props.currentConnectionId
+        : "") ||
+      sqlConnections[0]?.id ||
       "";
     targetId.value = "";
     sourceDatabase.value = "";
@@ -261,7 +271,7 @@ onBeforeUnmount(() => {
       <header class="modal-header">
         <div>
           <h2 id="transfer-title">数据传输</h2>
-          <p>同类型数据库之间按同名字段复制表数据</p>
+          <p>支持同类型或跨 SQL 驱动按同名字段复制表数据</p>
         </div>
         <button
           class="icon-button"
@@ -280,8 +290,8 @@ onBeforeUnmount(() => {
               源连接
               <select v-model="sourceId">
                 <option
-                  v-for="connection in connections.filter(
-                    (item) => item.driver !== 'redis',
+                  v-for="connection in connections.filter((item) =>
+                    ['sqlite', 'mysql', 'postgres'].includes(item.driver),
                   )"
                   :key="connection.id"
                   :value="connection.id"
@@ -353,7 +363,10 @@ onBeforeUnmount(() => {
           </div>
           <p v-if="scopeLoading" class="draft-hint">正在读取数据库 / 模式…</p>
           <p v-else-if="!targetOptions.length" class="draft-hint">
-            没有可用的同类型目标连接。
+            没有可用的 SQL 目标连接。
+          </p>
+          <p v-else-if="crossDriver" class="draft-hint">
+            跨驱动传输：按同名字段复制，目标缺表时使用目标驱动生成基础结构；复杂默认值 / 索引 / 外键不会自动迁移。
           </p>
           <p v-else-if="sameTarget" class="draft-hint">
             源和目标范围相同，不能传输到自身。

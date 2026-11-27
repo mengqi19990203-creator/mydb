@@ -54,6 +54,14 @@ function connectionTarget(connection: ConnectionConfig): string {
   if (connection.driver === "redis") {
     return `${connection.host}:${connection.port}`;
   }
+  if (connection.driver === "mongodb" && connection.mongoUriMode) {
+    const uri = connection.mongoUri ?? "";
+    const rest = uri.includes("://") ? uri.split("://")[1] ?? "" : uri;
+    const authority = rest.split(/[/?#]/)[0] ?? "";
+    return authority.includes("@")
+      ? authority.slice(authority.lastIndexOf("@") + 1)
+      : authority;
+  }
   const user = connection.username ? `${connection.username}@` : "";
   return `${user}${connection.host}:${connection.port}`;
 }

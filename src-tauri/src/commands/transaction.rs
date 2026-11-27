@@ -61,6 +61,7 @@ pub async fn execute_transaction_query(
     sql: String,
     max_rows: Option<usize>,
     operation_id: Option<String>,
+    history_sql: Option<String>,
 ) -> Result<QueryResult, String> {
     let entry = entry_for(&state, &session_id, &connection_id).await?;
     ensure_query_allowed(&app, &connection_id, &sql)?;
@@ -84,7 +85,13 @@ pub async fn execute_transaction_query(
         .await
     };
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    record_query_history_timed(&app, &connection_id, &sql, elapsed_ms, &outcome);
+    record_query_history_timed(
+        &app,
+        &connection_id,
+        history_sql.as_deref().unwrap_or(&sql),
+        elapsed_ms,
+        &outcome,
+    );
     outcome
 }
 

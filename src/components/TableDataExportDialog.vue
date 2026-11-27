@@ -310,8 +310,11 @@ onBeforeUnmount(() => {
         </button>
       </header>
 
+      <p class="hint">
+        显示格式不会写入导出文件；所有格式均使用原始值。
+      </p>
       <p v-if="hasPendingChanges" class="data-message warning import-message">
-        存在未提交修改；当前页 / 选中行导出会包含显示值，全部匹配只能导出数据库当前值。
+        存在未提交修改；当前页 / 选中行导出会包含待提交的原始值，全部匹配只能导出数据库当前值。
       </p>
       <p v-if="error" class="data-message error import-message">{{ error }}</p>
 

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import Icon from "./Icon.vue";
+import ServerGrantDialog from "./ServerGrantDialog.vue";
 import * as api from "../lib/api";
 import type { Driver, ServerUser, ServerUserDetail } from "../lib/types";
 
@@ -8,6 +9,7 @@ const props = defineProps<{
   connectionId: string;
   driver: Driver;
   active: boolean;
+  readOnly?: boolean;
 }>();
 
 const users = ref<ServerUser[]>([]);
@@ -18,6 +20,14 @@ const loading = ref(false);
 const detailLoading = ref(false);
 const error = ref("");
 const detailError = ref("");
+const currentDatabase = ref("");
+const currentSchema = ref("");
+const grantOpen = ref(false);
+const grantAction = ref<"grant" | "revoke">("grant");
+
+const selectedUser = computed(
+  () => users.value.find((user) => keyOf(user) === selectedKey.value) ?? null,
+);
 
 const filtered = computed(() => {
   const term = search.value.trim().toLowerCase();
@@ -47,8 +57,13 @@ async function refresh() {
   error.value = "";
   detailError.value = "";
   try {
-    const list = await api.serverUsers(props.connectionId);
+    const [list, context] = await Promise.all([
+      api.serverUsers(props.connectionId),
+      api.getConnectionContext(props.connectionId).catch(() => null),
+    ]);
     users.value = list;
+    currentDatabase.value = context?.database ?? "";
+    currentSchema.value = context?.schema ?? "";
     if (!list.length) {
       selectedKey.value = "";
       detail.value = null;
@@ -89,6 +104,22 @@ function select(user: ServerUser) {
   selectedKey.value = keyOf(user);
   void loadDetail(user);
 }
+
+function openGrant(action: "grant" | "revoke") {
+  grantAction.value = action;
+  grantOpen.value = true;
+}
+
+function afterGrant(message: string) {
+  error.value = "";
+  detailError.value = "";
+  void refresh().then(() => {
+    if (selectedUser.value) void loadDetail(selectedUser.value);
+  });
+  statusMessage.value = message;
+}
+
+const statusMessage = ref("");
 
 watch(
   () => [props.active, props.connectionId] as const,
@@ -192,6 +223,11 @@ defineExpose({ refresh });
             {{ detail.name }}
             <span v-if="detail.host" class="server-user-host">@{{ detail.host }}</span>
           </h3>
+          <div v-if="!readOnly && selectedUser" class="server-user-grant-actions">
+            <button class="button ghost compact" @click="openGrant('grant')">授权…</button>
+            <button class="button ghost compact danger-text" @click="openGrant('revoke')">回收权限…</button>
+          </div>
+          <p v-if="statusMessage" class="hint">{{ statusMessage }}</p>
           <p v-for="note in detail.notes" :key="note" class="hint">
             {{ note }}
           </p>
@@ -238,6 +274,19 @@ defineExpose({ refresh });
         <div v-else class="panel-empty compact">选择一个用户查看详情。</div>
       </aside>
     </div>
+
+    <ServerGrantDialog
+      :open="grantOpen"
+      :connection-id="connectionId"
+      :driver="driver"
+      :user="selectedUser"
+      :database="currentDatabase"
+      :schema="currentSchema"
+      :read-only="readOnly"
+      :initial-action="grantAction"
+      @close="grantOpen = false"
+      @done="afterGrant"
+    />
   </section>
 </template>
 

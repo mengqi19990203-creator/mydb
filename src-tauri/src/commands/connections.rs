@@ -20,11 +20,14 @@ pub async fn list_connections(
 ) -> Result<Vec<ConnectionConfig>, String> {
     let mut connections = storage::load_connections(&app)?;
     let passwords = state.passwords.lock().await;
+    let mongo_uri_secrets = state.mongo_uri_secrets.lock().await;
     let ssh_passwords = state.ssh_passwords.lock().await;
     let ssh_key_passphrases = state.ssh_key_passphrases.lock().await;
 
     for config in &mut connections {
         config.has_password = config.save_password || passwords.contains_key(&config.id);
+        config.has_mongo_uri_secret =
+            config.save_password || mongo_uri_secrets.contains_key(&config.id);
         config.has_ssh_password =
             config.save_ssh_password || ssh_passwords.contains_key(&config.id);
         config.has_ssh_key_passphrase =
@@ -40,9 +43,39 @@ pub async fn save_connection(
     state: State<'_, AppState>,
     mut config: ConnectionConfig,
     password: Option<String>,
+    mongo_uri_secret: Option<String>,
     ssh_password: Option<String>,
     ssh_key_passphrase: Option<String>,
 ) -> Result<ConnectionConfig, String> {
+    let mut uri_secret = mongo_uri_secret
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if uri_secret.as_deref().is_some_and(|value| value.contains("******")) {
+        return Err("连接串包含脱敏占位符，请重新输入完整连接串".to_string());
+    }
+    if config.driver == "mongodb" && config.mongo_uri_mode {
+        if uri_secret.is_none() {
+            let configured = config.mongo_uri.trim().to_string();
+            if configured.is_empty() && !config.id.trim().is_empty() {
+                uri_secret = password_for(&state, &config, "mongo-uri").await?;
+            } else if !configured.contains("******") && mongo_uri_has_secret(&configured) {
+                // A full URI imported from JSON keeps its password out of
+                // connections.json by moving it into the credential slot.
+                uri_secret = Some(configured);
+            }
+        }
+        if let Some(secret) = uri_secret.as_deref() {
+            config.mongo_uri = mask_mongo_uri(secret);
+            if config.database.trim().is_empty() {
+                config.database = mongo_database_from_uri(secret).unwrap_or_default();
+            }
+        }
+    }
+    if config.driver == "mongodb" && !config.mongo_uri.trim().is_empty() {
+        // Imported / legacy payloads and a mode switch back to host/port must
+        // never persist a plaintext password in connections.json.
+        config.mongo_uri = mask_mongo_uri(&config.mongo_uri);
+    }
     validate_config(&mut config)?;
 
     if config.id.trim().is_empty() {
@@ -65,6 +98,21 @@ pub async fn save_connection(
             .unwrap_or(false),
     )
     .await?;
+
+    if config.driver == "mongodb" && config.mongo_uri_mode {
+        apply_password(
+            &state,
+            &config.id,
+            "mongo-uri",
+            uri_secret.as_deref(),
+            config.save_password,
+            existing
+                .as_ref()
+                .map(|item| item.save_password)
+                .unwrap_or(false),
+        )
+        .await?;
+    }
 
     apply_password(
         &state,
@@ -102,6 +150,12 @@ pub async fn save_connection(
 
     config.has_password =
         config.save_password || state.passwords.lock().await.contains_key(&config.id);
+    config.has_mongo_uri_secret = config.save_password
+        || state
+            .mongo_uri_secrets
+            .lock()
+            .await
+            .contains_key(&config.id);
     config.has_ssh_password =
         config.save_ssh_password || state.ssh_passwords.lock().await.contains_key(&config.id);
     config.has_ssh_key_passphrase = config.save_ssh_key_passphrase
@@ -129,12 +183,15 @@ pub async fn clear_connection_secret(
     id: String,
     kind: String,
 ) -> Result<(), String> {
-    if !matches!(kind.as_str(), "db" | "ssh" | "ssh-key") {
+    if !matches!(kind.as_str(), "db" | "mongo-uri" | "ssh" | "ssh-key") {
         return Err("未知的凭据类型".to_string());
     }
     match kind.as_str() {
         "db" => {
             state.passwords.lock().await.remove(&id);
+        }
+        "mongo-uri" => {
+            state.mongo_uri_secrets.lock().await.remove(&id);
         }
         "ssh" => {
             state.ssh_passwords.lock().await.remove(&id);
@@ -165,10 +222,12 @@ pub async fn delete_connection(
     state.mongo_clients.lock().await.remove(&id);
     state.mongo_tunnels.lock().await.remove(&id);
     state.passwords.lock().await.remove(&id);
+    state.mongo_uri_secrets.lock().await.remove(&id);
     state.ssh_passwords.lock().await.remove(&id);
     state.ssh_key_passphrases.lock().await.remove(&id);
     close_connection_transactions(&state, &id).await;
     keychain::delete(&id, "db");
+    keychain::delete(&id, "mongo-uri");
     keychain::delete(&id, "ssh");
     keychain::delete(&id, "ssh-key");
 
@@ -248,6 +307,7 @@ pub async fn duplicate_connection(
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| format!("{} 副本", source.name));
     config.has_password = false;
+    config.has_mongo_uri_secret = false;
     config.has_ssh_password = false;
     config.has_ssh_key_passphrase = false;
     if connections.iter().any(|item| item.name == config.name) {
@@ -256,9 +316,18 @@ pub async fn duplicate_connection(
 
     if copy_secrets.unwrap_or(false) {
         copy_secret(&state, &source, &config.id, "db").await?;
+        if source.mongo_uri_mode {
+            copy_secret(&state, &source, &config.id, "mongo-uri").await?;
+        }
         copy_secret(&state, &source, &config.id, "ssh").await?;
         copy_secret(&state, &source, &config.id, "ssh-key").await?;
         let session_db = state.passwords.lock().await.get(&source.id).cloned();
+        let session_uri = state
+            .mongo_uri_secrets
+            .lock()
+            .await
+            .get(&source.id)
+            .cloned();
         let session_ssh = state.ssh_passwords.lock().await.get(&source.id).cloned();
         let session_key = state
             .ssh_key_passphrases
@@ -272,6 +341,13 @@ pub async fn duplicate_connection(
                 .lock()
                 .await
                 .insert(config.id.clone(), password);
+        }
+        if let Some(secret) = session_uri {
+            state
+                .mongo_uri_secrets
+                .lock()
+                .await
+                .insert(config.id.clone(), secret);
         }
         if let Some(password) = session_ssh {
             state
@@ -287,8 +363,18 @@ pub async fn duplicate_connection(
                 .await
                 .insert(config.id.clone(), passphrase);
         }
-        config.save_password =
-            source.save_password && keychain::load(&source.id, "db").ok().flatten().is_some();
+        config.save_password = source.save_password
+            && if source.mongo_uri_mode {
+                keychain::load(&source.id, "mongo-uri")
+                    .ok()
+                    .flatten()
+                    .is_some()
+            } else {
+                keychain::load(&source.id, "db").ok().flatten().is_some()
+            };
+        config.has_mongo_uri_secret = source.mongo_uri_mode
+            && source.save_password
+            && keychain::load(&source.id, "mongo-uri").ok().flatten().is_some();
         config.save_ssh_password =
             source.save_ssh_password && keychain::load(&source.id, "ssh").ok().flatten().is_some();
         config.save_ssh_key_passphrase = source.save_ssh_key_passphrase
@@ -317,6 +403,12 @@ async fn copy_secret(
     let saved = keychain::load(&source.id, kind).ok().flatten();
     let session = match kind {
         "db" => state.passwords.lock().await.get(&source.id).cloned(),
+        "mongo-uri" => state
+            .mongo_uri_secrets
+            .lock()
+            .await
+            .get(&source.id)
+            .cloned(),
         "ssh" => state.ssh_passwords.lock().await.get(&source.id).cloned(),
         "ssh-key" => state
             .ssh_key_passphrases
@@ -331,6 +423,13 @@ async fn copy_secret(
             "db" => {
                 state
                     .passwords
+                    .lock()
+                    .await
+                    .insert(target_id.to_string(), password.clone());
+            }
+            "mongo-uri" => {
+                state
+                    .mongo_uri_secrets
                     .lock()
                     .await
                     .insert(target_id.to_string(), password.clone());
@@ -387,7 +486,17 @@ pub async fn connection_info(
         .ok_or_else(|| format!("连接不存在: {id}"))?;
 
     let with_password = matches!(format, ConnectionInfoFormat::UrlWithPassword);
-    let password = if with_password {
+    let mongo_uri_mode = config.driver == "mongodb" && config.mongo_uri_mode;
+    let mongo_uri_secret = if with_password && mongo_uri_mode {
+        Some(
+            super::password_for(&state, &config, "mongo-uri")
+                .await?
+                .ok_or_else(|| "未保存连接串密码，请先编辑连接并输入".to_string())?,
+        )
+    } else {
+        None
+    };
+    let password = if with_password && !mongo_uri_mode {
         Some(
             super::password_for(&state, &config, "db")
                 .await?
@@ -396,6 +505,25 @@ pub async fn connection_info(
     } else {
         None
     };
+
+    if mongo_uri_mode {
+        let masked = mask_mongo_uri(&config.mongo_uri);
+        let full = mongo_uri_secret.unwrap_or_else(|| masked.clone());
+        let mut text = match format {
+            ConnectionInfoFormat::HostPort => mongo_uri_authority(&masked),
+            ConnectionInfoFormat::Url => masked,
+            ConnectionInfoFormat::UrlWithPassword => full,
+            ConnectionInfoFormat::Cli => format!("mongosh \"{full}\""),
+            ConnectionInfoFormat::Jdbc => {
+                return Err("MongoDB 不支持 JDBC 连接串".to_string());
+            }
+            ConnectionInfoFormat::Dsn => {
+                return Err("MongoDB 不支持 DSN 连接串".to_string());
+            }
+        };
+        text.push_str("\n# TLS / SRV 由连接串控制");
+        return Ok(text);
+    }
 
     let user = encode_component(&config.username);
     let host = config.host.clone();
@@ -526,6 +654,136 @@ pub async fn connection_info(
         ));
     }
     Ok(text)
+}
+
+pub(crate) fn mask_mongo_uri(uri: &str) -> String {
+    let trimmed = uri.trim();
+    let Some(scheme_end) = trimmed.find("://") else {
+        return "******".to_string();
+    };
+    let scheme = &trimmed[..scheme_end];
+    let rest = &trimmed[scheme_end + 3..];
+    let authority_end = rest
+        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let tail = &rest[authority_end..];
+
+    let masked_authority = match authority.rfind('@') {
+        Some(at) => {
+            let userinfo = &authority[..at];
+            let host = &authority[at + 1..];
+            if let Some(colon) = userinfo.find(':') {
+                format!("{}:******@{}", &userinfo[..colon], host)
+            } else {
+                authority.to_string()
+            }
+        }
+        None => authority.to_string(),
+    };
+
+    let mut result = format!("{scheme}://{masked_authority}");
+    if let Some(question) = tail.find('?') {
+        result.push_str(&tail[..question]);
+        result.push('?');
+        let query_and_fragment = &tail[question + 1..];
+        let (query, fragment) = match query_and_fragment.find('#') {
+            Some(index) => (&query_and_fragment[..index], Some(&query_and_fragment[index..])),
+            None => (query_and_fragment, None),
+        };
+        let masked_query = query
+            .split('&')
+            .map(|pair| {
+                let key = pair.split('=').next().unwrap_or(pair);
+                let lower = key.to_ascii_lowercase();
+                let sensitive = ["password", "secret", "token", "key"]
+                    .iter()
+                    .any(|needle| lower.contains(needle));
+                if sensitive {
+                    if pair.contains('=') {
+                        format!("{}=******", key)
+                    } else {
+                        "******".to_string()
+                    }
+                } else {
+                    pair.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        result.push_str(&masked_query);
+        if let Some(fragment) = fragment {
+            result.push_str(fragment);
+        }
+    } else {
+        result.push_str(tail);
+    }
+    result
+}
+
+/// Authority (userinfo removed) for compact connection-list labels.
+pub(crate) fn mongo_uri_authority(uri: &str) -> String {
+    let trimmed = uri.trim();
+    let rest = match trimmed.find("://") {
+        Some(index) => &trimmed[index + 3..],
+        None => trimmed,
+    };
+    let authority_end = rest
+        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    match authority.rfind('@') {
+        Some(at) => authority[at + 1..].to_string(),
+        None => authority.to_string(),
+    }
+}
+
+/// Initial database from a MongoDB URI path, if present.
+pub(crate) fn mongo_database_from_uri(uri: &str) -> Option<String> {
+    let trimmed = uri.trim();
+    let rest = trimmed.split_once("://")?.1;
+    let authority_end = rest
+        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let path = &rest[authority_end..];
+    let path = path.strip_prefix('/')?;
+    let segment = path.split(['/', '?', '#']).next()?;
+    if segment.is_empty() {
+        return None;
+    }
+    Some(
+        percent_encoding::percent_decode_str(segment)
+            .decode_utf8_lossy()
+            .to_string(),
+    )
+}
+
+fn mongo_uri_has_secret(uri: &str) -> bool {
+    let trimmed = uri.trim();
+    let rest = match trimmed.find("://") {
+        Some(index) => &trimmed[index + 3..],
+        None => return false,
+    };
+    let authority_end = rest
+        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if let Some(at) = authority.rfind('@') {
+        if authority[..at].contains(':') {
+            return true;
+        }
+    }
+    let query = rest[authority_end..]
+        .split_once('?')
+        .map(|(_, tail)| tail.split('#').next().unwrap_or(tail))
+        .unwrap_or("");
+    query.split('&').any(|pair| {
+        let key = pair.split('=').next().unwrap_or(pair).to_ascii_lowercase();
+        pair.contains('=')
+            && ["password", "secret", "token", "key"]
+                .iter()
+                .any(|needle| key.contains(needle))
+    })
 }
 
 fn encode_component(value: &str) -> String {
@@ -747,9 +1005,25 @@ pub async fn test_connection(
     state: State<'_, AppState>,
     mut config: ConnectionConfig,
     password: Option<String>,
+    mongo_uri_secret: Option<String>,
     ssh_password: Option<String>,
     ssh_key_passphrase: Option<String>,
 ) -> Result<(), String> {
+    let mongo_uri_secret = if config.driver == "mongodb" && config.mongo_uri_mode {
+        let secret = match mongo_uri_secret {
+            Some(value) if !value.trim().is_empty() => Some(value),
+            _ => password_for(&state, &config, "mongo-uri").await?,
+        };
+        if let Some(secret) = secret.as_deref() {
+            config.mongo_uri = mask_mongo_uri(secret);
+            if config.database.trim().is_empty() {
+                config.database = mongo_database_from_uri(secret).unwrap_or_default();
+            }
+        }
+        secret
+    } else {
+        None
+    };
     validate_config(&mut config)?;
 
     if config.driver == "sqlite" {
@@ -758,6 +1032,17 @@ pub async fn test_connection(
         }
         let driver = SqliteDriver::connect(&config.file).await?;
         return driver.test_connection().await;
+    }
+
+    if config.driver == "mongodb" && config.mongo_uri_mode {
+        return super::mongo::test_mongo_connection(
+            &config,
+            &config.host.clone(),
+            config.port,
+            None,
+            mongo_uri_secret.as_deref(),
+        )
+        .await;
     }
 
     if config.driver == "redis" {
@@ -781,8 +1066,14 @@ pub async fn test_connection(
         connection_target(&state, &config, ssh_password, ssh_key_passphrase).await?;
 
     if config.driver == "mongodb" {
-        let result =
-            super::mongo::test_mongo_connection(&config, &host, port, password.as_deref()).await;
+        let result = super::mongo::test_mongo_connection(
+            &config,
+            &host,
+            port,
+            password.as_deref(),
+            None,
+        )
+        .await;
         drop(tunnel);
         return result;
     }
@@ -987,6 +1278,7 @@ fn validate_config(config: &mut ConnectionConfig) -> Result<(), String> {
     config.username = config.username.trim().to_string();
     config.database = config.database.trim().to_string();
     config.mongo_auth_source = config.mongo_auth_source.trim().to_string();
+    config.mongo_uri = config.mongo_uri.trim().to_string();
     config.ssh_host = config.ssh_host.trim().to_string();
     config.ssh_username = config.ssh_username.trim().to_string();
     config.ssh_key_path = config.ssh_key_path.trim().to_string();
@@ -1076,17 +1368,44 @@ fn validate_config(config: &mut ConnectionConfig) -> Result<(), String> {
             }
         }
         "mongodb" => {
-            if config.host.is_empty() {
-                return Err("主机不能为空".to_string());
-            }
-            if config.port == 0 {
-                config.port = 27017;
-            }
-            if config.ssl_mode.is_empty() {
-                config.ssl_mode = "disabled".to_string();
-            }
-            if config.mongo_auth_source.is_empty() {
-                config.mongo_auth_source = "admin".to_string();
+            if config.mongo_uri_mode {
+                if config.mongo_uri.is_empty() {
+                    return Err("连接串不能为空".to_string());
+                }
+                if config.mongo_uri.chars().count() > 2048 {
+                    return Err("连接串不能超过 2048 个字符，请拆分参数或改用主机 / 端口模式".to_string());
+                }
+                let lower = config.mongo_uri.to_ascii_lowercase();
+                if !lower.starts_with("mongodb://") && !lower.starts_with("mongodb+srv://") {
+                    return Err("连接串只支持 mongodb:// 或 mongodb+srv://，例如 mongodb://user:password@127.0.0.1:27017/mydb?authSource=admin".to_string());
+                }
+                if config.ssh_enabled {
+                    return Err("URI / SRV 连接不支持 SSH 隧道，请改用主机 / 端口模式".to_string());
+                }
+                if lower.starts_with("mongodb+srv://")
+                    && lower.replace(' ', "").contains("directconnection=true")
+                {
+                    return Err("mongodb+srv 与 directConnection=true 不兼容，请移除该参数".to_string());
+                }
+                if config.port == 0 {
+                    config.port = 27017;
+                }
+                if config.ssl_mode.is_empty() {
+                    config.ssl_mode = "disabled".to_string();
+                }
+            } else {
+                if config.host.is_empty() {
+                    return Err("主机不能为空".to_string());
+                }
+                if config.port == 0 {
+                    config.port = 27017;
+                }
+                if config.ssl_mode.is_empty() {
+                    config.ssl_mode = "disabled".to_string();
+                }
+                if config.mongo_auth_source.is_empty() {
+                    config.mongo_auth_source = "admin".to_string();
+                }
             }
         }
         "redis" => {
@@ -1169,6 +1488,12 @@ pub(crate) async fn password_for(
 ) -> Result<Option<String>, String> {
     let session_password = match kind {
         "db" => state.passwords.lock().await.get(&config.id).cloned(),
+        "mongo-uri" => state
+            .mongo_uri_secrets
+            .lock()
+            .await
+            .get(&config.id)
+            .cloned(),
         "ssh" => state.ssh_passwords.lock().await.get(&config.id).cloned(),
         "ssh-key" => state
             .ssh_key_passphrases
@@ -1183,7 +1508,7 @@ pub(crate) async fn password_for(
     }
 
     let save_flag = match kind {
-        "db" => config.save_password,
+        "db" | "mongo-uri" => config.save_password,
         "ssh" => config.save_ssh_password,
         "ssh-key" => config.save_ssh_key_passphrase,
         _ => false,
@@ -1209,6 +1534,13 @@ async fn apply_password(
                 "db" => {
                     state
                         .passwords
+                        .lock()
+                        .await
+                        .insert(connection_id.to_string(), value.to_string());
+                }
+                "mongo-uri" => {
+                    state
+                        .mongo_uri_secrets
                         .lock()
                         .await
                         .insert(connection_id.to_string(), value.to_string());
@@ -1247,4 +1579,80 @@ async fn apply_password(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod uri_tests {
+    use super::*;
+
+    fn uri_config(uri: &str) -> ConnectionConfig {
+        let mut config = ConnectionConfig::default();
+        config.driver = "mongodb".to_string();
+        config.name = "test".to_string();
+        config.mongo_uri_mode = true;
+        config.mongo_uri = uri.to_string();
+        config
+    }
+
+    #[test]
+    fn masks_uri_password_and_sensitive_query_values() {
+        let masked = mask_mongo_uri(
+            "mongodb://user:p%40ss@host1:27017,host2:27017/app?authSource=admin&token=abc&replicaSet=rs0",
+        );
+        assert_eq!(
+            masked,
+            "mongodb://user:******@host1:27017,host2:27017/app?authSource=admin&token=******&replicaSet=rs0"
+        );
+        assert!(!masked.contains("p%40ss"));
+        assert!(!masked.contains("abc"));
+    }
+
+    #[test]
+    fn extracts_authority_and_initial_database() {
+        let uri = "mongodb+srv://user:secret@cluster0.example.net/my%20db?retryWrites=true";
+        assert_eq!(mongo_uri_authority(uri), "cluster0.example.net");
+        assert_eq!(mongo_database_from_uri(uri).as_deref(), Some("my db"));
+        assert_eq!(mongo_uri_authority("mongodb://u:p@h1:1,h2:2/db"), "h1:1,h2:2");
+        assert_eq!(mongo_database_from_uri("mongodb://u:p@h1:1,h2:2"), None);
+    }
+
+    #[test]
+    fn detects_userinfo_and_query_secrets() {
+        assert!(mongo_uri_has_secret("mongodb://u:p@host/db"));
+        assert!(mongo_uri_has_secret("mongodb://host/db?authSource=admin&token=abc"));
+        assert!(!mongo_uri_has_secret("mongodb://host/db?authSource=admin"));
+        assert!(!mongo_uri_has_secret("mongodb://host/db?tls=true"));
+    }
+
+    #[test]
+    fn accepts_mongodb_and_srv_schemes() {
+        let mut direct = uri_config("mongodb://u:p@h1:27017,h2:27017/db?replicaSet=rs0");
+        assert!(validate_config(&mut direct).is_ok());
+        let mut srv = uri_config("mongodb+srv://u:p@cluster.example.net/db");
+        assert!(validate_config(&mut srv).is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_scheme_ssh_and_srv_direct_connection() {
+        let mut http = uri_config("http://host/db");
+        assert!(validate_config(&mut http).is_err());
+
+        let mut ssh = uri_config("mongodb://u:p@host/db");
+        ssh.ssh_enabled = true;
+        ssh.ssh_host = "bastion".to_string();
+        ssh.ssh_username = "root".to_string();
+        assert!(validate_config(&mut ssh).is_err());
+
+        let mut srv_direct =
+            uri_config("mongodb+srv://u:p@cluster.example.net/db?directConnection=true");
+        assert!(validate_config(&mut srv_direct).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_and_overlong_uris() {
+        let mut empty = uri_config("");
+        assert!(validate_config(&mut empty).is_err());
+        let mut long = uri_config(&format!("mongodb://host/{}", "x".repeat(2048)));
+        assert!(validate_config(&mut long).is_err());
+    }
 }

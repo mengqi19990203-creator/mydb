@@ -43,6 +43,12 @@ pub struct ConnectionConfig {
     /// MongoDB authentication database (authSource). Empty uses `admin`.
     #[serde(default)]
     pub mongo_auth_source: String,
+    /// MongoDB connection-string mode; the full URI lives in the keychain.
+    #[serde(default)]
+    pub mongo_uri_mode: bool,
+    /// Masked MongoDB URI for display. Never contains a password.
+    #[serde(default)]
+    pub mongo_uri: String,
     pub ssl_mode: String,
     #[serde(default)]
     pub ssl_ca_path: String,
@@ -69,6 +75,8 @@ pub struct ConnectionConfig {
     // Derived, never persisted
     #[serde(skip)]
     pub has_password: bool,
+    #[serde(skip)]
+    pub has_mongo_uri_secret: bool,
     #[serde(skip)]
     pub has_ssh_password: bool,
     #[serde(skip)]
@@ -98,6 +106,8 @@ impl Default for ConnectionConfig {
             username: String::new(),
             database: String::new(),
             mongo_auth_source: String::new(),
+            mongo_uri_mode: false,
+            mongo_uri: String::new(),
             ssl_mode: default_ssl_mode(),
             ssl_ca_path: String::new(),
             ssl_client_cert_path: String::new(),
@@ -113,6 +123,7 @@ impl Default for ConnectionConfig {
             save_ssh_key_passphrase: false,
             read_only: false,
             has_password: false,
+            has_mongo_uri_secret: false,
             has_ssh_password: false,
             has_ssh_key_passphrase: false,
         }
@@ -154,12 +165,114 @@ pub struct MongoDocumentPage {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MongoConsoleOutcome {
+    pub index: usize,
+    pub statement: String,
+    /// "documents" | "document" | "scalar" | "values" | "write" | "empty"
+    pub kind: String,
+    pub database: String,
+    pub collection: Option<String>,
+    pub documents: Vec<Value>,
+    pub values: Vec<Value>,
+    pub elapsed_ms: u64,
+    pub truncated: bool,
+    pub error: Option<String>,
+    pub message: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoConsoleConfirmation {
+    pub index: usize,
+    pub database: String,
+    pub collection: String,
+    pub method: String,
+    pub reason: String,
+    pub estimated_count: Option<u64>,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoConsoleResponse {
+    pub outcomes: Vec<MongoConsoleOutcome>,
+    pub confirmations: Vec<MongoConsoleConfirmation>,
+    pub database: String,
+    /// True when a write may have created / changed a collection.
+    pub refresh_collections: bool,
+    pub error: Option<String>,
+    pub error_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MongoIndexInfo {
     pub name: String,
     pub keys: Value,
     pub unique: bool,
     pub sparse: bool,
     pub expire_after_seconds: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoUserInfo {
+    pub username: String,
+    pub database: String,
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoRoleInfo {
+    pub name: String,
+    pub database: String,
+    pub builtin: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoGridFsFile {
+    pub id: Value,
+    pub filename: String,
+    pub length: u64,
+    pub chunk_size: u32,
+    pub upload_date: String,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoIndexSize {
+    pub name: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoTimeseriesInfo {
+    pub time_field: Option<String>,
+    pub meta_field: Option<String>,
+    pub granularity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoCollectionStats {
+    pub namespace: String,
+    pub kind: String,
+    pub capped: bool,
+    pub count: Option<u64>,
+    pub size: Option<u64>,
+    pub storage_size: Option<u64>,
+    pub avg_obj_size: Option<f64>,
+    pub nindexes: Option<u32>,
+    pub total_index_size: Option<u64>,
+    pub index_sizes: Vec<MongoIndexSize>,
+    pub timeseries: Option<MongoTimeseriesInfo>,
+    pub validator: Option<Value>,
+    pub read_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

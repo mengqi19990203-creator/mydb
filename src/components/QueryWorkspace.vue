@@ -22,12 +22,15 @@ import SqlEditor from "./SqlEditor.vue";
 import Icon from "./Icon.vue";
 import { writeClipboard } from "../lib/clipboard";
 import { checkSql } from "../lib/sql-check";
+import { extractSqlParameters } from "../lib/sql-parameters";
+import { hasSqlContent, splitSqlStatements } from "../lib/sql-statements";
 import {
   MAX_PINNED_RESULTS,
   type PinnedQueryResult,
 } from "../lib/pinned-results";
 import type { CompareSource } from "../lib/result-compare";
 import type { SqlNavigationPayload } from "../lib/sql-navigation";
+import type { ColumnFormatEntry } from "../lib/column-format";
 import type { ResultExportSnapshot } from "../lib/result-export";
 import type { ChartData } from "../lib/result-chart";
 import type {
@@ -70,6 +73,9 @@ const props = defineProps<{
   showExplain: boolean;
   pinnedResults: PinnedQueryResult[];
   activePinId: string | null;
+  parameterCount?: number;
+  scriptContinueOnError?: boolean;
+  scriptWrapInTransaction?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -82,6 +88,11 @@ const emit = defineEmits<{
   explain: [];
   "open-snippets": [];
   "open-format-settings": [];
+  "open-parameters": [];
+  "open-datasets": [];
+  "open-ai": [];
+  "update:script-continue-on-error": [value: boolean];
+  "update:script-wrap-in-transaction": [value: boolean];
   "begin-transaction": [];
   "commit-transaction": [];
   "rollback-transaction": [];
@@ -98,6 +109,14 @@ const emit = defineEmits<{
 
 const liveResultGrid = ref<InstanceType<typeof ResultGrid> | null>(null);
 const pinnedResultGrid = ref<InstanceType<typeof ResultGrid> | null>(null);
+const columnFormats = ref<ColumnFormatEntry[]>([]);
+
+watch(
+  () => [props.tabId, props.result],
+  () => {
+    columnFormats.value = [];
+  },
+);
 const sqlEditor = ref<InstanceType<typeof SqlEditor> | null>(null);
 const liveHidden = ref(0);
 const pinnedHidden = ref(0);
@@ -114,6 +133,14 @@ const pinnedFilter = reactive({
 const activePin = computed(
   () =>
     props.pinnedResults.find((pin) => pin.id === props.activePinId) ?? null,
+);
+const sqlParameterCount = computed(
+  () => extractSqlParameters(props.sql, props.driver).definitions.length,
+);
+const scriptStatementCount = computed(
+  () =>
+    splitSqlStatements(props.sql).filter((range) => hasSqlContent(range.text))
+      .length,
 );
 const activePinResult = computed<QueryResult | null>(
   () => activePin.value?.result ?? null,
@@ -710,6 +737,13 @@ async function copyError(error: string) {
               <Icon name="chevron-down" :size="12" />
             </button>
             <span
+              v-if="scriptStatementCount > 1"
+              class="run-script-badge"
+              title="整段 SQL 包含多条语句"
+            >
+              脚本模式（{{ scriptStatementCount }} 条）
+            </span>
+            <span
               v-if="showScopeBadge"
               class="run-scope-badge"
               aria-live="polite"
@@ -717,6 +751,15 @@ async function copyError(error: string) {
             >
               第 {{ scopeIndex }} / {{ scopeTotal }} 条
             </span>
+            <button
+              v-if="sqlParameterCount"
+              class="button ghost compact sql-parameter-badge"
+              :title="`检测到 ${sqlParameterCount} 个 SQL 参数，点击重新填写`"
+              aria-label="编辑 SQL 参数"
+              @click="emit('open-parameters')"
+            >
+              参数：{{ sqlParameterCount }}
+            </button>
             <div v-if="runMenuOpen" class="context-menu run-scope-menu">
               <button
                 class="context-menu-item"
@@ -739,6 +782,36 @@ async function copyError(error: string) {
                   <Icon v-if="runMode === 'tab'" name="check" :size="13" />
                 </span>
                 <span>运行整个标签</span>
+              </button>
+              <div class="context-separator"></div>
+              <button
+                class="context-menu-item"
+                @click="
+                  emit(
+                    'update:script-continue-on-error',
+                    !scriptContinueOnError,
+                  )
+                "
+              >
+                <span class="layout-check-slot">
+                  <Icon v-if="scriptContinueOnError" name="check" :size="13" />
+                </span>
+                <span>多语句出错继续</span>
+              </button>
+              <button
+                class="context-menu-item"
+                title="所有语句在同一事务中执行；失败整体回滚（MySQL DDL 可能隐式提交）"
+                @click="
+                  emit(
+                    'update:script-wrap-in-transaction',
+                    !scriptWrapInTransaction,
+                  )
+                "
+              >
+                <span class="layout-check-slot">
+                  <Icon v-if="scriptWrapInTransaction" name="check" :size="13" />
+                </span>
+                <span>脚本事务包裹</span>
               </button>
             </div>
           </div>
@@ -909,6 +982,9 @@ async function copyError(error: string) {
     <div class="result-panel">
       <div class="panel-header">
         <span>结果</span>
+        <span v-if="parameterCount" class="result-parameter-badge">
+          已应用 {{ parameterCount }} 个参数
+        </span>
         <div class="result-hints">
           <div
             v-if="activeResult || explainResult || explainLoading || explainError"
@@ -1011,6 +1087,22 @@ async function copyError(error: string) {
             @click="activeGrid?.showAllColumns()"
           >
             已隐藏 {{ hiddenColumns }} 列 · 显示全部
+          </button>
+          <button
+            class="button ghost compact"
+            title="AI SQL 助手（需要先在设置中配置模型）"
+            @click="emit('open-ai')"
+          >
+            <Icon name="bolt" :size="13" />
+            AI
+          </button>
+          <button
+            class="button ghost compact"
+            title="数据集与 HTML 报表"
+            @click="emit('open-datasets')"
+          >
+            <Icon name="list" :size="13" />
+            数据集
           </button>
           <button
             v-if="!showExplain && !chartMode && !transposeMode && !profileMode"
@@ -1150,6 +1242,7 @@ async function copyError(error: string) {
           v-if="transposeMode && !chartMode"
           :data="chartDataView"
           :title="activePin ? `${tabTitle} · ${activePin.name}` : tabTitle"
+          :formats="columnFormats"
         />
         <ResultChart
           v-show="chartMode"
@@ -1165,6 +1258,8 @@ async function copyError(error: string) {
           v-show="!chartMode && !transposeMode && !profileMode && !activePin"
           :result="result"
           :running="running"
+          :formats="columnFormats"
+          @update:formats="columnFormats = $event"
           @hidden-change="liveHidden = $event"
           @export-request="handleExportRequest"
           @filter-change="
@@ -1181,6 +1276,8 @@ async function copyError(error: string) {
           v-show="!chartMode && !transposeMode && !profileMode"
           :result="activePin.result"
           :running="false"
+          :formats="columnFormats"
+          @update:formats="columnFormats = $event"
           @hidden-change="pinnedHidden = $event"
           @export-request="handleExportRequest"
           @filter-change="

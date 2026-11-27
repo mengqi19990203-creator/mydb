@@ -55,7 +55,7 @@ function isNumericOperator(operator: string): boolean {
     <div class="result-filter-head">
       <span class="result-filter-title">
         <Icon name="filter" :size="13" />
-        只筛选当前已加载结果
+        只筛选当前已加载结果 · 基于原始值，不受显示格式影响
         <template v-if="truncated">（结果已截断）</template>
       </span>
       <span class="result-filter-count" aria-live="polite">

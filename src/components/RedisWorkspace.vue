@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import AiSqlDialog from "./AiSqlDialog.vue";
 import ConfirmDialog from "./ConfirmDialog.vue";
 import Icon from "./Icon.vue";
 import * as api from "../lib/api";
@@ -19,6 +20,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   "database-change": [database: string];
+  "open-settings": [];
 }>();
 
 function normalizeDatabase(value: string | null | undefined): number {
@@ -74,6 +76,8 @@ const output = ref("");
 const commandError = ref("");
 const commandRunning = ref(false);
 const commandElapsed = ref(0);
+const aiOpen = ref(false);
+const aiCommand = ref("");
 const toast = ref("");
 const ttlInput = ref("60");
 const renameInput = ref("");
@@ -94,6 +98,29 @@ const zsetNewMember = ref("");
 const zsetNewScore = ref(0);
 let detailRequest = 0;
 let toastTimer = 0;
+
+const redisAiContext = computed(() =>
+  [
+    `Redis 数据库：${databaseLabel.value}`,
+    `当前 key 模式：${pattern.value}`,
+    selectedKey.value ? `当前选中 key：${selectedKey.value}` : "",
+    detail.value?.keyType ? `当前 key 类型：${detail.value.keyType}` : "",
+    "不要发送 key 对应的值内容；只根据 key 名、类型和结构生成命令。",
+  ]
+    .filter(Boolean)
+    .join("\n"),
+);
+
+function openRedisAi() {
+  aiCommand.value = command.value;
+  aiOpen.value = true;
+}
+
+function applyRedisAi(text: string) {
+  command.value = text.trim();
+  aiOpen.value = false;
+  flashToast("AI 命令已填入，请确认后手动执行");
+}
 
 function flashToast(message: string) {
   toast.value = message;
@@ -815,6 +842,14 @@ onBeforeUnmount(() => {
           <Icon name="refresh" :size="14" />
           {{ scanning ? "扫描中…" : "扫描" }}
         </button>
+        <button
+          class="button ghost compact"
+          title="AI 助手（基于当前 key / 类型，不发送值）"
+          @click="openRedisAi"
+        >
+          <Icon name="bolt" :size="13" />
+          AI
+        </button>
       </div>
 
       <p v-if="scanError" class="redis-error">{{ scanError }}</p>
@@ -1096,6 +1131,14 @@ onBeforeUnmount(() => {
           <span v-if="commandElapsed" class="hint">{{ commandElapsed }} ms</span>
           <div class="spacer"></div>
           <button
+            class="button ghost compact"
+            title="AI 助手（基于当前 key / 类型，不发送值）"
+            @click="openRedisAi"
+          >
+            <Icon name="bolt" :size="13" />
+            AI
+          </button>
+          <button
             v-if="output"
             class="button ghost compact"
             @click="copyText(output, '已复制输出')"
@@ -1173,5 +1216,20 @@ onBeforeUnmount(() => {
     <div v-if="toast" class="grid-toast" role="status" aria-live="polite">
       {{ toast }}
     </div>
+    <AiSqlDialog
+      :open="aiOpen"
+      :sql="aiCommand"
+      selected-sql=""
+      driver="redis"
+      :database="databaseLabel"
+      :schema="null"
+      :schema-context="redisAiContext"
+      language="redis"
+      :error="commandError"
+      @close="aiOpen = false"
+      @insert="applyRedisAi"
+      @replace="applyRedisAi"
+      @open-settings="emit('open-settings')"
+    />
   </section>
 </template>

@@ -32,6 +32,8 @@ interface ImportedConnection {
   username: string;
   database: string;
   mongoAuthSource?: string;
+  mongoUriMode: boolean;
+  mongoUri: string;
   sslMode: SslMode;
   sshEnabled: boolean;
   sshHost: string;
@@ -109,6 +111,8 @@ function exportPayload() {
       username: connection.username,
       database: connection.database,
       mongoAuthSource: connection.mongoAuthSource ?? "",
+      mongoUriMode: connection.mongoUriMode ?? false,
+      mongoUri: connection.mongoUri ?? "",
       sslMode: connection.sslMode,
       sshEnabled: connection.sshEnabled,
       sshHost: connection.sshHost,
@@ -169,6 +173,8 @@ function emptyConnection(
     username: driver === "postgres" ? "postgres" : "root",
     database: driver === "postgres" ? "postgres" : driver === "mysql" ? "mysql" : driver === "mongodb" ? "admin" : "",
     mongoAuthSource: driver === "mongodb" ? "admin" : "",
+    mongoUriMode: false,
+    mongoUri: "",
     sslMode: "disabled",
     sshEnabled: false,
     sshHost: "",
@@ -186,7 +192,7 @@ function parseMydb(raw: Record<string, unknown>): ImportedConnection[] {
     if (!item || typeof item !== "object") return [];
     const record = item as Record<string, unknown>;
     const driver = String(record.driver ?? "");
-    if (!["mysql", "postgres", "sqlite", "redis"].includes(driver)) return [];
+    if (!["mysql", "postgres", "sqlite", "redis", "mongodb"].includes(driver)) return [];
     const base = emptyConnection(
       String(record.name ?? "导入连接"),
       driver as Driver,
@@ -201,6 +207,9 @@ function parseMydb(raw: Record<string, unknown>): ImportedConnection[] {
         port: Number(record.port ?? base.port) || base.port,
         username: String(record.username ?? base.username),
         database: String(record.database ?? base.database),
+        mongoAuthSource: String(record.mongoAuthSource ?? base.mongoAuthSource ?? ""),
+        mongoUriMode: record.mongoUriMode === true,
+        mongoUri: String(record.mongoUri ?? ""),
         sslMode: (String(record.sslMode ?? "disabled") as SslMode) ?? "disabled",
         sshEnabled: Boolean(record.sshEnabled),
         sshHost: String(record.sshHost ?? ""),
@@ -385,13 +394,19 @@ async function importConnections() {
         sslClientCertPath: "",
         sslClientKeyPath: "",
         hasPassword: false,
+        hasMongoUriSecret: false,
         hasSshPassword: false,
         hasSshKeyPassphrase: false,
       };
       await api.saveConnection(config);
       count += 1;
     }
-    message.value = `已导入 ${count} 个连接；密码未导入，请手动补充`;
+    const needsUriSecret = imported.value.some(
+      (item) => item.mongoUriMode && item.mongoUri,
+    );
+    message.value = needsUriSecret
+      ? `已导入 ${count} 个连接；连接串已脱敏，请编辑连接并重新输入密码`
+      : `已导入 ${count} 个连接；密码未导入，请手动补充`;
     imported.value = [];
     selectedImport.value = new Set();
     importOpen.value = false;

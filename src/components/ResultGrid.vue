@@ -9,12 +9,28 @@ import {
   watch,
 } from "vue";
 import CellValueDialog from "./CellValueDialog.vue";
+import ColumnFormatDialog from "./ColumnFormatDialog.vue";
+import ColumnVisibilityPanel from "./ColumnVisibilityPanel.vue";
 import GridFindBar from "./GridFindBar.vue";
 import Icon from "./Icon.vue";
 import ResultFilterBar from "./ResultFilterBar.vue";
 import RowDetailPanel from "./RowDetailPanel.vue";
 import { writeClipboard as copyToClipboard } from "../lib/clipboard";
+import {
+  formatColumnKeys,
+  formatDisplayValue,
+  formatRuleSummary,
+  type ColumnFormatEntry,
+  type ColumnFormatRule,
+} from "../lib/column-format";
 import { reorderByName } from "../lib/column-order";
+import {
+  autoHiddenKeys,
+  findEmptyColumnKeys,
+  keepOneAutoVisible,
+  type AutoHideMode,
+  type ColumnVisibilityColumn,
+} from "../lib/column-visibility";
 import { frozenOffsets } from "../lib/frozen-columns";
 import type { ChartData } from "../lib/result-chart";
 import {
@@ -70,6 +86,7 @@ interface ResizeState {
 const props = defineProps<{
   result: QueryResult | null;
   running: boolean;
+  formats?: ColumnFormatEntry[];
 }>();
 
 const emit = defineEmits<{
@@ -84,12 +101,17 @@ const emit = defineEmits<{
     },
   ];
   "chart-data": [data: ChartData];
+  "update:formats": [entries: ColumnFormatEntry[]];
 }>();
 
 const columnWidths = reactive<Record<number, number>>({});
 const defaultWidths = ref<number[]>([]);
 const cellMenu = ref<CellMenu | null>(null);
 const headerMenu = ref<HeaderMenu | null>(null);
+const formatDialog = ref<{ colIndex: number } | null>(null);
+const columnPanelOpen = ref(false);
+const autoHideMode = ref<AutoHideMode>("off");
+const autoExceptions = reactive(new Set<number>());
 const hiddenColumns = reactive(new Set<number>());
 const columnOrder = ref<number[]>([]);
 const lastColumnNames = ref<string[]>([]);
@@ -133,6 +155,51 @@ const scrollRef = ref<HTMLElement | null>(null);
 let resizeState: ResizeState | null = null;
 let toastTimer = 0;
 
+const visibilityColumns = computed<ColumnVisibilityColumn[]>(() => {
+  const columns = props.result?.columns ?? [];
+  const keys = formatColumnKeys(columns.map((name) => ({ name })));
+  return columns.map((name, index) => ({
+    key: keys[index] ?? String(index),
+    name,
+    index,
+  }));
+});
+
+const manualHiddenKeys = computed(() =>
+  visibilityColumns.value
+    .filter((column) => hiddenColumns.has(column.index))
+    .map((column) => column.key),
+);
+
+const emptyColumnKeys = computed(() =>
+  findEmptyColumnKeys(
+    props.result?.rows ?? [],
+    visibilityColumns.value,
+    { mode: autoHideMode.value },
+  ),
+);
+
+const autoHiddenIndices = computed(() => {
+  if (autoHideMode.value === "off") return new Set<number>();
+  const exceptions = new Set(
+    visibilityColumns.value
+      .filter((column) => autoExceptions.has(column.index))
+      .map((column) => column.key),
+  );
+  const keys = autoHiddenKeys(
+    visibilityColumns.value,
+    emptyColumnKeys.value,
+    exceptions,
+  );
+  const manual = new Set(manualHiddenKeys.value);
+  keepOneAutoVisible(visibilityColumns.value, manual, keys);
+  return new Set(
+    visibilityColumns.value
+      .filter((column) => keys.has(column.key))
+      .map((column) => column.index),
+  );
+});
+
 const visibleColumns = computed(() => {
   const columns = props.result?.columns ?? [];
   const ordered: Array<{ name: string; index: number }> = [];
@@ -140,12 +207,12 @@ const visibleColumns = computed(() => {
   for (const index of columnOrder.value) {
     if (index < 0 || index >= columns.length || seen.has(index)) continue;
     seen.add(index);
-    if (!hiddenColumns.has(index)) {
+    if (!hiddenColumns.has(index) && !autoHiddenIndices.value.has(index)) {
       ordered.push({ name: columns[index], index });
     }
   }
   for (let index = 0; index < columns.length; index += 1) {
-    if (seen.has(index) || hiddenColumns.has(index)) continue;
+    if (seen.has(index) || hiddenColumns.has(index) || autoHiddenIndices.value.has(index)) continue;
     ordered.push({ name: columns[index], index });
   }
   const frozen = ordered.filter((column) =>
@@ -857,12 +924,91 @@ const virtualRows = computed(() => {
   }));
 });
 
+const formatMap = computed(() => {
+  const map = new Map<string, ColumnFormatRule>();
+  for (const entry of props.formats ?? []) {
+    map.set(entry.columnKey, entry.rule);
+  }
+  return map;
+});
+
+const formatColumnKeysForResult = computed(() =>
+  formatColumnKeys((props.result?.columns ?? []).map((name) => ({ name }))),
+);
+
+function columnFormatKey(index: number): string {
+  return formatColumnKeysForResult.value[index] ?? "";
+}
+
+function ruleForColumn(index: number): ColumnFormatRule | null {
+  return formatMap.value.get(columnFormatKey(index)) ?? null;
+}
+
+function formatSummaryForColumn(index: number): string {
+  const rule = ruleForColumn(index);
+  return rule ? formatRuleSummary(rule) : "";
+}
+
+function displayCell(value: unknown, index: number): { text: string; warning: string | null } {
+  const rule = ruleForColumn(index);
+  if (!rule) return { text: formatCell(value), warning: null };
+  return formatDisplayValue(value, rule);
+}
+
+function formatCellForColumn(value: unknown, index: number): string {
+  return displayCell(value, index).text;
+}
+
+function formatWarningForColumn(value: unknown, index: number): string | null {
+  return displayCell(value, index).warning;
+}
+
+function cellTitle(value: unknown, index: number): string {
+  const formatted = displayCell(value, index);
+  return formatted.warning ? `${formatted.text} · ${formatted.warning}` : formatted.text;
+}
+
+function openColumnFormat(index: number) {
+  headerMenu.value = null;
+  formatDialog.value = { colIndex: index };
+}
+
+function clearColumnFormat(index: number) {
+  const key = columnFormatKey(index);
+  emit(
+    "update:formats",
+    (props.formats ?? []).filter((entry) => entry.columnKey !== key),
+  );
+}
+
+function applyColumnFormat(rule: ColumnFormatRule | null) {
+  const dialog = formatDialog.value;
+  if (!dialog) return;
+  const key = columnFormatKey(dialog.colIndex);
+  const next = (props.formats ?? []).filter((entry) => entry.columnKey !== key);
+  if (rule) next.push({ columnKey: key, rule });
+  emit("update:formats", next);
+  formatDialog.value = null;
+}
+
+const formatSamples = computed(() => {
+  const dialog = formatDialog.value;
+  if (!dialog || !props.result) return [];
+  return sortedRows.value
+    .map((row) => row[dialog.colIndex])
+    .filter((value) => value !== null && value !== undefined)
+    .slice(0, 10);
+});
+
 const findMatches = computed<GridMatch[]>(() =>
   findGridMatches(
     sortedRows.value,
     visibleColumns.value,
     findTerm.value,
-    { caseSensitive: findCaseSensitive.value },
+    {
+      caseSensitive: findCaseSensitive.value,
+      display: (value, columnIndex) => formatCellForColumn(value, columnIndex),
+    },
   ),
 );
 const findRowCount = computed(() => countMatchRows(findMatches.value));
@@ -895,7 +1041,7 @@ const findHighlights = computed(() => {
       highlights.set(
         key,
         highlightSegments(
-          formatCell(entry.row[column.index]),
+          formatCellForColumn(entry.row[column.index], column.index),
           findTerm.value,
           findCaseSensitive.value,
         ),
@@ -1202,7 +1348,7 @@ function openHeaderMenu(event: MouseEvent, colIndex: number) {
   cellMenu.value = null;
   headerMenu.value = {
     x: Math.max(8, Math.min(event.clientX, window.innerWidth - 210)),
-    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 280)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 360)),
     colIndex,
   };
 }
@@ -1233,7 +1379,34 @@ function showOnlyColumn() {
 
 function showAllColumns() {
   hiddenColumns.clear();
+  autoHideMode.value = "off";
+  autoExceptions.clear();
   closeMenus();
+}
+
+const hiddenColumnTotal = computed(
+  () => new Set([...hiddenColumns, ...autoHiddenIndices.value]).size,
+);
+
+function toggleVisibilityColumn(key: string, visible: boolean) {
+  const column = visibilityColumns.value.find((item) => item.key === key);
+  if (!column) return;
+  if (visible) {
+    hiddenColumns.delete(column.index);
+    autoExceptions.add(column.index);
+  } else if (
+    autoHiddenIndices.value.has(column.index) ||
+    autoExceptions.has(column.index)
+  ) {
+    autoExceptions.delete(column.index);
+  } else {
+    hiddenColumns.add(column.index);
+  }
+}
+
+function setAutoHideMode(mode: AutoHideMode) {
+  autoHideMode.value = mode;
+  autoExceptions.clear();
 }
 
 function resetHeaderWidth() {
@@ -1329,6 +1502,16 @@ function menuCellValue(): unknown {
 
 function copyCell() {
   void writeClipboard(copyValue(menuCellValue()), "已复制单元格");
+}
+
+function copyDisplayCell() {
+  const menu = cellMenu.value;
+  if (!menu) return;
+  const value = sortedRows.value[menu.rowIndex]?.[menu.colIndex];
+  void writeClipboard(
+    displayCell(value, menu.colIndex).text,
+    "已复制显示值（原始值仍保留在数据库和导出中）",
+  );
 }
 
 function copyRow() {
@@ -1427,6 +1610,9 @@ watch(
     stopResize();
     closeMenus();
     hiddenColumns.clear();
+    autoHideMode.value = "off";
+    autoExceptions.clear();
+    columnPanelOpen.value = false;
     toast.value = "";
     sortIndex.value = null;
     sortDirection.value = "asc";
@@ -1468,7 +1654,7 @@ watch(
 );
 
 watch(
-  () => hiddenColumns.size,
+  () => hiddenColumnTotal.value,
   (count) => emit("hidden-change", count),
   { immediate: true },
 );
@@ -1530,6 +1716,37 @@ onBeforeUnmount(() => {
       @next="nextMatch"
       @prev="previousMatch"
       @close="closeSearch"
+    />
+    <div v-if="result" class="result-grid-column-tools">
+      <button
+        class="button ghost compact"
+        :title="`手动隐藏 ${hiddenColumns.size} 列 · 自动隐藏 ${autoHiddenIndices.size} 列`"
+        @click="columnPanelOpen = true"
+      >
+        <Icon name="list" :size="12" />
+        列
+        <span v-if="hiddenColumnTotal" class="result-filter-badge">
+          {{ hiddenColumnTotal }}
+        </span>
+      </button>
+    </div>
+    <ColumnVisibilityPanel
+      :open="columnPanelOpen"
+      :columns="visibilityColumns"
+      :manual-hidden="manualHiddenKeys"
+      :auto-hidden="
+        visibilityColumns
+          .filter((column) => autoHiddenIndices.has(column.index))
+          .map((column) => column.key)
+      "
+      :auto-mode="autoHideMode"
+      :has-data="Boolean(result?.rows.length)"
+      :row-count="result?.rows.length ?? 0"
+      row-label="基于已加载结果，不含本地筛选"
+      @close="columnPanelOpen = false"
+      @toggle="toggleVisibilityColumn"
+      @show-all="showAllColumns"
+      @set-mode="setAutoHideMode"
     />
     <div
       ref="scrollRef"
@@ -1602,6 +1819,13 @@ onBeforeUnmount(() => {
             <span class="result-head-label">
               <span class="result-head-text">{{ column.name }}</span>
               <span
+                v-if="ruleForColumn(column.index)"
+                class="column-format-badge"
+                role="img"
+                aria-label="已应用显示格式"
+                :title="formatSummaryForColumn(column.index)"
+              >fx</span>
+              <span
                 v-if="column.index === lastFrozenIndex"
                 class="frozen-pin"
                 role="img"
@@ -1660,13 +1884,16 @@ onBeforeUnmount(() => {
               'frozen-boundary': column.index === lastFrozenIndex,
               'grid-selected': isGridSelected(entry.index, column.index),
               'grid-active-cell': isActiveCell(entry.index, column.index),
+              'format-cell-warning': Boolean(
+                formatWarningForColumn(entry.row[column.index], column.index),
+              ),
             }"
             :style="
               frozenLeft[column.index] !== undefined
                 ? { left: `${frozenLeft[column.index]}px` }
                 : undefined
             "
-            :title="formatCell(entry.row[column.index])"
+            :title="cellTitle(entry.row[column.index], column.index)"
             tabindex="-1"
             :data-cell="`${entry.index}:${column.index}`"
             @mousedown="onCellMouseDown($event, entry.index, column.index)"
@@ -1687,7 +1914,7 @@ onBeforeUnmount(() => {
               >{{ segment.text }}</span>
             </template>
             <template v-else>
-              {{ formatCell(entry.row[column.index]) }}
+              {{ formatCellForColumn(entry.row[column.index], column.index) }}
             </template>
           </td>
         </tr>
@@ -1754,6 +1981,15 @@ onBeforeUnmount(() => {
         <Icon name="copy" :size="14" />
         复制单元格
       </button>
+      <button
+        v-if="ruleForColumn(cellMenu.colIndex)"
+        class="context-menu-item"
+        title="只复制格式化后的显示文本；导出与整行 JSON 仍用原始值"
+        @click="copyDisplayCell"
+      >
+        <Icon name="copy" :size="14" />
+        复制显示值
+      </button>
       <button class="context-menu-item" @click="copyRow">
         <Icon name="copy" :size="14" />
         复制整行
@@ -1804,6 +2040,22 @@ onBeforeUnmount(() => {
       >
         <Icon name="table" :size="14" />
         统计此列
+      </button>
+      <div class="context-separator"></div>
+      <button
+        class="context-menu-item"
+        @click="openColumnFormat(headerMenu.colIndex)"
+      >
+        <Icon name="edit" :size="14" />
+        显示格式…
+      </button>
+      <button
+        v-if="ruleForColumn(headerMenu.colIndex)"
+        class="context-menu-item"
+        @click="clearColumnFormat(headerMenu.colIndex)"
+      >
+        <Icon name="close" :size="14" />
+        清除此列格式
       </button>
       <div class="context-separator"></div>
       <button
@@ -1915,6 +2167,15 @@ onBeforeUnmount(() => {
         导出结果…
       </button>
     </div>
+
+    <ColumnFormatDialog
+      :open="Boolean(formatDialog)"
+      :column-name="formatDialog ? (result?.columns[formatDialog.colIndex] ?? '') : ''"
+      :samples="formatSamples"
+      :initial="formatDialog ? ruleForColumn(formatDialog.colIndex) : null"
+      @cancel="formatDialog = null"
+      @apply="applyColumnFormat"
+    />
 
     <CellValueDialog
       :open="Boolean(valueViewer)"

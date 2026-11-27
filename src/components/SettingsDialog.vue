@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref, watch } from "vue";
+import AiSettingsSection from "./AiSettingsSection.vue";
 import Icon from "./Icon.vue";
 import {
   applyEditorFontSize,
@@ -229,6 +230,8 @@ onBeforeUnmount(() => {
             轻量跨平台数据库客户端。设置与连接信息仅保存在本机，不上传云端。
           </p>
         </section>
+
+        <AiSettingsSection />
       </div>
 
       <footer class="modal-footer">
