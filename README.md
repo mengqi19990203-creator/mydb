@@ -8,6 +8,16 @@
 
 版本变更记录见 [CHANGELOG.md](CHANGELOG.md)；版本号只在明确要求时提升。
 
+## 界面截图
+
+### AI SQL 助手
+
+![AI SQL 助手](docs/screenshots/ai-sql-assistant.png)
+
+### AI 生成 SQL 并执行
+
+![AI 生成 SQL 并执行](docs/screenshots/ai-sql-result.png)
+
 ## 当前功能
 
 - **SQLite**、**MySQL / MariaDB**、**PostgreSQL**、**MongoDB** 与 **Redis** 连接；MongoDB 支持单 host 字段表单和 `mongodb://` / `mongodb+srv://` 完整连接串（多 host、副本集与 URI 参数）
