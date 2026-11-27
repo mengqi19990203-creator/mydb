@@ -39,7 +39,7 @@ jobs:
         with:
           key: macos-universal
       - run: npm ci
-      - run: npm run tauri -- build --target universal-apple-darwin --bundles dmg
+      - run: npx tauri build --target universal-apple-darwin --bundles dmg
       - name: Upload DMG to release
         run: gh release upload "$RELEASE_TAG" src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg --clobber
         env:
@@ -61,7 +61,7 @@ jobs:
         with:
           key: windows-msvc
       - run: npm ci
-      - run: npm run tauri -- build --bundles nsis
+      - run: npx tauri build --bundles nsis
       - name: Upload installer to release
         shell: pwsh
         run: |
